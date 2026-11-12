@@ -131,11 +131,27 @@ pub const Service = struct {
     }
 };
 
+/// 递归收集嵌套 message / enum 的符号（`pkg.Outer.Nested`）。
+fn collectNestedSymbols(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged([]const u8),
+    prefix: []const u8,
+    m: proto.Message,
+) !void {
+    const full = if (prefix.len == 0)
+        try alloc.dupe(u8, m.name)
+    else
+        try std.fmt.allocPrint(alloc, "{s}.{s}", .{ prefix, m.name });
+    try list.append(alloc, full);
+    for (m.enums) |e| try list.append(alloc, try std.fmt.allocPrint(alloc, "{s}.{s}", .{ full, e.name }));
+    for (m.nested) |n| try collectNestedSymbols(alloc, list, full, n);
+}
+
 fn collectSymbols(alloc: std.mem.Allocator, p: proto.Proto) ![]const []const u8 {
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
     const prefix = if (p.package.len > 0) try std.fmt.allocPrint(alloc, "{s}.", .{p.package}) else "";
 
-    for (p.messages) |m| try list.append(alloc, try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, m.name }));
+    for (p.messages) |m| try collectNestedSymbols(alloc, &list, prefix[0 .. prefix.len -| 1], m);
     for (p.enums) |e| try list.append(alloc, try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, e.name }));
     for (p.services) |s| {
         try list.append(alloc, try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, s.name }));

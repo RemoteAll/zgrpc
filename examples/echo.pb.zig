@@ -211,6 +211,62 @@ pub const Summary = struct {
     }
 };
 
+pub const Container = struct {
+    pub const Nested = struct {
+        pub const Level = enum(i32) {
+            LOW = 0,
+            HIGH = 1,
+        };
+        x: i32 = 0,
+        level: ?Level = null,
+    
+        pub fn encode(self: @This(), a: std.mem.Allocator) ![]const u8 {
+            var w = pb.Writer.init(a);
+            if (self.x != 0) try w.int32(1, self.x);
+            if (self.level) |v| { if (@intFromEnum(v) != 0) try w.enumField(2, v); }
+            return w.bytes();
+        }
+
+        pub fn decode(bytes: []const u8, a: std.mem.Allocator) !@This() {
+            _ = a; // 该 message 的字段不需要分配
+            var self: @This() = .{};
+            var r = pb.Reader{ .data = bytes };
+            while (r.next()) |f| switch (f.number) {
+                1 => self.x = f.asInt32(),
+                2 => self.level = f.asEnum(Level),
+                else => {},
+            };
+            return self;
+        }
+    };
+
+    nested: ?Nested = null,
+    level: ?Nested.Level = null,
+    items: []const Nested = &.{},
+
+    pub fn encode(self: @This(), a: std.mem.Allocator) ![]const u8 {
+        var w = pb.Writer.init(a);
+        if (self.nested) |v| try w.message(1, try v.encode(a));
+        if (self.level) |v| { if (@intFromEnum(v) != 0) try w.enumField(2, v); }
+        for (self.items) |v| try w.message(3, try v.encode(a));
+        return w.bytes();
+    }
+
+    pub fn decode(bytes: []const u8, a: std.mem.Allocator) !@This() {
+        var self: @This() = .{};
+        var lst_items: std.ArrayListUnmanaged(Nested) = .empty;
+        var r = pb.Reader{ .data = bytes };
+        while (r.next()) |f| switch (f.number) {
+            1 => self.nested = try Nested.decode(f.asBytes(), a),
+            2 => self.level = f.asEnum(Nested.Level),
+            3 => try lst_items.append(a, try Nested.decode(f.asBytes(), a)),
+            else => {},
+        };
+        self.items = lst_items.items;
+        return self;
+    }
+};
+
 /// service echo.Echo（路径前缀 `/echo.Echo/`）
 pub const Echo = struct {
     pub const name = "echo.Echo";

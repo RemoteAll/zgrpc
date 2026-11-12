@@ -6,6 +6,8 @@
 ## 未发布
 
 ### 新增
+- **嵌套 `message` / `enum` 定义**：生成 Zig 嵌套声明（引用写 `Outer.Inner`），反射侧递归收集符号
+  并用相对全名解析 `type_name`；`grpcurl describe echo.Container.Nested` 可直接查。
 - **`optional`（proto3 显式 presence）**：生成 `?T`，**设为默认值也会写盘**（否则无法区分「设成 0」与「未设置」）。
   描述符侧按 protoc 的做法合成 `_<字段名>` oneof 并打 `FieldDescriptorProto.proto3_optional = 17`；
   `grpcurl describe` 实测渲染为 `optional int32 opt_value = 15;`（合成 oneof 被正确隐藏）。

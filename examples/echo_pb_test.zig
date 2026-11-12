@@ -141,6 +141,28 @@ test "proto_gen：oneof 往返（tagged union）" {
     try std.testing.expect((try echo.Summary.decode("", a)).payload == null);
 }
 
+test "proto_gen：嵌套 message / enum 定义往返" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const c = echo.Container{
+        .nested = .{ .x = 3, .level = .HIGH },
+        .level = .HIGH,
+        .items = &.{ .{ .x = 1 }, .{ .x = 2, .level = .HIGH } },
+    };
+    const back = try echo.Container.decode(try c.encode(a), a);
+
+    try std.testing.expectEqual(@as(i32, 3), back.nested.?.x);
+    try std.testing.expectEqual(echo.Container.Nested.Level.HIGH, back.nested.?.level.?);
+    try std.testing.expectEqual(echo.Container.Nested.Level.HIGH, back.level.?);
+
+    try std.testing.expectEqual(@as(usize, 2), back.items.len);
+    try std.testing.expectEqual(@as(i32, 1), back.items[0].x);
+    try std.testing.expectEqual(@as(i32, 2), back.items[1].x);
+    try std.testing.expectEqual(echo.Container.Nested.Level.HIGH, back.items[1].level.?);
+}
+
 test "proto_gen：proto3 optional 显式 presence（未设置不写、设成默认值要写）" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

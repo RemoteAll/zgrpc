@@ -53,3 +53,18 @@ service Echo {
   rpc Say(BumpRequest) returns (BumpResponse);
   rpc Chat(stream BumpRequest) returns (stream BumpResponse);
 }
+
+// 嵌套定义：Zig 里生成嵌套声明，引用写 `Container.Nested`
+message Container {
+  message Nested {
+    enum Level {
+      LOW = 0;
+      HIGH = 1;
+    }
+    int32 x = 1;
+    Level level = 2;
+  }
+  Nested nested = 1;
+  Nested.Level level = 2;
+  repeated Nested items = 3;
+}

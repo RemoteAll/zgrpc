@@ -16,7 +16,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # 测试数下限：只能抬高，不能降低（降低必须在 docs/决策记录.md 写明依据）
-$minTests = 66
+$minTests = 67
 
 # 随机空闲端口：Windows 上 `Stop-Process -Force`（= TerminateProcess）会让监听 socket
 # 变成 zombie LISTEN（netstat 里 OwningProcess=0），持续数十秒且无法 kill。

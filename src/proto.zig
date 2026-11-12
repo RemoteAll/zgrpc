@@ -9,13 +9,14 @@
 //! - `syntax = "proto3";`、`package a.b.c;`
 //! - `message Name { ... }`：标量、`string`/`bytes`、`enum` 字段、同文件 message 字段，
 //!   `repeated` 支持**任意元素**（标量 / `string` / `bytes` / enum / message），
-//!   `map<K, V>`（key 限整数或 `string`），`oneof { ... }`，`optional`（proto3 显式 presence）
+//!   `map<K, V>`（key 限整数或 `string`），`oneof { ... }`，`optional`（proto3 显式 presence），
+//!   嵌套 `message` / `enum` 定义
 //! - `enum Name { A = 0; ... }`
 //! - `service Name { rpc M(Req) returns (Res); rpc S(stream Req) returns (stream Res); }`
 //!
 //! ## 明确不支持（报错并指出行号，不静默忽略）
 //!
-//! `import`、`reserved`、`extend`、`group`、嵌套 `message`/`enum` 定义。
+//! `import`、`reserved`、`extend`、`group`。
 
 const std = @import("std");
 
@@ -126,6 +127,10 @@ pub const Message = struct {
     fields: []Field,
     /// oneof 名字（按出现顺序）
     oneofs: []const []const u8 = &.{},
+    /// 嵌套定义的 message（Zig 侧生成在外层 struct 内）
+    nested: []Message = &.{},
+    /// 嵌套定义的 enum
+    enums: []EnumDef = &.{},
 };
 
 pub const EnumValue = struct { name: []const u8, value: i32 };
@@ -250,6 +255,8 @@ pub const Parser = struct {
     fn parseMessage(self: *Parser, name: []const u8) ParseError!Message {
         var fields: std.ArrayListUnmanaged(Field) = .empty;
         var oneofs: std.ArrayListUnmanaged([]const u8) = .empty;
+        var nested: std.ArrayListUnmanaged(Message) = .empty;
+        var enums: std.ArrayListUnmanaged(EnumDef) = .empty;
         try self.expectSym("{");
         while (!self.atSym("}")) {
             if (self.tok.kind == .eof) return self.fail("message 未闭合");
@@ -259,9 +266,18 @@ pub const Parser = struct {
                 std.debug.print("[zgrpc.proto] 第 {d} 行：不支持 `{s}`\n", .{ self.tok.line, self.tok.text });
                 return error.Unsupported;
             }
-            if (self.atIdent("message") or self.atIdent("enum")) {
-                std.debug.print("[zgrpc.proto] 第 {d} 行：不支持嵌套定义\n", .{self.tok.line});
-                return error.Unsupported;
+            // 嵌套定义（Zig 侧生成在外层 struct 内，引用时用 `Outer.Inner`）
+            if (self.atIdent("message")) {
+                try self.advance();
+                const nname = try self.expectIdent();
+                try nested.append(self.a, try self.parseMessage(nname));
+                continue;
+            }
+            if (self.atIdent("enum")) {
+                try self.advance();
+                const ename = try self.expectIdent();
+                try enums.append(self.a, try self.parseEnum(ename));
+                continue;
             }
             if (self.atIdent("map")) {
                 try fields.append(self.a, try self.parseMapField());
@@ -314,7 +330,13 @@ pub const Parser = struct {
             try fields.append(self.a, f);
         }
         try self.expectSym("}");
-        return .{ .name = name, .fields = fields.items, .oneofs = oneofs.items };
+        return .{
+            .name = name,
+            .fields = fields.items,
+            .oneofs = oneofs.items,
+            .nested = nested.items,
+            .enums = enums.items,
+        };
     }
 
     /// `type name = N [options];`（不含 repeated / map 前缀）
@@ -512,6 +534,104 @@ pub fn toPascalCase(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out[0..n];
 }
 
+/// 名字匹配：`want` 可以是完整限定名（`Outer.Inner`）、相对限定名（`Inner`）或末段名。
+/// 相对限定名按**后缀**匹配，例如 `Nested.Level` 命中 `Container.Nested.Level` ——
+/// 同一份 proto 里同名类型本来就该报错，所以这里的宽松匹配不会误伤正确代码。
+fn nameMatch(prefix: []const u8, own: []const u8, want: []const u8) bool {
+    if (std.mem.eql(u8, own, want)) return true;
+    if (prefix.len == 0) return false;
+    var buf: [256]u8 = undefined;
+    const full = std.fmt.bufPrint(&buf, "{s}.{s}", .{ prefix, own }) catch return false;
+    if (std.mem.eql(u8, full, want)) return true;
+    if (full.len > want.len) {
+        const tail = full[full.len - want.len ..];
+        if (std.mem.eql(u8, tail, want) and full[full.len - want.len - 1] == '.') return true;
+    }
+    return false;
+}
+
+fn scanMessage(m: *const Message, prefix: []const u8, want: []const u8) ?*const Message {
+    if (nameMatch(prefix, m.name, want)) return m;
+    var buf: [256]u8 = undefined;
+    const sub = if (prefix.len == 0)
+        m.name
+    else
+        std.fmt.bufPrint(&buf, "{s}.{s}", .{ prefix, m.name }) catch prefix;
+    for (m.nested) |*n| {
+        if (scanMessage(n, sub, want)) |hit| return hit;
+    }
+    return null;
+}
+
+fn scanEnum(p: *const Proto, prefix: []const u8, want: []const u8) ?*const EnumDef {
+    for (p.enums) |*e| {
+        if (nameMatch(prefix, e.name, want)) return e;
+    }
+    return null;
+}
+
+fn scanEnumIn(m: *const Message, prefix: []const u8, want: []const u8) ?*const EnumDef {
+    var buf: [256]u8 = undefined;
+    const sub = if (prefix.len == 0)
+        m.name
+    else
+        std.fmt.bufPrint(&buf, "{s}.{s}", .{ prefix, m.name }) catch prefix;
+    for (m.enums) |*e| {
+        if (nameMatch(sub, e.name, want)) return e;
+    }
+    for (m.nested) |*n| {
+        if (scanEnumIn(n, sub, want)) |hit| return hit;
+    }
+    return null;
+}
+
+/// 递归查找 message（含嵌套定义）。`name` 可写 `Outer.Inner`，也可只写 `Inner`。
+pub fn findMessage(p: *const Proto, want: []const u8) ?*const Message {
+    for (p.messages) |*m| {
+        if (scanMessage(m, "", want)) |hit| return hit;
+    }
+    return null;
+}
+
+/// 递归查找 enum（含嵌套定义）。
+/// 因为 `Proto` 是值类型、没有全局上下文，这里需要把顶层 enums 一起传进来 ——
+/// 调用方通常直接传 `&parsed`，见 `findEnumIn`。
+pub fn findEnum(p: *const Proto, want: []const u8) ?*const EnumDef {
+    if (scanEnum(p, "", want)) |hit| return hit;
+    for (p.messages) |*m| {
+        if (scanEnumIn(m, "", want)) |hit| return hit;
+    }
+    return null;
+}
+
+fn scanQualified(alloc: std.mem.Allocator, m: *const Message, prefix: []const u8, want: []const u8) !?[]const u8 {
+    const full = if (prefix.len == 0)
+        try alloc.dupe(u8, m.name)
+    else
+        try std.fmt.allocPrint(alloc, "{s}.{s}", .{ prefix, m.name });
+    if (nameMatch(prefix, m.name, want)) return full;
+    for (m.enums) |*e| {
+        if (nameMatch(full, e.name, want)) return try std.fmt.allocPrint(alloc, "{s}.{s}", .{ full, e.name });
+    }
+    for (m.nested) |*n| {
+        if (try scanQualified(alloc, n, full, want)) |hit| return hit;
+    }
+    return null;
+}
+
+/// 类型在文件内的**相对全名**（不含 package），如 `Container.Nested` / `BumpResponse`。
+/// 生成描述符的 `type_name` 时需要绝对名 → 前面补 `.package.`。
+/// 名字未定义时返回 null（调用方决定是报错还是当外部类型）。
+pub fn qualifiedName(alloc: std.mem.Allocator, p: *const Proto, want: []const u8) !?[]const u8 {
+    for (p.messages) |*m| {
+        if (try scanQualified(alloc, m, "", want)) |hit| return hit;
+    }
+    for (p.enums) |*e| {
+        if (nameMatch("", e.name, want)) return try alloc.dupe(u8, e.name);
+    }
+    return null;
+}
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -552,13 +672,42 @@ test "proto：不支持的语法报错而不静默忽略" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nimport \"x.proto\";\n"));
-    try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { message N { int32 a = 1; } }\n"));
     // map 的 key 不能是 float / double / bytes
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { map<double,int32> m = 1; }\n"));
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { map<bytes,int32> m = 1; }\n"));
     // oneof 成员不能是 repeated / map
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { oneof k { repeated int32 a = 1; } }\n"));
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { oneof k { map<string,int32> m = 1; } }\n"));
+}
+
+test "proto：嵌套 message / enum 定义与递归查找" {
+    const src =
+        \\syntax = "proto3";
+        \\package demo;
+        \\message Outer {
+        \\  message Inner {
+        \\    enum Kind { A = 0; B = 1; }
+        \\    int32 x = 1;
+        \\  }
+        \\  Inner inner = 1;
+        \\}
+        \\message Other { Outer.Inner.Kind k = 1; }
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try parse(arena.allocator(), src);
+
+    try testing.expectEqual(@as(usize, 2), p.messages.len);
+    try testing.expectEqual(@as(usize, 1), p.messages[0].nested.len);
+    try testing.expectEqual(@as(usize, 1), p.messages[0].nested[0].enums.len);
+
+    // 递归查找：末段名 / 限定名都能命中
+    try testing.expect(findMessage(&p, "Inner") != null);
+    try testing.expect(findMessage(&p, "Outer.Inner") != null);
+    try testing.expect(findMessage(&p, "Nope") == null);
+    try testing.expect(findEnum(&p, "Kind") != null);
+    try testing.expect(findEnum(&p, "Outer.Inner.Kind") != null);
+    try testing.expect(findEnum(&p, "x") == null);
 }
 
 test "proto：map<K,V> 解析（含 message 值）" {

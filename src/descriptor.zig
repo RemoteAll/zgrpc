@@ -34,11 +34,8 @@ const Label = struct {
 /// 写错会导致 grpcurl/protoreflect 报
 /// `resolved "X", but it is not an message`。
 fn isEnumName(p: *const proto.Proto, name: []const u8) bool {
-    const seg = proto.lastSegment(name);
-    for (p.enums) |e| {
-        if (std.mem.eql(u8, e.name, seg)) return true;
-    }
-    return false;
+    // 递归查找，嵌套定义的 enum 也要能识别
+    return proto.findEnum(p, name) != null;
 }
 
 fn fieldTypeOf(p: *const proto.Proto, f: proto.Field) i32 {
@@ -90,7 +87,18 @@ fn writeField(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, msg_
     try inner.int32(5, fieldTypeOf(p, f)); // type
     switch (f.ftype) {
         .scalar => {},
-        .named => |n| try inner.string(6, try fullyQualified(alloc, package, n)), // type_name
+        .named => |n| {
+            // 嵌套定义要用相对全名：`Nested` → `.pkg.Container.Nested`
+            if (try proto.qualifiedName(alloc, p, n)) |q| {
+                const abs = if (package.len > 0)
+                    try std.fmt.allocPrint(alloc, ".{s}.{s}", .{ package, q })
+                else
+                    try std.fmt.allocPrint(alloc, ".{s}", .{q});
+                try inner.string(6, abs); // type_name
+            } else {
+                try inner.string(6, try fullyQualified(alloc, package, n)); // type_name
+            }
+        },
         .map => {
             // map 字段在描述符里是 `repeated <Msg>.<Field>Entry`
             const entry = try mapEntryName(alloc, f.name);
@@ -177,19 +185,42 @@ fn writeMapEntry(
     try w.message(3, entry.bytes()); // DescriptorProto.nested_type = 3
 }
 
-fn writeMessage(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, p: *const proto.Proto, m: proto.Message) !void {
+fn writeMessage(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, p: *const proto.Proto, m: proto.Message, outer: []const u8) !void {
+    try writeMessageAs(w, alloc, package, p, m, outer, 4); // 顶层：FileDescriptorProto.message_type = 4
+}
+
+/// `field_num`：顶层用 4，嵌套用 3（`DescriptorProto.nested_type`）。
+/// 写错会让 protoreflect 把嵌套 message 当成 enum 解析。
+fn writeMessageAs(
+    w: *pb.Writer,
+    alloc: std.mem.Allocator,
+    package: []const u8,
+    p: *const proto.Proto,
+    m: proto.Message,
+    outer: []const u8,
+    field_num: u32,
+) !void {
     var inner = pb.Writer.init(alloc);
     defer inner.deinit();
+
+    // 限定名（嵌套时是 `Outer.Inner`）：map Entry 与嵌套类型引用都要用它
+    const full_name = if (outer.len == 0)
+        m.name
+    else
+        try std.fmt.allocPrint(alloc, "{s}.{s}", .{ outer, m.name });
 
     try inner.string(1, m.name);
     // 先排真实 oneof，再排 `optional` 字段的合成 oneof（索引必须与实际 oneof_decl 顺序一致）
     for (m.fields) |f| {
         if (f.proto3_optional) {
-            try writeField(&inner, alloc, package, m.name, p, f, @intCast(m.oneofs.len + syntheticIndex(m, f)));
+            try writeField(&inner, alloc, package, full_name, p, f, @intCast(m.oneofs.len + syntheticIndex(m, f)));
         } else {
-            try writeField(&inner, alloc, package, m.name, p, f, f.oneof_index);
+            try writeField(&inner, alloc, package, full_name, p, f, f.oneof_index);
         }
     }
+    // 嵌套定义（message / enum）：`DescriptorProto.nested_type = 3`、`enum_type = 4`
+    for (m.nested) |n| try writeMessageAs(&inner, alloc, package, p, n, full_name, 3);
+    for (m.enums) |e| try writeEnumAs(&inner, alloc, e, 4);
     // map 字段要额外生成嵌套 Entry 类型（`nested_type`）
     for (m.fields) |f| {
         switch (f.ftype) {
@@ -213,10 +244,15 @@ fn writeMessage(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, p:
         try inner.message(8, od.bytes());
     }
 
-    try w.message(4, inner.bytes()); // FileDescriptorProto.message_type = 4
+    try w.message(field_num, inner.bytes());
 }
 
 fn writeEnum(w: *pb.Writer, alloc: std.mem.Allocator, e: proto.EnumDef) !void {
+    try writeEnumAs(w, alloc, e, 5); // 顶层：FileDescriptorProto.enum_type = 5
+}
+
+/// 把 enum 写进外层容器：顶层用 5，嵌套用 4（`DescriptorProto.enum_type`）。
+fn writeEnumAs(w: *pb.Writer, alloc: std.mem.Allocator, e: proto.EnumDef, field_num: u32) !void {
     var inner = pb.Writer.init(alloc);
     defer inner.deinit();
 
@@ -229,7 +265,7 @@ fn writeEnum(w: *pb.Writer, alloc: std.mem.Allocator, e: proto.EnumDef) !void {
         try inner.message(2, iv.bytes()); // EnumDescriptorProto.value = 2
     }
 
-    try w.message(5, inner.bytes()); // FileDescriptorProto.enum_type = 5
+    try w.message(field_num, inner.bytes());
 }
 
 fn writeService(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, s: proto.Service) !void {
@@ -260,7 +296,7 @@ pub fn encodeFile(alloc: std.mem.Allocator, file_name: []const u8, p: proto.Prot
 
     try w.string(1, file_name); // name
     if (p.package.len > 0) try w.string(2, p.package); // package
-    for (p.messages) |m| try writeMessage(&w, alloc, p.package, &p, m);
+    for (p.messages) |m| try writeMessage(&w, alloc, p.package, &p, m, "");
     for (p.enums) |e| try writeEnum(&w, alloc, e);
     for (p.services) |s| try writeService(&w, alloc, p.package, s);
     try w.string(12, "proto3"); // syntax
