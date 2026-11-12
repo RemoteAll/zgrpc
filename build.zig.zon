@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0x7f4035e3913d2c0f,
     .name = .zgrpc,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .minimum_zig_version = "0.17.1",
     .dependencies = .{},
     .paths = .{
@@ -9,5 +9,8 @@
         "build.zig.zon",
         "src",
         "README.md",
+        "CHANGELOG.md",
+        "docs",
+        "tools/proto_gen.zig",
     },
 }

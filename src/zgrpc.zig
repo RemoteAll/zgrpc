@@ -29,7 +29,7 @@ pub const clock = @import("clock.zig");
 pub const pb = @import("pb.zig");
 
 /// 库版本（语义化）。
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 
 test {
     std.testing.refAllDecls(@This());
