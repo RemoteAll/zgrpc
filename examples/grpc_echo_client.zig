@@ -130,4 +130,30 @@ pub fn main(init: std.process.Init) !void {
         return error.GrpcStatusNotOk;
     }
     std.debug.print("[zgrpc] grpc-timeout 生效：grpc-status=4（{s}）\n", .{slow[0].message});
+
+    // ---- 自定义 metadata（`-bin`）：发 base64，服务端解码后回显到响应头 + trailer ----
+    const token = try zgrpc.grpc.encodeBase64NoPad(a, "hello-bin");
+    const md = try client.callMany(&.{
+        .{ .method = method, .payload = "with-metadata", .metadata = &.{
+            .{ .name = "x-token-bin", .value = token },
+        } },
+    }, a);
+    if (!md[0].ok()) {
+        std.debug.print("[zgrpc] metadata 调用失败：status={d} message={s}\n", .{ md[0].status, md[0].message });
+        return error.GrpcStatusNotOk;
+    }
+    const echoed = (try md[0].binaryMetadata(a, "x-echo-bin")) orelse {
+        std.debug.print("[zgrpc] 响应缺少 x-echo-bin\n", .{});
+        return error.MetadataMissing;
+    };
+    if (!std.mem.eql(u8, echoed, "hello-bin")) {
+        std.debug.print("[zgrpc] x-echo-bin 回显不符：{s}\n", .{echoed});
+        return error.MetadataMismatch;
+    }
+    const note = md[0].trailer("x-note") orelse "";
+    if (!std.mem.eql(u8, note, "metadata-ok")) {
+        std.debug.print("[zgrpc] trailers 里的 x-note 不符：{s}\n", .{note});
+        return error.MetadataMismatch;
+    }
+    std.debug.print("[zgrpc] -bin metadata 往返成功：x-echo-bin={s} / x-note={s}\n", .{ echoed, note });
 }

@@ -11,16 +11,17 @@ const port: u16 = 18051;
 /// 方法 `/echo.Echo/Say`：把请求消息原样回显。
 fn sayHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator) anyerror!void {
     _ = ctx;
-    _ = arena;
     const msg = call.firstMessage() orelse {
         call.setStatus(.invalid_argument, "缺少请求消息");
         return;
     };
-    if (msg.compressed) {
-        call.setStatus(.unimplemented, "本示例不支持压缩");
-        return;
+    std.debug.print("[zgrpc] 收到 {d} 字节（压缩={}）：{s}\n", .{ msg.payload.len, msg.compressed, msg.payload });
+
+    // 自定义二进制 metadata（`-bin` 结尾）：值已在协议层 base64 解码
+    if (try call.requestBinaryMetadata(arena, "x-token-bin")) |token| {
+        try call.setBinaryHeader("x-echo-bin", token); // 自动 base64（无 padding）
+        try call.setTrailer("x-note", "metadata-ok");
     }
-    std.debug.print("[zgrpc] 收到 {d} 字节：{s}\n", .{ msg.payload.len, msg.payload });
     try call.sendMessage(msg.payload);
 }
 

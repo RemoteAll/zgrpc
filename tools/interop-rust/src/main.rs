@@ -63,17 +63,59 @@ fn grpc_frame(msg: &[u8]) -> Vec<u8> {
     v
 }
 
-/// gRPC-Web 的 trailers 尾帧：`0x80 | 长度:4B | "grpc-status: 0\r\n"`
-fn web_trailer_block(status: &str, message: Option<&str>) -> Vec<u8> {
+/// gRPC-Web 的 trailers 尾帧：`0x80` + 长度:4B + `"grpc-status: 0\r\n"` 等
+fn web_trailer_block(status: &str, message: Option<&str>, extra: &[(String, String)]) -> Vec<u8> {
     let mut text = format!("grpc-status: {status}\r\n");
     if let Some(m) = message {
         text.push_str(&format!("grpc-message: {m}\r\n"));
+    }
+    for (k, v) in extra {
+        text.push_str(&format!("{k}: {v}\r\n"));
     }
     let mut v = Vec::with_capacity(5 + text.len());
     v.push(0x80u8);
     v.extend_from_slice(&(text.len() as u32).to_be_bytes());
     v.extend_from_slice(text.as_bytes());
     v
+}
+
+// ---------------------------------------------------------------------------
+// base64（零新依赖）：`-bin` metadata 用；编码不带 padding，解码宽松（忽略 `=`）
+// ---------------------------------------------------------------------------
+
+const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode_nopad(data: &[u8]) -> String {
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = ((chunk[0] as u32) << 16) | (b1 << 8) | b2;
+        let idx = [(n >> 18) & 63, (n >> 12) & 63, (n >> 6) & 63, n & 63];
+        for i in 0..=chunk.len() {
+            out.push(B64[idx[i] as usize] as char);
+        }
+    }
+    out
+}
+
+fn b64_decode_loose(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for c in s.bytes() {
+        if matches!(c, b'=' | b'\r' | b'\n' | b' ' | b'\t') {
+            continue;
+        }
+        let v = B64.iter().position(|x| *x == c)? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +231,11 @@ async fn handle(req: Request<Incoming>) -> Result<Response<GrpcBody>, Infallible
         .get("grpc-timeout")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let token_hdr = req
+        .headers()
+        .get("x-token-bin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     let whole = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
@@ -207,6 +254,18 @@ async fn handle(req: Request<Incoming>) -> Result<Response<GrpcBody>, Infallible
     let mut out: Vec<u8> = Vec::new();
     let mut grpc_status = "0".to_string();
     let mut grpc_message: Option<String> = None;
+    // `-bin` metadata：解码后重新编码回显（证明真是按规范在处理，而不是原样透传）
+    let mut extra_headers: Vec<(String, String)> = Vec::new();
+    let mut extra_trailers: Vec<(String, String)> = Vec::new();
+    if let Some(t) = &token_hdr {
+        match b64_decode_loose(t) {
+            Some(raw) => {
+                extra_headers.push(("x-echo-bin".to_string(), b64_encode_nopad(&raw)));
+                extra_trailers.push(("x-note".to_string(), "metadata-ok".to_string()));
+            }
+            None => eprintln!("[interop] x-token-bin 不是合法 base64：{t}"),
+        }
+    }
 
     if path == "/grpc.health.v1.Health/Check" {
         // 标准健康检查：空 service 或 "echo.Echo" → SERVING；其它 → NOT_FOUND(5)
@@ -254,8 +313,15 @@ async fn handle(req: Request<Incoming>) -> Result<Response<GrpcBody>, Infallible
 
     let mut resp = Response::builder().status(StatusCode::OK);
     if is_web {
-        out.extend_from_slice(&web_trailer_block(&grpc_status, grpc_message.as_deref()));
+        out.extend_from_slice(&web_trailer_block(
+            &grpc_status,
+            grpc_message.as_deref(),
+            &extra_trailers,
+        ));
         resp = resp.header(hyper::header::CONTENT_TYPE, GRPC_WEB_CT);
+        for (k, v) in &extra_headers {
+            resp = resp.header(k.as_str(), v.as_str());
+        }
         let body = GrpcBody {
             data: Some(Bytes::from(out)),
             trailers: None,
@@ -271,7 +337,18 @@ async fn handle(req: Request<Incoming>) -> Result<Response<GrpcBody>, Infallible
     if let Some(m) = grpc_message {
         trailers.insert("grpc-message", hyper::header::HeaderValue::from_str(&m).unwrap());
     }
+    for (k, v) in &extra_trailers {
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) {
+            trailers.insert(name, val);
+        }
+    }
     resp = resp.header(hyper::header::CONTENT_TYPE, GRPC_CT);
+    for (k, v) in &extra_headers {
+        resp = resp.header(k.as_str(), v.as_str());
+    }
     let body = GrpcBody {
         data: Some(Bytes::from(out)),
         trailers: Some(trailers),
@@ -505,6 +582,61 @@ async fn run_client(port: u16, web: bool) -> Result<(), Box<dyn std::error::Erro
     println!("  grpc-timeout：grpc-status={gs:?}（期望 4）");
     if gs.as_deref() != Some("4") {
         return Err(format!("grpc-timeout 期望 grpc-status=4，实际 {gs:?}").into());
+    }
+
+    // ⑤ 自定义 `-bin` metadata：发出 base64，服务端应解码后重新编码回显
+    let token = b64_encode_nopad(b"hello-interop");
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://127.0.0.1:{port}/echo.Echo/Say"))
+        .header(hyper::header::CONTENT_TYPE, ct)
+        .header("te", "trailers")
+        .header("x-token-bin", &token)
+        .body(Full::new(Bytes::from(grpc_frame(b"md"))))?;
+    let resp = sender.send_request(req).await?;
+    let echoed = resp
+        .headers()
+        .get("x-echo-bin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let mut body = resp.into_body();
+    let mut data: Vec<u8> = Vec::new();
+    let mut note: Option<String> = None;
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Some(d) = frame.data_ref() {
+            data.extend_from_slice(d);
+        }
+        if let Some(t) = frame.trailers_ref() {
+            if let Some(v) = t.get("x-note") {
+                note = Some(v.to_str().unwrap_or("").to_string());
+            }
+        }
+    }
+    if web && note.is_none() {
+        // gRPC-Web：trailer 在 body 尾帧里
+        let msgs = parse_messages(&data);
+        let pos: usize = msgs.iter().map(|m| 5 + m.len()).sum();
+        if data.len() >= pos + 5 && data[pos] & 0x80 != 0 {
+            let len = u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]) as usize;
+            let end = (pos + 5 + len).min(data.len());
+            let text = String::from_utf8_lossy(&data[pos + 5..end]).to_string();
+            for line in text.split("\r\n") {
+                if let Some(rest) = line.strip_prefix("x-note:") {
+                    note = Some(rest.trim().to_string());
+                }
+            }
+        }
+    }
+    println!("  -bin metadata：x-echo-bin={echoed:?} x-note={note:?}");
+    if echoed.as_deref() != Some(token.as_str()) {
+        return Err(format!(
+            "x-echo-bin 期望 {token:?}（=“hello-interop”），实际 {echoed:?}"
+        )
+        .into());
+    }
+    if note.as_deref() != Some("metadata-ok") {
+        return Err(format!("x-note 期望 metadata-ok，实际 {note:?}").into());
     }
 
     println!("[interop] 对拍通过");

@@ -151,6 +151,45 @@ pub fn percentDecode(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out.items;
 }
 
+// ---------------------------------------------------------------------------
+// 二进制 metadata（`-bin`）：base64 编解码
+// 规范：实现 MUST 接受带与不带 padding 的值，并**应当发不带 padding 的值**。
+// ---------------------------------------------------------------------------
+
+/// 编码：**不带 padding**。
+pub fn encodeBase64NoPad(alloc: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    const enc = std.base64.standard_no_pad.Encoder;
+    if (bytes.len == 0) return "";
+    const buf = try alloc.alloc(u8, enc.calcSize(bytes.len));
+    return enc.encode(buf, bytes);
+}
+
+/// 解码：**带/不带 padding 都接受**；两者都失败则 `error.InvalidBase64`。
+pub fn decodeBase64Loose(alloc: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (text.len == 0) return "";
+    const padded = std.base64.standard.Decoder;
+    if (padded.calcSizeForSlice(text)) |n| {
+        const buf = try alloc.alloc(u8, n);
+        if (padded.decode(buf, text)) |_| {
+            return buf;
+        } else |_| {
+            // 落到无 padding 分支再试
+        }
+    } else |_| {}
+
+    const no_pad = std.base64.standard_no_pad.Decoder;
+    const n = no_pad.calcSizeForSlice(text) catch return error.InvalidBase64;
+    const buf = try alloc.alloc(u8, n);
+    no_pad.decode(buf, text) catch return error.InvalidBase64;
+    return buf;
+}
+
+/// 取逗号分隔的第一段（规范：重复的二进制头可被合并成 `a,b`）。
+fn firstCommaSegment(raw: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, raw, ',')) |i| return raw[0..i];
+    return raw;
+}
+
 const grpc_content_type = [_]hpack.Header{
     .{ .name = "content-type", .value = "application/grpc" },
 };
@@ -238,6 +277,11 @@ pub const Call = struct {
     unary_route: ?Route = null,
     route_ctx: *anyopaque = undefined,
 
+    /// 要随**响应头**一起发的自定义 metadata（须在首条 `sendMessage` 之前 append）
+    resp_headers: std.ArrayListUnmanaged(hpack.Header) = .empty,
+    /// 要随 **trailers** 一起发的自定义 metadata（可在 finish 前任意时刻 append）
+    resp_trailers: std.ArrayListUnmanaged(hpack.Header) = .empty,
+
     /// unary 调用取第一条消息。
     pub fn firstMessage(self: *Call) ?Message {
         var it = MessageIterator{ .data = self.req.body, .alloc = self.alloc };
@@ -246,6 +290,67 @@ pub const Call = struct {
 
     pub fn messages(self: *Call) MessageIterator {
         return .{ .data = self.req.body, .alloc = self.alloc };
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom-Metadata（规范：`-bin` 结尾的用 base64，重复名可逗号合并）
+    // -----------------------------------------------------------------------
+
+    /// 读一个 ASCII metadata（同名多次出现时返回第一个）。
+    pub fn requestMetadata(self: *Call, name: []const u8) ?[]const u8 {
+        return self.req.header(name);
+    }
+
+    /// 读一个**二进制** metadata（名字以 `-bin` 结尾）：按规范先按 `,` 切分再 base64 解码。
+    /// 同名多段时返回第一段；需要全部请用 `requestBinaryMetadataAll`。
+    pub fn requestBinaryMetadata(self: *Call, arena: std.mem.Allocator, name: []const u8) !?[]const u8 {
+        const raw = self.req.header(name) orelse return null;
+        const first = firstCommaSegment(raw);
+        return try decodeBase64Loose(arena, std.mem.trim(u8, first, " \t"));
+    }
+
+    /// 读一个二进制 metadata 的**全部**段（规范：重复名或逗号合并都可能出现）。
+    pub fn requestBinaryMetadataAll(
+        self: *Call,
+        arena: std.mem.Allocator,
+        name: []const u8,
+    ) ![]const []const u8 {
+        const raw = self.req.header(name) orelse return &.{};
+        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, raw, ',');
+        while (it.next()) |seg| {
+            const t = std.mem.trim(u8, seg, " \t");
+            if (t.len == 0) continue;
+            try out.append(arena, try decodeBase64Loose(arena, t));
+        }
+        return out.items;
+    }
+
+    /// 加一条**响应头** metadata（须在首条 `sendMessage` 之前调用，否则已发出）。
+    /// `name` 不得以 `-bin` 结尾（二进制请用 `setBinaryHeader`），否则头部值会不合规范。
+    pub fn setHeader(self: *Call, name: []const u8, value: []const u8) !void {
+        if (std.mem.endsWith(u8, name, "-bin")) return error.UseSetBinaryHeader;
+        try self.resp_headers.append(self.alloc, .{ .name = name, .value = value });
+    }
+
+    /// 加一条**二进制响应头**：值自动 base64（**不带 padding**，规范：应发无 padding）。
+    pub fn setBinaryHeader(self: *Call, name: []const u8, value: []const u8) !void {
+        if (!std.mem.endsWith(u8, name, "-bin")) return error.BinaryNameMustEndWithBin;
+        const enc = try encodeBase64NoPad(self.alloc, value);
+        try self.resp_headers.append(self.alloc, .{ .name = name, .value = enc });
+    }
+
+    /// 加一条 **trailers** metadata（`grpc-status-details-bin` 等标准字段也走这里）。
+    pub fn setTrailer(self: *Call, name: []const u8, value: []const u8) !void {
+        if (std.mem.endsWith(u8, name, "-bin")) return error.UseSetBinaryTrailer;
+        try self.resp_trailers.append(self.alloc, .{ .name = name, .value = value });
+    }
+
+    /// 加一条**二进制 trailers**（如 `grpc-status-details-bin`）：值自动 base64（无 padding）。
+    pub fn setBinaryTrailer(self: *Call, name: []const u8, value: []const u8) !void {
+        if (!std.mem.endsWith(u8, name, "-bin")) return error.BinaryNameMustEndWithBin;
+        const enc = try encodeBase64NoPad(self.alloc, value);
+        try self.resp_trailers.append(self.alloc, .{ .name = name, .value = enc });
     }
 
     /// 距截止时刻还有多少纳秒（未设超时返回 null；已过期则为负数）。
@@ -272,20 +377,19 @@ pub const Call = struct {
     pub fn sendMessage(self: *Call, payload: []const u8) !void {
         if (self.finished) return error.AlreadyFinished;
         if (!self.sent_any) {
+            const a = self.alloc;
             const should_gzip = self.accept_gzip and payload.len >= compress_min_size;
-            // 顺序按规范 ABNF：HTTP-Status [Message-Encoding] [Message-Accept-Encoding] Content-Type
-            var hs: [3]hpack.Header = undefined;
-            var n: usize = 0;
+            // 顺序按规范 ABNF：HTTP-Status [Message-Encoding] [Message-Accept-Encoding] Content-Type *Custom-Metadata
+            var hs: std.ArrayListUnmanaged(hpack.Header) = .empty;
             if (should_gzip) {
-                hs[n] = .{ .name = "grpc-encoding", .value = "gzip" };
-                n += 1;
+                try hs.append(a, .{ .name = "grpc-encoding", .value = "gzip" });
                 self.resp_gzip = true;
             }
-            hs[n] = .{ .name = "grpc-accept-encoding", .value = "gzip" };
-            n += 1;
-            hs[n] = .{ .name = "content-type", .value = self.resp_content_type };
-            n += 1;
-            try self.rsp.begin("200", hs[0..n]);
+            try hs.append(a, .{ .name = "grpc-accept-encoding", .value = "gzip" });
+            try hs.append(a, .{ .name = "content-type", .value = self.resp_content_type });
+            // 业务自定义响应 metadata 放在 Call-Definition 之后（规范：Call-Definition 在前）
+            try hs.appendSlice(a, self.resp_headers.items);
+            try self.rsp.begin("200", hs.items);
             self.sent_any = true;
         }
 
@@ -334,14 +438,21 @@ pub const Call = struct {
                 try block.appendSlice(a, enc);
                 try block.appendSlice(a, "\r\n");
             }
+            // 自定义 trailers（含 `grpc-status-details-bin`）也入尾帧，键名保持小写
+            for (self.resp_trailers.items) |h| {
+                try block.appendSlice(a, h.name);
+                try block.appendSlice(a, ": ");
+                try block.appendSlice(a, h.value);
+                try block.appendSlice(a, "\r\n");
+            }
             std.mem.writeInt(u32, block.items[len_pos..][0..4], @intCast(block.items.len - start), .big);
 
             if (!self.sent_any) {
-                const hs = [_]hpack.Header{
-                    .{ .name = "grpc-accept-encoding", .value = "gzip" },
-                    .{ .name = "content-type", .value = self.resp_content_type },
-                };
-                try self.rsp.begin("200", &hs);
+                var hs: std.ArrayListUnmanaged(hpack.Header) = .empty;
+                try hs.append(a, .{ .name = "grpc-accept-encoding", .value = "gzip" });
+                try hs.append(a, .{ .name = "content-type", .value = self.resp_content_type });
+                try hs.appendSlice(a, self.resp_headers.items);
+                try self.rsp.begin("200", hs.items);
                 self.sent_any = true;
             }
             return self.rsp.endData(block.items);
@@ -354,13 +465,14 @@ pub const Call = struct {
             const enc = try percentEncode(a, self.error_message);
             try trailers.append(a, .{ .name = "grpc-message", .value = enc });
         }
+        try trailers.appendSlice(a, self.resp_trailers.items);
 
         if (!self.sent_any) {
-            const hs = [_]hpack.Header{
-                .{ .name = "grpc-accept-encoding", .value = "gzip" },
-                .{ .name = "content-type", .value = self.resp_content_type },
-            };
-            try self.rsp.begin("200", &hs);
+            var hs: std.ArrayListUnmanaged(hpack.Header) = .empty;
+            try hs.append(a, .{ .name = "grpc-accept-encoding", .value = "gzip" });
+            try hs.append(a, .{ .name = "content-type", .value = self.resp_content_type });
+            try hs.appendSlice(a, self.resp_headers.items);
+            try self.rsp.begin("200", hs.items);
             self.sent_any = true;
         }
         try self.rsp.end(trailers.items);
@@ -1225,4 +1337,158 @@ test "grpc：content-type 不符回 HTTP 415（规范指定）" {
     try testing.expectEqualStrings("415", try roundTripStatus(a, "POST", "text/plain"));
     // 正例：application/grpc 才走 gRPC 语义（200）
     try testing.expectEqualStrings("200", try roundTripStatus(a, "POST", "application/grpc"));
+}
+// ---------------------------------------------------------------------------
+// Custom-Metadata：`-bin` 的 base64（规范 MUST：接受带/不带 padding，应发不带 padding）
+// ---------------------------------------------------------------------------
+
+test "metadata：-bin base64 编码无 padding、解码容忍两种形式" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // "hello" → "aGVsbG8"（无 padding）；带 padding 形式为 "aGVsbG8="
+    try testing.expectEqualStrings("aGVsbG8", try encodeBase64NoPad(a, "hello"));
+    try testing.expectEqualStrings("hello", try decodeBase64Loose(a, "aGVsbG8"));
+    try testing.expectEqualStrings("hello", try decodeBase64Loose(a, "aGVsbG8="));
+    // 空值：发出去是空串，解回来也是空串
+    try testing.expectEqualStrings("", try encodeBase64NoPad(a, ""));
+    try testing.expectEqualStrings("", try decodeBase64Loose(a, ""));
+    // 非法 base64 必须报错，而不是悄悄返回垃圾
+    try testing.expectError(error.InvalidBase64, decodeBase64Loose(a, "!!!not-base64"));
+}
+
+fn metadataHandler(ctx: *anyopaque, call: *Call, arena: std.mem.Allocator) anyerror!void {
+    _ = ctx;
+    const token = (try call.requestBinaryMetadata(arena, "x-token-bin")) orelse {
+        call.setStatus(.unauthenticated, "缺少 x-token-bin");
+        return;
+    };
+    try call.setBinaryHeader("x-echo-bin", token);
+    try call.setTrailer("x-note", "trailer-ok");
+    try call.setBinaryTrailer("x-trail-bin", "world");
+    try call.sendMessage("ok");
+}
+
+const TripDetail = struct {
+    status: []const u8 = "",
+    headers: std.ArrayListUnmanaged(hpack.Header) = .empty,
+    trailers: std.ArrayListUnmanaged(hpack.Header) = .empty,
+    body: []const u8 = "",
+
+    fn headerValue(self: TripDetail, name: []const u8) ?[]const u8 {
+        for (self.headers.items) |h| {
+            if (std.mem.eql(u8, h.name, name)) return h.value;
+        }
+        return null;
+    }
+
+    fn trailerValue(self: TripDetail, name: []const u8) ?[]const u8 {
+        for (self.trailers.items) |h| {
+            if (std.mem.eql(u8, h.name, name)) return h.value;
+        }
+        return null;
+    }
+};
+
+/// 走完整 h2 帧发一次请求（带额外请求头），收集响应头 / trailers / body。
+fn roundTripDetail(
+    a: std.mem.Allocator,
+    extra: []const hpack.Header,
+    handler: HandlerFn,
+) !TripDetail {
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, h2.client_preface);
+    try h2.appendFrame(&input, a, .settings, 0, 0, &.{});
+
+    var block: std.ArrayListUnmanaged(u8) = .empty;
+    var hs: std.ArrayListUnmanaged(hpack.Header) = .empty;
+    try hs.appendSlice(a, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/echo.Echo/Say" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "te", .value = "trailers" },
+    });
+    try hs.appendSlice(a, extra);
+    try hpack.encode(hs.items, &block, a);
+    try h2.appendFrame(&input, a, .headers, h2.Flags.end_headers, 1, block.items);
+
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    try encodeMessage(&body, a, "ping");
+    try h2.appendFrame(&input, a, .data, h2.Flags.end_stream, 1, body.items);
+
+    var reader = std.Io.Reader.fixed(input.items);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var conn = h2.Connection.init(testing.allocator, &reader, &aw.writer, .{});
+    defer conn.deinit();
+
+    var routes = [_]Route{.{ .path = "/echo.Echo/Say", .handler = handler }};
+    var dummy: u8 = 0;
+    var server = Server{ .routes = &routes, .outer_ctx = &dummy };
+    conn.serve(server.context(), server.handler()) catch |e| {
+        if (e != error.ConnectionClosed) return e;
+    };
+
+    var out = TripDetail{};
+    var pos: usize = 0;
+    while (h2.nextFrame(aw.written(), &pos)) |f| {
+        switch (f.ftype) {
+            .headers => {
+                var dec = hpack.Decoder.init(testing.allocator);
+                defer dec.deinit();
+                var list: std.ArrayListUnmanaged(hpack.Header) = .empty;
+                try dec.decode(f.payload, &list, a);
+                for (list.items) |h| {
+                    if (std.mem.eql(u8, h.name, ":status")) {
+                        out.status = h.value;
+                    } else if (f.flags & h2.Flags.end_stream != 0) {
+                        try out.trailers.append(a, h);
+                    } else {
+                        try out.headers.append(a, h);
+                    }
+                }
+            },
+            .data => out.body = f.payload,
+            else => {},
+        }
+    }
+    return out;
+}
+
+test "metadata：请求 -bin 可读、响应头与 trailers 可写（端到端）" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const trip = try roundTripDetail(a, &.{
+        .{ .name = "x-token-bin", .value = "aGVsbG8" }, // "hello"
+    }, metadataHandler);
+
+    try testing.expectEqualStrings("200", trip.status);
+    // 响应头里的二进制 metadata 应是**无 padding** 的 base64
+    try testing.expectEqualStrings("aGVsbG8", trip.headerValue("x-echo-bin").?);
+    // 自定义 ASCII trailer 与二进制 trailer 都要出现
+    try testing.expectEqualStrings("trailer-ok", trip.trailerValue("x-note").?);
+    try testing.expectEqualStrings("d29ybGQ", trip.trailerValue("x-trail-bin").?); // "world"
+    // grpc-status 仍在 trailers
+    try testing.expectEqualStrings("0", trip.trailerValue("grpc-status").?);
+    // 请求体与响应体（5 字节帧 + "ok"）
+    try testing.expect(trip.body.len >= 5);
+}
+
+test "metadata：逗号合并的多段 -bin 逐段解码" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 规范：重复的二进制头可能被合并成 "aGVsbG8,d29ybGQ"
+    const trip = try roundTripDetail(a, &.{
+        .{ .name = "x-token-bin", .value = "aGVsbG8,d29ybGQ" }, // "hello","world"
+    }, metadataHandler);
+    // requestBinaryMetadata 取第一段
+    try testing.expectEqualStrings("aGVsbG8", trip.headerValue("x-echo-bin").?);
 }

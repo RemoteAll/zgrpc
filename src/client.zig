@@ -17,6 +17,8 @@ pub const Request = struct {
     payload: []const u8 = "",
     /// 单次调用的超时（毫秒）；空则用 `Options.timeout_ms`。发出时为 `grpc-timeout` 头。
     timeout_ms: ?u32 = null,
+    /// 自定义请求 metadata（`-bin` 结尾的请自行 base64；可用 `grpc.encodeBase64NoPad`）
+    metadata: []const hpack.Header = &.{},
 };
 
 pub const Result = struct {
@@ -31,9 +33,36 @@ pub const Result = struct {
     aborted: bool = false,
     /// 响应的 `:status`（非 200 时说明对端回的不是 gRPC 响应，详见 `message`）
     http_status: []const u8 = "",
+    /// 响应头帧里的全部头（含 `content-type` 等，业务自行挑）
+    headers: std.ArrayListUnmanaged(hpack.Header) = .empty,
+    /// trailers 里的自定义 metadata（`grpc-status` / `grpc-message` 已单独抽出）
+    trailers: std.ArrayListUnmanaged(hpack.Header) = .empty,
 
     pub fn ok(self: Result) bool {
         return !self.aborted and self.status == 0;
+    }
+
+    /// 读一个响应头（同名多次时返回第一个）。
+    pub fn header(self: Result, name: []const u8) ?[]const u8 {
+        for (self.headers.items) |h| {
+            if (std.mem.eql(u8, h.name, name)) return h.value;
+        }
+        return null;
+    }
+
+    /// 读一个 trailers metadata（同名多次时返回第一个）。
+    pub fn trailer(self: Result, name: []const u8) ?[]const u8 {
+        for (self.trailers.items) |h| {
+            if (std.mem.eql(u8, h.name, name)) return h.value;
+        }
+        return null;
+    }
+
+    /// 读一个**二进制** metadata（`-bin` 结尾，trailers 优先、再找响应头）：base64 解码。
+    pub fn binaryMetadata(self: Result, arena: std.mem.Allocator, name: []const u8) !?[]const u8 {
+        const raw = self.trailer(name) orelse self.header(name) orelse return null;
+        const first = if (std.mem.indexOfScalar(u8, raw, ',')) |i| raw[0..i] else raw;
+        return try grpc.decodeBase64Loose(arena, std.mem.trim(u8, first, " \t"));
     }
 };
 
@@ -121,7 +150,13 @@ pub const Client = struct {
 
         // 先全部发 HEADERS（模拟并发发起），再发各自 DATA
         for (reqs, results) |req, r| {
-            try self.writeHeaders(r.stream_id, req.method, req.timeout_ms orelse self.opts.timeout_ms, arena);
+            try self.writeHeaders(
+                r.stream_id,
+                req.method,
+                req.timeout_ms orelse self.opts.timeout_ms,
+                req.metadata,
+                arena,
+            );
         }
         for (reqs, results) |req, r| {
             var body: std.ArrayListUnmanaged(u8) = .empty;
@@ -170,7 +205,13 @@ pub const Client = struct {
                         });
                         return e;
                     };
-                    try applyHeaders(&results[idx], hs.items, &saw_status[idx], arena);
+                    try applyHeaders(
+                        &results[idx],
+                        hs.items,
+                        &saw_status[idx],
+                        hdr.flags & h2.Flags.end_stream != 0,
+                        arena,
+                    );
                     if (hdr.flags & h2.Flags.end_stream != 0) {
                         if (!done[idx]) {
                             // 规范：缺 grpc-status / 非 200 时必须合成状态，不能静默认成功
@@ -216,7 +257,7 @@ pub const Client = struct {
         const sid = self.next_stream_id;
         self.next_stream_id += 2;
 
-        try self.writeHeaders(sid, method, self.opts.timeout_ms, arena);
+        try self.writeHeaders(sid, method, self.opts.timeout_ms, &.{}, arena);
         if (messages.len == 0) {
             try writeFrame(self.writer, .data, h2.Flags.end_stream, sid, &.{});
         } else {
@@ -265,7 +306,7 @@ pub const Client = struct {
                     if (hdr.stream_id != sid) continue;
                     var hs: std.ArrayListUnmanaged(hpack.Header) = .empty;
                     try self.decoder.decode(payload, &hs, arena);
-                    try applyHeaders(&result, hs.items, &saw_status, arena);
+                    try applyHeaders(&result, hs.items, &saw_status, hdr.flags & h2.Flags.end_stream != 0, arena);
                     if (hdr.flags & h2.Flags.end_stream != 0) {
                         if (!saw_status) try synthesizeStatus(&result, arena);
                         break;
@@ -294,6 +335,7 @@ pub const Client = struct {
         stream_id: u32,
         method: []const u8,
         timeout_ms: ?u32,
+        metadata: []const hpack.Header,
         arena: std.mem.Allocator,
     ) !void {
         var block: std.ArrayListUnmanaged(u8) = .empty;
@@ -316,6 +358,8 @@ pub const Client = struct {
             // 声明可接受 gzip：否则服务端永远不会压缩响应（大消息白耗带宽）
             .{ .name = "grpc-accept-encoding", .value = "gzip" },
         });
+        // 自定义请求 metadata 放在 Call-Definition 之后（规范：Call-Definition 在前）
+        try hs.appendSlice(arena, metadata);
         try hpack.encode(hs.items, &block, arena);
         try writeFrame(self.writer, .headers, h2.Flags.end_headers, stream_id, block.items);
     }
@@ -345,6 +389,7 @@ fn applyHeaders(
     r: *Result,
     hs: []const hpack.Header,
     saw_status: *bool,
+    is_trailer: bool,
     arena: std.mem.Allocator,
 ) !void {
     for (hs) |h| {
@@ -355,6 +400,10 @@ fn applyHeaders(
             r.message = try grpc.percentDecode(arena, h.value);
         } else if (std.mem.eql(u8, h.name, ":status")) {
             r.http_status = h.value;
+        } else if (is_trailer) {
+            try r.trailers.append(arena, h);
+        } else {
+            try r.headers.append(arena, h);
         }
     }
 }
