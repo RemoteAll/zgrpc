@@ -93,13 +93,12 @@ zig run tools/proto_gen.zig -- my.proto my.pb.zig
 `map` 生成的形式是 `[]const XxxEntry`（`XxxEntry = struct { key: K, value: V }`）+ `get<Field>(k)`
 线性查找辅助 —— **零依赖、不引入 hash 容器**，小 map 足够快；条目类型名与描述符里的嵌套类型同名，便于双向对照。
 
-**不支持**（遇到会报错并给行号，不静默忽略）：`import`（跨文件引用）、`reserved`、`extend`、`option`。
+**不支持**（遇到会报错并给行号，不静默忽略）：`import public` / `import weak`、`reserved`、`extend`、`option`。
 
 ## 服务反射（`grpcurl` 无需 `.proto`）
 
 实现标准 `grpc.reflection.v1.ServerReflection`（同时注册 `v1alpha` 兼容老工具），
 让 `grpcurl` / `ghz` / Postman 等能**自省**服务定义并直接发请求：
-
 ```zig
 // 1. 起服务时登记 .proto 源码（嵌入式，运行时不需要 .proto 文件）
 var refl = try zgrpc.reflection.Service.init(allocator, &.{

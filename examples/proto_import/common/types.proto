@@ -1,0 +1,15 @@
+// 被 import 的公共类型（验证跨文件引用与反射的 dependency 传递）
+syntax = "proto3";
+
+package common;
+
+message Money {
+  int64 cents = 1;
+  string currency = 2;
+}
+
+enum Region {
+  GLOBAL = 0;
+  CN = 1;
+  US = 2;
+}

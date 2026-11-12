@@ -6,7 +6,7 @@
 //!
 //! ## 支持的语法
 //!
-//! - `syntax = "proto3";`、`package a.b.c;`
+//! - `syntax = "proto3";`、`package a.b.c;`、`import "path.proto";`
 //! - `message Name { ... }`：标量、`string`/`bytes`、`enum` 字段、同文件 message 字段，
 //!   `repeated` 支持**任意元素**（标量 / `string` / `bytes` / enum / message），
 //!   `map<K, V>`（key 限整数或 `string`），`oneof { ... }`，`optional`（proto3 显式 presence），
@@ -14,9 +14,11 @@
 //! - `enum Name { A = 0; ... }`
 //! - `service Name { rpc M(Req) returns (Res); rpc S(stream Req) returns (stream Res); }`
 //!
+//! 本模块只负责**单文件**语法；跨文件加载与依赖顺序见 `proto_loader.zig`。
+//!
 //! ## 明确不支持（报错并指出行号，不静默忽略）
 //!
-//! `import`、`reserved`、`extend`、`group`。
+//! `import public` / `import weak`、`reserved`、`extend`、`group`。
 
 const std = @import("std");
 
@@ -146,8 +148,15 @@ pub const Rpc = struct {
 
 pub const Service = struct { name: []const u8, rpcs: []Rpc };
 
+pub const Import = struct {
+    /// import 语句里的路径原样保留（反射的 `dependency` 与 `file_by_filename` 都用它）
+    path: []const u8,
+    line: usize,
+};
+
 pub const Proto = struct {
     package: []const u8 = "",
+    imports: []const Import = &.{},
     messages: []Message = &.{},
     enums: []EnumDef = &.{},
     services: []Service = &.{},
@@ -207,6 +216,7 @@ pub const Parser = struct {
 
     pub fn parseFile(self: *Parser) ParseError!Proto {
         var out = Proto{};
+        var imports: std.ArrayListUnmanaged(Import) = .empty;
         var messages: std.ArrayListUnmanaged(Message) = .empty;
         var enums: std.ArrayListUnmanaged(EnumDef) = .empty;
         var services: std.ArrayListUnmanaged(Service) = .empty;
@@ -238,7 +248,20 @@ pub const Parser = struct {
                 try self.advance();
                 const name = try self.expectIdent();
                 try services.append(self.a, try self.parseService(name));
-            } else if (self.atIdent("import") or self.atIdent("option")) {
+            } else if (self.atIdent("import")) {
+                try self.advance();
+                // `import public` / `import weak` 语义不同（传递导出 / 可缺省），静默当普通 import 会出错
+                if (self.atIdent("public") or self.atIdent("weak")) {
+                    std.debug.print("[zgrpc.proto] 第 {d} 行：不支持 `import {s}`\n", .{ self.tok.line, self.tok.text });
+                    return error.Unsupported;
+                }
+                if (self.tok.kind != .string) return self.fail("import 后面必须是字符串路径");
+                const path = self.tok.text;
+                const line = self.tok.line;
+                try self.advance();
+                try self.expectSym(";");
+                try imports.append(self.a, .{ .path = path, .line = line });
+            } else if (self.atIdent("option")) {
                 std.debug.print("[zgrpc.proto] 第 {d} 行：不支持 `{s}`\n", .{ self.tok.line, self.tok.text });
                 return error.Unsupported;
             } else {
@@ -246,6 +269,7 @@ pub const Parser = struct {
             }
         }
 
+        out.imports = imports.items;
         out.messages = messages.items;
         out.enums = enums.items;
         out.services = services.items;
@@ -585,21 +609,20 @@ fn scanEnumIn(m: *const Message, prefix: []const u8, want: []const u8) ?*const E
     return null;
 }
 
-/// 递归查找 message（含嵌套定义）。`name` 可写 `Outer.Inner`，也可只写 `Inner`。
+/// 递归查找 message（含嵌套定义）。`name` 可写 `pkg.Outer.Inner`、`Outer.Inner` 或 `Inner`。
 pub fn findMessage(p: *const Proto, want: []const u8) ?*const Message {
     for (p.messages) |*m| {
-        if (scanMessage(m, "", want)) |hit| return hit;
+        // 初始 prefix 用 package：跨文件引用写的是 `common.Money`，不带包名就该命中不了
+        if (scanMessage(m, p.package, want)) |hit| return hit;
     }
     return null;
 }
 
 /// 递归查找 enum（含嵌套定义）。
-/// 因为 `Proto` 是值类型、没有全局上下文，这里需要把顶层 enums 一起传进来 ——
-/// 调用方通常直接传 `&parsed`，见 `findEnumIn`。
 pub fn findEnum(p: *const Proto, want: []const u8) ?*const EnumDef {
-    if (scanEnum(p, "", want)) |hit| return hit;
+    if (scanEnum(p, p.package, want)) |hit| return hit;
     for (p.messages) |*m| {
-        if (scanEnumIn(m, "", want)) |hit| return hit;
+        if (scanEnumIn(m, p.package, want)) |hit| return hit;
     }
     return null;
 }
@@ -623,13 +646,27 @@ fn scanQualified(alloc: std.mem.Allocator, m: *const Message, prefix: []const u8
 /// 生成描述符的 `type_name` 时需要绝对名 → 前面补 `.package.`。
 /// 名字未定义时返回 null（调用方决定是报错还是当外部类型）。
 pub fn qualifiedName(alloc: std.mem.Allocator, p: *const Proto, want: []const u8) !?[]const u8 {
-    for (p.messages) |*m| {
-        if (try scanQualified(alloc, m, "", want)) |hit| return hit;
+    const found: []const u8 = blk: {
+        for (p.messages) |*m| {
+            if (try scanQualified(alloc, m, p.package, want)) |hit| break :blk hit;
+        }
+        for (p.enums) |*e| {
+            if (nameMatch(p.package, e.name, want)) {
+                break :blk if (p.package.len == 0)
+                    try alloc.dupe(u8, e.name)
+                else
+                    try std.fmt.allocPrint(alloc, "{s}.{s}", .{ p.package, e.name });
+            }
+        }
+        return null;
+    };
+    // 剥掉 package 前缀：调用方自己会拼 `.package.`
+    if (p.package.len > 0 and found.len > p.package.len + 1 and
+        std.mem.startsWith(u8, found, p.package) and found[p.package.len] == '.')
+    {
+        return found[p.package.len + 1 ..];
     }
-    for (p.enums) |*e| {
-        if (nameMatch("", e.name, want)) return try alloc.dupe(u8, e.name);
-    }
-    return null;
+    return found;
 }
 
 // ---------------------------------------------------------------------------
@@ -671,13 +708,31 @@ test "proto：解析 message / enum / service（含流式标记）" {
 test "proto：不支持的语法报错而不静默忽略" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nimport \"x.proto\";\n"));
+    try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nimport public \"x.proto\";\n"));
     // map 的 key 不能是 float / double / bytes
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { map<double,int32> m = 1; }\n"));
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { map<bytes,int32> m = 1; }\n"));
     // oneof 成员不能是 repeated / map
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { oneof k { repeated int32 a = 1; } }\n"));
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { oneof k { map<string,int32> m = 1; } }\n"));
+}
+
+test "proto：import 语句被记录（路径与行号）" {
+    const src =
+        \\syntax = "proto3";
+        \\package demo;
+        \\import "common/types.proto";
+        \\import "other.proto";
+        \\message Req { int32 id = 1; }
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try parse(arena.allocator(), src);
+
+    try testing.expectEqual(@as(usize, 2), p.imports.len);
+    try testing.expectEqualStrings("common/types.proto", p.imports[0].path);
+    try testing.expectEqual(@as(usize, 3), p.imports[0].line);
+    try testing.expectEqualStrings("other.proto", p.imports[1].path);
 }
 
 test "proto：嵌套 message / enum 定义与递归查找" {

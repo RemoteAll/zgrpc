@@ -33,15 +33,21 @@ const Label = struct {
 /// protobuf 的 `type` 必须与 `type_name` 指向的真实定义一致：enum→14、message→11。
 /// 写错会导致 grpcurl/protoreflect 报
 /// `resolved "X", but it is not an message`。
-fn isEnumName(p: *const proto.Proto, name: []const u8) bool {
-    // 递归查找，嵌套定义的 enum 也要能识别
-    return proto.findEnum(p, name) != null;
+///
+/// `all` 是本次一起登记的全部文件：**跨包引用**（`common.Region`）的定义不在本文件里，
+/// 不查它就会被当成 message（→ type=11），protoreflect 直接报错。
+fn isEnumName(p: *const proto.Proto, all: []const proto.Proto, name: []const u8) bool {
+    if (proto.findEnum(p, name) != null) return true; // 递归查找，嵌套定义也能识别
+    for (all) |*o| {
+        if (proto.findEnum(o, name) != null) return true;
+    }
+    return false;
 }
 
-fn fieldTypeOf(p: *const proto.Proto, f: proto.Field) i32 {
+fn fieldTypeOf(p: *const proto.Proto, all: []const proto.Proto, f: proto.Field) i32 {
     return switch (f.ftype) {
         .scalar => |s| scalarTypeCode(s),
-        .named => |n| if (isEnumName(p, n)) 14 else 11,
+        .named => |n| if (isEnumName(p, all, n)) 14 else 11,
         // map 字段在 wire/描述符层面就是一个 message（指向自动生成的 `XxxEntry`）
         .map => 11,
     };
@@ -77,14 +83,14 @@ fn fullyQualified(alloc: std.mem.Allocator, package: []const u8, name: []const u
     return std.fmt.allocPrint(alloc, ".{s}.{s}", .{ package, name });
 }
 
-fn writeField(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, msg_name: []const u8, p: *const proto.Proto, f: proto.Field, oneof_index: ?u32) !void {
+fn writeField(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, msg_name: []const u8, p: *const proto.Proto, all: []const proto.Proto, f: proto.Field, oneof_index: ?u32) !void {
     var inner = pb.Writer.init(alloc);
     defer inner.deinit();
 
     try inner.string(1, f.name); // name
     try inner.int32(3, @intCast(f.number)); // number
     try inner.int32(4, if (f.repeated) Label.repeated else Label.optional); // label
-    try inner.int32(5, fieldTypeOf(p, f)); // type
+    try inner.int32(5, fieldTypeOf(p, all, f)); // type
     switch (f.ftype) {
         .scalar => {},
         .named => |n| {
@@ -141,6 +147,7 @@ fn writeMapEntry(
     alloc: std.mem.Allocator,
     package: []const u8,
     p: *const proto.Proto,
+    all: []const proto.Proto,
     mt: proto.MapType,
     field_name: []const u8,
 ) !void {
@@ -167,7 +174,7 @@ fn writeMapEntry(
         switch (mt.value.*) {
             .scalar => |s| try vf.int32(5, scalarTypeCode(s)),
             .named => |n| {
-                try vf.int32(5, if (isEnumName(p, n)) 14 else 11);
+                try vf.int32(5, if (isEnumName(p, all, n)) 14 else 11);
                 try vf.string(6, try fullyQualified(alloc, package, n));
             },
             // protobuf 不允许 map 的 value 又是 map（parser 已挡住，这里只是穷尽 switch）
@@ -185,8 +192,8 @@ fn writeMapEntry(
     try w.message(3, entry.bytes()); // DescriptorProto.nested_type = 3
 }
 
-fn writeMessage(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, p: *const proto.Proto, m: proto.Message, outer: []const u8) !void {
-    try writeMessageAs(w, alloc, package, p, m, outer, 4); // 顶层：FileDescriptorProto.message_type = 4
+fn writeMessage(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, p: *const proto.Proto, all: []const proto.Proto, m: proto.Message, outer: []const u8) !void {
+    try writeMessageAs(w, alloc, package, p, all, m, outer, 4); // 顶层：FileDescriptorProto.message_type = 4
 }
 
 /// `field_num`：顶层用 4，嵌套用 3（`DescriptorProto.nested_type`）。
@@ -196,6 +203,7 @@ fn writeMessageAs(
     alloc: std.mem.Allocator,
     package: []const u8,
     p: *const proto.Proto,
+    all: []const proto.Proto,
     m: proto.Message,
     outer: []const u8,
     field_num: u32,
@@ -213,18 +221,18 @@ fn writeMessageAs(
     // 先排真实 oneof，再排 `optional` 字段的合成 oneof（索引必须与实际 oneof_decl 顺序一致）
     for (m.fields) |f| {
         if (f.proto3_optional) {
-            try writeField(&inner, alloc, package, full_name, p, f, @intCast(m.oneofs.len + syntheticIndex(m, f)));
+            try writeField(&inner, alloc, package, full_name, p, all, f, @intCast(m.oneofs.len + syntheticIndex(m, f)));
         } else {
-            try writeField(&inner, alloc, package, full_name, p, f, f.oneof_index);
+            try writeField(&inner, alloc, package, full_name, p, all, f, f.oneof_index);
         }
     }
     // 嵌套定义（message / enum）：`DescriptorProto.nested_type = 3`、`enum_type = 4`
-    for (m.nested) |n| try writeMessageAs(&inner, alloc, package, p, n, full_name, 3);
+    for (m.nested) |n| try writeMessageAs(&inner, alloc, package, p, all, n, full_name, 3);
     for (m.enums) |e| try writeEnumAs(&inner, alloc, e, 4);
     // map 字段要额外生成嵌套 Entry 类型（`nested_type`）
     for (m.fields) |f| {
         switch (f.ftype) {
-            .map => |mt| try writeMapEntry(&inner, alloc, package, p, mt, f.name),
+            .map => |mt| try writeMapEntry(&inner, alloc, package, p, all, mt, f.name),
             else => {},
         }
     }
@@ -291,12 +299,24 @@ fn writeService(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, s:
 ///
 /// `file_name` 就是客户端后面用来 `file_by_filename` 查询的名字（通常用 `.proto` 的文件名或任意标识）。
 pub fn encodeFile(alloc: std.mem.Allocator, file_name: []const u8, p: proto.Proto) ![]const u8 {
+    return encodeFileWith(alloc, file_name, p, &.{});
+}
+
+/// 带跨文件上下文：`all` 是本次一起登记的全部文件。
+/// 跨包引用（`common.Region`）要靠它判定 enum / message，否则会被当成 message 编码。
+pub fn encodeFileWith(
+    alloc: std.mem.Allocator,
+    file_name: []const u8,
+    p: proto.Proto,
+    all: []const proto.Proto,
+) ![]const u8 {
     var w = pb.Writer.init(alloc);
     defer w.deinit();
 
     try w.string(1, file_name); // name
     if (p.package.len > 0) try w.string(2, p.package); // package
-    for (p.messages) |m| try writeMessage(&w, alloc, p.package, &p, m, "");
+    for (p.imports) |imp| try w.string(3, imp.path); // dependency（按 import 原样路径）
+    for (p.messages) |m| try writeMessage(&w, alloc, p.package, &p, all, m, "");
     for (p.enums) |e| try writeEnum(&w, alloc, e);
     for (p.services) |s| try writeService(&w, alloc, p.package, s);
     try w.string(12, "proto3"); // syntax

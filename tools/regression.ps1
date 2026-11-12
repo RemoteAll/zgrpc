@@ -16,7 +16,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # 测试数下限：只能抬高，不能降低（降低必须在 docs/决策记录.md 写明依据）
-$minTests = 67
+$minTests = 74
 
 # 随机空闲端口：Windows 上 `Stop-Process -Force`（= TerminateProcess）会让监听 socket
 # 变成 zombie LISTEN（netstat 里 OwningProcess=0），持续数十秒且无法 kill。
@@ -243,6 +243,39 @@ if ($SkipSmoke) {
         } finally {
             if ($srv -and -not $srv.HasExited) { Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue }
         }
+    }
+}
+
+# ---------- 3.6 跨文件 import：加载 + 反射 dependency + 无 proto 调用 ----------
+$importPort = Get-FreePort
+$importExe = Join-Path $root 'zig-out\bin\import-server.exe'
+if ($SkipSmoke) {
+    Write-Report "[回归] SKIP：import 反射（-SkipSmoke）"
+} elseif (-not (Test-Path $grpcurlExe)) {
+    Write-Report "[回归] SKIP：import 反射（未找到 grpcurl）"
+} elseif (-not (Test-Path $importExe)) {
+    Write-Report "[回归] SKIP：import 反射（缺少 import-server 产物）"
+} else {
+    $srv2 = Start-Process -FilePath $importExe -ArgumentList @('--port', $importPort.ToString()) -RedirectStandardError "$reportDir\import-server.log" -PassThru -WindowStyle Hidden
+    Start-Sleep -Milliseconds 900
+    try {
+        $impOk = $true
+        $o1 = & $grpcurlExe -plaintext "127.0.0.1:$importPort" describe shop.Order 2>&1 | Out-String
+        Add-Content -Path $report -Value "[回归] import describe：$o1" -Encoding UTF8
+        if ($o1 -notmatch '\.common\.Money' -or $o1 -notmatch '\.common\.Region') { $impOk = $false; Write-Report "[回归] FAIL：跨文件类型未正确解析" }
+
+        $o2 = & $grpcurlExe -plaintext "127.0.0.1:$importPort" describe common.Money 2>&1 | Out-String
+        Add-Content -Path $report -Value "[回归] import describe 依赖文件：$o2" -Encoding UTF8
+        if ($o2 -notmatch 'common\.Money is a message') { $impOk = $false; Write-Report "[回归] FAIL：依赖文件未随 dependency 提供" }
+
+        $o3 = '{"id":"A1","total":{"cents":100,"currency":"CNY"},"region":"CN"}' | & $grpcurlExe -plaintext -d '@' "127.0.0.1:$importPort" shop.Shop/Get 2>&1 | Out-String
+        Add-Content -Path $report -Value "[回归] import 调用：$o3" -Encoding UTF8
+        if ($o3 -notmatch '"currency": "CNY"' -or $o3 -notmatch '"region": "CN"') { $impOk = $false; Write-Report "[回归] FAIL：跨文件类型往返失败" }
+
+        if ($impOk) { Write-Report "[回归] PASS：import（递归加载 + 反射 dependency + 跨包类型往返）" }
+        else { $failed += 'import' }
+    } finally {
+        if ($srv2 -and -not $srv2.HasExited) { Stop-Process -Id $srv2.Id -Force -ErrorAction SilentlyContinue }
     }
 }
 

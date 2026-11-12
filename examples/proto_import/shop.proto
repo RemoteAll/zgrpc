@@ -1,0 +1,18 @@
+// 带 import 的服务定义：跨包引用 common 里的 message 与 enum
+syntax = "proto3";
+
+package shop;
+
+import "common/types.proto";
+
+message Order {
+  string id = 1;
+  common.Money total = 2;
+  common.Region region = 3;
+  repeated common.Money lines = 4;
+  map<string, common.Money> by_sku = 5;
+}
+
+service Shop {
+  rpc Get(Order) returns (Order);
+}

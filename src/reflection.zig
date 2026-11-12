@@ -59,6 +59,7 @@
 const std = @import("std");
 const grpc = @import("grpc.zig");
 const proto = @import("proto.zig");
+const proto_loader = @import("proto_loader.zig");
 const descriptor = @import("descriptor.zig");
 const pb = @import("pb.zig");
 
@@ -100,6 +101,31 @@ pub const Service = struct {
                 .bytes = try descriptor.encodeFile(a, s.file_name, parsed),
                 .symbols = try collectSymbols(a, parsed),
                 .service_names = try collectServiceNames(a, parsed),
+            };
+        }
+        return .{ .arena = arena, .entries = entries };
+    }
+
+    /// 从 `proto_loader` 的结果建反射服务（**支持 import**：每个文件一份 descriptor）。
+    ///
+    /// `loaded.files` 已按依赖拓扑排序（被依赖的在前），客户端 `file_by_filename`
+    /// 拉依赖时能逐层拿全。
+    pub fn fromLoaded(parent: std.mem.Allocator, loaded: proto_loader.Loaded) !Service {
+        var arena = std.heap.ArenaAllocator.init(parent);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+
+        // 跨包引用的 enum / message 判定要能查到同批登记的其他文件
+        const all = try a.alloc(proto.Proto, loaded.files.len);
+        for (loaded.files, 0..) |f, i| all[i] = f.proto;
+
+        const entries = try a.alloc(Entry, loaded.files.len);
+        for (loaded.files, 0..) |f, i| {
+            entries[i] = .{
+                .file_name = try a.dupe(u8, f.name),
+                .bytes = try descriptor.encodeFileWith(a, f.name, f.proto, all),
+                .symbols = try collectSymbols(a, f.proto),
+                .service_names = try collectServiceNames(a, f.proto),
             };
         }
         return .{ .arena = arena, .entries = entries };

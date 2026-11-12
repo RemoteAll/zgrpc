@@ -6,6 +6,14 @@
 ## 未发布
 
 ### 新增
+- **`import` 跨文件引用（加载 + 反射）**：新增 `zgrpc.proto_loader`（递归加载、拓扑排序、循环依赖报错）
+  与 `zgrpc.reflection.Service.fromLoaded`（每个文件一份 `FileDescriptorProto`，带 `dependency`）。
+  路径按 **root 文件所在目录**解析（等价单一 `-I`，与 protoc 一致）。
+  - 跨包类型（`common.Region`）的 enum/message 判定靠 `encodeFileWith(..., all)` 的多文件上下文；
+    漏了它会被当成 message 编码，protoreflect 直接报错。
+  - `describe shop.Order` 实测渲染出 `.common.Money` / `.common.Region`，且 `describe common.Money`
+    （依赖文件里的类型）也能查；无 `.proto` 调用可正确往返 enum 与嵌套 message。
+  - 示例：`zig build import-server`（`examples/proto_import/`）；**codegen 仍只支持单文件**（遇 `import` 会报错）。
 - **嵌套 `message` / `enum` 定义**：生成 Zig 嵌套声明（引用写 `Outer.Inner`），反射侧递归收集符号
   并用相对全名解析 `type_name`；`grpcurl describe echo.Container.Nested` 可直接查。
 - **`optional`（proto3 显式 presence）**：生成 `?T`，**设为默认值也会写盘**（否则无法区分「设成 0」与「未设置」）。
