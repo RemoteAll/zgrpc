@@ -146,6 +146,25 @@ gRPC 的一次调用是 HEADERS + DATA + TRAILERS 多个小包。Nagle 会让后
 - **客户端**：`client.enableTimeout(stream, io)` 会自动关闭 Nagle；只需要这一项就调 `client.tuneSocket(stream, io)`；
 - **服务端**：accept 之后调一次 `zgrpc.socket_timeout.setNoDelay(io, stream, true)`（见 `examples/grpc_echo_server.zig` 与 `tools/bench.zig`）。
 
+### 富错误：`grpc-status-details-bin`
+
+`grpc-status` 只有一个数字码。要告诉客户端「哪个字段错了 / 缺什么权限 / 多久后重试」，用 `zgrpc.status`：
+
+```zig
+try call.setStatusDetails(arena, .{
+    .code = 3, // INVALID_ARGUMENT
+    .message = "参数不合法",
+    .details = &.{
+        .{ .type_url = "type.googleapis.com/google.rpc.BadRequest", .value = bad_request_bytes },
+        .{ .type_url = "type.googleapis.com/google.rpc.RetryInfo", .value = retry_bytes },
+    },
+});
+call.setStatus(.invalid_argument, "参数不合法");
+```
+
+- 自动按 `-bin` 规则做 base64（无 padding）写入 trailers；
+- 客户端侧用 `result.binaryMetadata(arena, "grpc-status-details-bin")` 取原始字节，再用 `zgrpc.status.decode` 解析；
+- 未知字段跳过、截断数据返回错误而非 panic（protobuf 前向兼容）。
 ### 外部工具验证（`ghz`，业界标准 gRPC 压测器）
 
 以上数字是自己进程内测的（客户端与服务端抢同一批 CPU）。用 Go 的 `ghz` 作**独立进程**压测同一份服务端：

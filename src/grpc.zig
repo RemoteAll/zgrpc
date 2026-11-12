@@ -17,6 +17,7 @@ const std = @import("std");
 const h2 = @import("h2.zig");
 const hpack = @import("hpack.zig");
 const gzip = @import("gzip.zig");
+const rpc_status = @import("status.zig");
 const clock = @import("clock.zig");
 
 /// gRPC 状态码（https://grpc.io/docs/guides/status-codes/）。
@@ -414,6 +415,14 @@ pub const Call = struct {
     }
 
     /// 距截止时刻还有多少纳秒（未设超时返回 null；已过期则为负数）。
+    /// 设置**富错误详情**：把 `google.rpc.Status` 序列化后写入 `grpc-status-details-bin` trailer。
+    ///
+    /// 规范里 `grpc-status` 只有一个数字码；业务要表达「哪个字段错了 / 缺什么权限 / 多久后重试」
+    /// 就靠这条 trailer。`code` 建议与随后 `setStatus` 的错误码一致。
+    pub fn setStatusDetails(self: *Call, arena: std.mem.Allocator, st: rpc_status.Status) !void {
+        const raw = try rpc_status.encode(arena, st);
+        try self.setBinaryTrailer("grpc-status-details-bin", raw);
+    }
     pub fn remainingNs(self: *const Call) ?i128 {
         const d = self.deadline_ns orelse return null;
         return d - clock.monotonicNs();
