@@ -1,0 +1,40 @@
+// zgrpc 代码生成示例（proto3 子集）
+//
+// 生成：zig run tools/proto_gen.zig -- examples/echo.proto examples/echo.pb.zig
+syntax = "proto3";
+
+package echo;
+
+// 与 examples/grpc_echo_server.zig 的 /echo.Echo/Bump 对应
+message BumpRequest {
+  int32 value = 1;
+  string tag = 2;
+}
+
+message BumpResponse {
+  int32 value = 1;
+  string tag = 2;
+  uint64 calls = 3;
+}
+
+enum Status {
+  UNKNOWN = 0;
+  OK = 1;
+  FAILED = 2;
+}
+
+// 复杂一点的：嵌套 message + 枚举 + repeated
+message Summary {
+  string note = 1;
+  Status status = 2;
+  BumpResponse last = 3;
+  repeated int32 samples = 4;
+  repeated uint64 counters = 5;
+  bool done = 6;
+  double ratio = 7;
+}
+
+service Echo {
+  rpc Say(BumpRequest) returns (BumpResponse);
+  rpc Chat(stream BumpRequest) returns (stream BumpResponse);
+}

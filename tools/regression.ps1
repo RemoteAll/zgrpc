@@ -87,6 +87,35 @@ if ($testCode -ne 0) {
     }
 }
 
+# ---------- 2.5 代码生成（proto3 子集）：生成 + 语法检查 + 生成代码单测 ----------
+$genLog = Join-Path $reportDir 'codegen.log'
+$genOut = & $zig build codegen 2>&1 | Out-String
+$genCode = $LASTEXITCODE
+Add-Content -Path $genLog -Value $genOut -Encoding UTF8
+if ($genCode -ne 0) {
+    Write-Report "[回归] FAIL：zig build codegen exit=$genCode（详见 $genLog）"
+    $failed += 'codegen'
+} else {
+    $astOut = & $zig ast-check 'examples\echo.pb.zig' 2>&1 | Out-String
+    $astCode = $LASTEXITCODE
+    Add-Content -Path $genLog -Value $astOut -Encoding UTF8
+    if ($astCode -ne 0) {
+        Write-Report "[回归] FAIL：生成的 echo.pb.zig 语法检查未通过（详见 $genLog）"
+        $failed += 'codegen-ast'
+    } else {
+        # 生成代码的编解码单测（examples/echo_pb_test.zig，独立一套）
+        $pbOut = & $zig build test 2>&1 | Out-String
+        $pbCode = $LASTEXITCODE
+        Add-Content -Path $genLog -Value $pbOut -Encoding UTF8
+        if ($pbCode -ne 0) {
+            Write-Report "[回归] FAIL：zig build test（含生成代码单测）exit=$pbCode（详见 $genLog）"
+            $failed += 'codegen-test'
+        } else {
+            Write-Report "[回归] PASS：codegen（生成 + ast-check + 生成代码单测）"
+        }
+    }
+}
+
 # ---------- 3. 冒烟：真实 socket 并发双流 ----------
 if ($SkipSmoke) {
     Write-Report "[回归] SKIP：冒烟（-SkipSmoke）"

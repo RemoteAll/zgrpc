@@ -255,8 +255,10 @@ pub const Field = struct {
 
     pub fn asEnum(self: Field, comptime E: type) ?E {
         const raw = self.asInt32();
-        inline for (@typeInfo(E).@"enum".fields) |fld| {
-            if (fld.value == raw) return @enumFromInt(raw);
+        // Zig 0.17 的 Enum TypeInfo 是 field_values（不再是 fields）
+        const info = @typeInfo(E).@"enum";
+        inline for (info.field_values) |v| {
+            if (v == raw) return @enumFromInt(raw);
         }
         return null;
     }

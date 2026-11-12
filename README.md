@@ -21,7 +21,7 @@
 handler 并行执行（业务仍同步串行，串行只是执行顺序，**不会因此拒绝并发流**）、
 客户端流/bidi 背压（gRPC-Web 规范本身也不支持 bidi）、`grpc-timeout` 的**强制中断**（本层只判超时并回 `DEADLINE_EXCEEDED`，
 不会打断已阻塞在业务里的调用）、
-protobuf 代码生成（`.proto` → Zig，属于独立工具；运行时原语见 `pb`）。
+well-known types / `Any` / 反射（`.proto` 子集代码生成见下）。
 
 ### 对照官方规范的符合性
 
@@ -70,6 +70,23 @@ try conn.serve(server.context(), server.handler());
 ```
 
 完整可运行例子见 `examples/grpc_echo_server.zig` / `examples/grpc_echo_client.zig`。
+
+## 代码生成（可选）
+
+`tools/proto_gen.zig` 把 proto3 的**子集**编译成 Zig 结构体 + `encode`/`decode` + 路由常量，
+生成结果直接跑在 `zgrpc.pb` 上（零依赖）：
+
+```bash
+zig build codegen        # 从 examples/echo.proto 生成 examples/echo.pb.zig
+# 或直接指定输入输出：
+zig run tools/proto_gen.zig -- my.proto my.pb.zig
+```
+
+支持：`syntax = "proto3"`、`package`、`message`（标量 / `string` / `bytes` / 枚举 / 嵌套 message / `repeated` 标量）、
+`enum`、`service`（含 `stream` 标记，生成路由常量）。
+
+**不支持**（遇到会报错并给行号，不静默忽略）：`import`、`map`、`oneof`、`optional`、`reserved`、
+`extend`、`option`、嵌套定义、`repeated` message/string。
 
 ## 构建与验证
 
