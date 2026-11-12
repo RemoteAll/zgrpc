@@ -5,7 +5,8 @@
 
 param(
     [switch]$SkipBuild,
-    [switch]$SkipSmoke
+    [switch]$SkipSmoke,
+    [switch]$SkipInterop
 )
 
 # 外部命令（zig 等）写 stderr 不能被当成终止错误，否则脚本会被炸掉且无提示
@@ -15,7 +16,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # 测试数下限：只能抬高，不能降低（降低必须在 docs/决策记录.md 写明依据）
-$minTests = 20
+$minTests = 23
 
 $reportDir = Join-Path $root 'artifacts\regression'
 New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
@@ -114,6 +115,74 @@ if ($SkipSmoke) {
                 }
             } finally {
                 if ($server -and -not $server.HasExited) { Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue }
+            }
+        }
+    }
+}
+
+# ---------- 4. 互操作对拍（Rust hyper 当裁判，双向）----------
+if ($SkipInterop) {
+    Write-Report "[回归] SKIP：互操作对拍（-SkipInterop）"
+} else {
+    $interopExe = Join-Path $root 'tools\interop-rust\target\release\zgrpc-interop.exe'
+    $serverExe2 = Join-Path $root 'zig-out\bin\echo-server.exe'
+    $clientExe2 = Join-Path $root 'zig-out\bin\echo-client.exe'
+    if (-not (Test-Path $interopExe)) {
+        Write-Report "[回归] SKIP：互操作对拍（缺 tools/interop-rust/target/release/zgrpc-interop.exe，先 cargo build --release）"
+    } elseif (-not (Test-Path $serverExe2) -or -not (Test-Path $clientExe2)) {
+        Write-Report "[回归] SKIP：互操作对拍（缺 zig 示例产物）"
+    } else {
+        # (a) Rust 服务端 -> zgrpc 客户端
+        $p18061 = Get-NetTCPConnection -LocalPort 18061 -ErrorAction SilentlyContinue
+        if ($p18061) {
+            Write-Report "[回归] SKIP：对拍(a)（18061 被占用）"
+        } else {
+            $rs = Start-Process -FilePath $interopExe -ArgumentList @('server', '--port', '18061') -RedirectStandardError "$reportDir\rust-server.log" -RedirectStandardOutput "$reportDir\rust-server.out" -PassThru -WindowStyle Hidden
+            Start-Sleep -Milliseconds 900
+            try {
+                $zo = & $clientExe2 18061 2>&1 | Out-String
+                $zc = $LASTEXITCODE
+                Add-Content -Path $report -Value "[回归] zgrpc client -> Rust server：$zo" -Encoding UTF8
+                if ($zc -eq 0) {
+                    Write-Report "[回归] PASS：对拍 zgrpc client -> Rust server"
+                } else {
+                    Write-Report "[回归] FAIL：对拍 zgrpc client -> Rust server exit=$zc"
+                    $failed += 'interop-zig-client'
+                }
+            } finally {
+                if ($rs -and -not $rs.HasExited) { Stop-Process -Id $rs.Id -Force -ErrorAction SilentlyContinue }
+            }
+        }
+
+        # (b)(c) zgrpc 服务端 -> Rust 客户端（原生 + gRPC-Web）
+        $p18051 = Get-NetTCPConnection -LocalPort 18051 -ErrorAction SilentlyContinue
+        if ($p18051) {
+            Write-Report "[回归] SKIP：对拍(b)(c)（18051 被占用，pid=$(($p18051 | Select-Object -First 1).OwningProcess)）"
+        } else {
+            $zs = Start-Process -FilePath $serverExe2 -RedirectStandardError "$reportDir\zig-server.log" -PassThru -WindowStyle Hidden
+            Start-Sleep -Milliseconds 700
+            try {
+                $ro = & $interopExe client --port 18051 2>&1 | Out-String
+                $rc = $LASTEXITCODE
+                Add-Content -Path $report -Value "[回归] Rust client(原生) -> zgrpc server：$ro" -Encoding UTF8
+                if ($rc -eq 0) {
+                    Write-Report "[回归] PASS：对拍 Rust client(原生) -> zgrpc server"
+                } else {
+                    Write-Report "[回归] FAIL：对拍 Rust client(原生) exit=$rc"
+                    $failed += 'interop-rust-native'
+                }
+
+                $rwo = & $interopExe client --port 18051 --web 2>&1 | Out-String
+                $rwc = $LASTEXITCODE
+                Add-Content -Path $report -Value "[回归] Rust client(gRPC-Web) -> zgrpc server：$rwo" -Encoding UTF8
+                if ($rwc -eq 0) {
+                    Write-Report "[回归] PASS：对拍 Rust client(gRPC-Web) -> zgrpc server"
+                } else {
+                    Write-Report "[回归] FAIL：对拍 Rust client(gRPC-Web) exit=$rwc"
+                    $failed += 'interop-rust-web'
+                }
+            } finally {
+                if ($zs -and -not $zs.HasExited) { Stop-Process -Id $zs.Id -Force -ErrorAction SilentlyContinue }
             }
         }
     }

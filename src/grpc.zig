@@ -13,6 +13,7 @@
 const std = @import("std");
 const h2 = @import("h2.zig");
 const hpack = @import("hpack.zig");
+const gzip = @import("gzip.zig");
 
 /// gRPC 状态码（https://grpc.io/docs/guides/status-codes/）。
 pub const Status = enum(u32) {
@@ -40,10 +41,12 @@ pub const Message = struct {
     payload: []const u8,
 };
 
-/// 遍历一个 gRPC 请求体里的全部消息。
+/// 遍历一个 gRPC 请求体里的全部消息（压缩消息会**自动解压**）。
 pub const MessageIterator = struct {
     data: []const u8,
     pos: usize = 0,
+    /// 解压用分配器：压缩消息必须有它（为空时压缩消息返回 null，避免把压缩字节当明文给业务）
+    alloc: ?std.mem.Allocator = null,
 
     pub fn next(self: *MessageIterator) ?Message {
         if (self.pos + 5 > self.data.len) return null;
@@ -51,8 +54,13 @@ pub const MessageIterator = struct {
         const len = std.mem.readInt(u32, self.data[self.pos + 1 ..][0..4], .big);
         const start = self.pos + 5;
         if (len > self.data.len - start) return null;
+        const raw = self.data[start .. start + len];
         self.pos = start + len;
-        return .{ .compressed = compressed, .payload = self.data[start..self.pos] };
+        if (!compressed) return .{ .compressed = false, .payload = raw };
+
+        const a = self.alloc orelse return null;
+        const plain = gzip.decompress(a, raw) catch return null;
+        return .{ .compressed = true, .payload = plain };
     }
 };
 
@@ -80,12 +88,27 @@ fn describeContentType(req: h2.Request, call: *Call) bool {
     if (std.mem.startsWith(u8, ct, "application/grpc-web")) {
         call.web = true;
         call.resp_content_type = "application/grpc-web+proto";
-        return true;
-    }
-    if (std.mem.startsWith(u8, ct, "application/grpc")) {
+    } else if (std.mem.startsWith(u8, ct, "application/grpc")) {
         call.web = false;
         call.resp_content_type = "application/grpc";
-        return true;
+    } else {
+        return false;
+    }
+
+    // 客户端声明可接受的响应压缩算法（`grpc-accept-encoding: gzip, deflate`）
+    if (req.header("grpc-accept-encoding")) |ae| {
+        call.accept_gzip = containsIgnoreCase(ae, "gzip");
+    }
+    return true;
+}
+
+/// 大小写不敏感的子串查找（头值匹配）。
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
     }
     return false;
 }
@@ -106,6 +129,10 @@ pub const Call = struct {
     web: bool = false,
     /// 响应 content-type（web / 原生）
     resp_content_type: []const u8 = "application/grpc",
+    /// 客户端声明接受 gzip（`grpc-accept-encoding`）→ 响应消息压缩
+    accept_gzip: bool = false,
+    /// 响应消息是否真压过（决定是否发 `grpc-encoding: gzip` 头）
+    resp_gzip: bool = false,
 
     // --- 流式模式状态（由 `Server.streamHooks` 驱动）---
     /// 跨 DATA 帧的累积缓冲（整请求路由存原始帧，流式路由存待切分帧）
@@ -116,24 +143,45 @@ pub const Call = struct {
 
     /// unary 调用取第一条消息。
     pub fn firstMessage(self: *Call) ?Message {
-        var it = MessageIterator{ .data = self.req.body };
+        var it = MessageIterator{ .data = self.req.body, .alloc = self.alloc };
         return it.next();
     }
 
     pub fn messages(self: *Call) MessageIterator {
-        return .{ .data = self.req.body };
+        return .{ .data = self.req.body, .alloc = self.alloc };
     }
 
     /// 发送一条响应消息（服务端流式可多次调用）。
+    ///
+    /// 客户端在 `grpc-accept-encoding` 里声明 gzip 且消息够大时，自动压缩并置帧标志位。
     pub fn sendMessage(self: *Call, payload: []const u8) !void {
         if (self.finished) return error.AlreadyFinished;
         if (!self.sent_any) {
-            const ct = [_]hpack.Header{.{ .name = "content-type", .value = self.resp_content_type }};
-            try self.rsp.begin("200", &ct);
+            const should_gzip = self.accept_gzip and payload.len >= compress_min_size;
+            var hs: [2]hpack.Header = undefined;
+            var n: usize = 0;
+            hs[n] = .{ .name = "content-type", .value = self.resp_content_type };
+            n += 1;
+            if (should_gzip) {
+                hs[n] = .{ .name = "grpc-encoding", .value = "gzip" };
+                n += 1;
+                self.resp_gzip = true;
+            }
+            try self.rsp.begin("200", hs[0..n]);
             self.sent_any = true;
         }
+
         var buf: std.ArrayListUnmanaged(u8) = .empty;
-        try encodeMessage(&buf, self.alloc, payload);
+        if (self.resp_gzip and payload.len >= compress_min_size) {
+            const gz = try gzip.compress(self.alloc, payload);
+            try buf.append(self.alloc, 1); // 压缩标志位
+            var len: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len, @intCast(gz.len), .big);
+            try buf.appendSlice(self.alloc, &len);
+            try buf.appendSlice(self.alloc, gz);
+        } else {
+            try encodeMessage(&buf, self.alloc, payload);
+        }
         try self.rsp.sendData(buf.items);
     }
 
@@ -217,6 +265,9 @@ pub const StreamRoute = struct {
 
 /// 单条消息上限（流式重组时防炸）。
 const max_stream_message: usize = 4 * 1024 * 1024;
+
+/// 小于该体积不压缩（小报文压完反而变大，与 zzig/DH.RustBase 同口径）。
+const compress_min_size: usize = 256;
 
 /// gRPC 路由表；把它作为 `h2.Connection.serve` 的 handler 使用：
 /// ```zig
@@ -783,4 +834,100 @@ test "grpc：gRPC-Web（trailers 走 body 尾帧，不发 trailer HEADERS）" {
     const tlen = std.mem.readInt(u32, resp.items[msg_frame_len + 1 ..][0..4], .big);
     const tbytes = resp.items[msg_frame_len + 5 .. msg_frame_len + 5 + tlen];
     try testing.expect(std.mem.indexOf(u8, tbytes, "grpc-status: 0") != null);
+}
+// ---------------------------------------------------------------------------
+// gRPC 消息压缩（grpc-encoding: gzip）
+// ---------------------------------------------------------------------------
+
+fn echoHandler2(ctx: *anyopaque, call: *Call, arena: std.mem.Allocator) anyerror!void {
+    _ = ctx;
+    _ = arena;
+    const msg = call.firstMessage() orelse {
+        call.setStatus(.invalid_argument, "缺少请求消息");
+        return;
+    };
+    try call.sendMessage(msg.payload);
+}
+
+test "grpc：压缩请求自动解压 + 大响应按 grpc-accept-encoding 压缩" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // 1 KB 可压缩正文
+    const base = "compressible-payload-0123456789-";
+    var plain_buf: [base.len * 32]u8 = undefined;
+    for (0..32) |i| @memcpy(plain_buf[i * base.len ..][0..base.len], base);
+    const plain: []const u8 = &plain_buf;
+
+    // 请求体：压缩帧（flag=1 + 长度 + gzip 数据）
+    const gz_req = try gzip.compress(a, plain);
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    try body.append(a, 1);
+    var len: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len, @intCast(gz_req.len), .big);
+    try body.appendSlice(a, &len);
+    try body.appendSlice(a, gz_req);
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, h2.client_preface);
+    try h2.appendFrame(&input, a, .settings, 0, 0, &.{});
+
+    var block: std.ArrayListUnmanaged(u8) = .empty;
+    try hpack.encode(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/test.Echo/Big" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "grpc-encoding", .value = "gzip" },
+        .{ .name = "grpc-accept-encoding", .value = "gzip, deflate" },
+    }, &block, a);
+    try h2.appendFrame(&input, a, .headers, h2.Flags.end_headers, 1, block.items);
+    try h2.appendFrame(&input, a, .data, h2.Flags.end_stream, 1, body.items);
+
+    var routes = [_]Route{.{ .path = "/test.Echo/Big", .handler = echoHandler2 }};
+    var dummy: u8 = 0;
+    var server = Server{ .routes = &routes, .outer_ctx = &dummy };
+
+    var r = std.Io.Reader.fixed(input.items);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var conn = h2.Connection.init(testing.allocator, &r, &aw.writer, .{});
+    defer conn.deinit();
+    conn.serve(server.context(), server.handler()) catch |e| {
+        if (e != error.ConnectionClosed) return e;
+    };
+
+    var pos: usize = 0;
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    var saw_grpc_encoding = false;
+    var grpc_status: []const u8 = "";
+    while (h2.nextFrame(aw.written(), &pos)) |f| {
+        switch (f.ftype) {
+            .data => try resp.appendSlice(a, f.payload),
+            .headers => {
+                var dec = hpack.Decoder.init(testing.allocator);
+                defer dec.deinit();
+                var hs: std.ArrayListUnmanaged(hpack.Header) = .empty;
+                try dec.decode(f.payload, &hs, a);
+                for (hs.items) |h| {
+                    if (std.mem.eql(u8, h.name, "grpc-encoding") and std.mem.eql(u8, h.value, "gzip")) saw_grpc_encoding = true;
+                    if (std.mem.eql(u8, h.name, "grpc-status")) grpc_status = h.value;
+                }
+            },
+            else => {},
+        }
+    }
+
+    // 响应帧：flag=1 表示压缩
+    try testing.expect(resp.items.len > 5);
+    try testing.expectEqual(@as(u8, 1), resp.items[0]);
+    const rlen = std.mem.readInt(u32, resp.items[1..5], .big);
+    try testing.expectEqual(@as(usize, rlen), resp.items.len - 5);
+    const back = try gzip.decompress(a, resp.items[5..]);
+    try testing.expectEqualStrings(plain, back);
+    try testing.expect(saw_grpc_encoding);
+    try testing.expectEqualStrings("0", grpc_status);
 }

@@ -11,7 +11,7 @@
 |---|---|---|
 | `hpack` | 头部压缩（RFC 7541） | **解码完整**（静态表 + 动态表 + Huffman）；编码简化（静态命中走索引，其余明文 literal） |
 | `h2` | HTTP/2 明文 h2c（prior-knowledge）服务端 | SETTINGS/ACK、HEADERS/CONTINUATION（含 PADDED/PRIORITY）、DATA（含 PADDED + 流控回补）、WINDOW_UPDATE（连接级 + 每流）、PING、RST_STREAM、GOAWAY；**多路复用**（多流并存、发送阻塞时帧入 pending 队列） |
-| `grpc` | gRPC 语义层 | 消息分帧、状态码、路由、unary / 服务端流式 / **客户端流与 bidi**（`server.stream_routes` + `streamHooks`） |
+| `grpc` | gRPC 语义层 | 消息分帧、状态码、路由、unary / 服务端流式 / **客户端流与 bidi**（`server.stream_routes` + `streamHooks`）、**gRPC-Web**、**gzip 消息压缩** |
 | `client` | gRPC 客户端（h2c） | 握手、`unary`、**`callMany`（同一连接并发多条流）**、`clientStream`（客户端流/bidi），按 stream_id 归位、回补窗口 |
 
 **未做**（明确列出，避免误解为完整实现）：TLS/ALPN、服务端推送、优先级调度、
@@ -46,14 +46,14 @@ try conn.serve(server.context(), server.handler());
 ## 构建与验证
 
 ```bash
-zig build test           # 17 个单元/端到端测试
+zig build test           # 23 个单元/端到端测试
 zig build echo-server    # 监听 127.0.0.1:18051
 zig build echo-client    # 用 zgrpc.client 在同一 TCP 上并发两个 unary 调用
 ```
 
 实测（2026-11-12，Windows，Zig 0.17.1）：
 
-- `tools\regression.ps1` → 构建 PASS / tests 19（下限 19）/ 冒烟 PASS，exit 0；
+- `tools\regression.ps1` → 构建 PASS / tests 23（下限 23）/ 冒烟 PASS，exit 0；
 - 真实 socket：unary **并发双流**均 `grpc-status=0`；**bidi** 3 条请求 → 3 条响应（`chat:a/b/c`），exit 0。
 
 ## 为什么不直接复用现成 Zig 库

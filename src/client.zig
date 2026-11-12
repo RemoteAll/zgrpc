@@ -195,8 +195,7 @@ pub const Client = struct {
         return results;
     }
 
-    /// 客户端流 / bidi（批量形式）：把多条请求消息一次性发完，收全部响应消息。
-    ///
+    /// 客户端流 / bidi（批量形式）：把多条请求消息一次性发完，收全部响应消息。    ///
     /// 服务端若在每条消息到达时就回一条（bidi），这里能一次拿回多条 —— 这正是
     /// `grpc.Server.streamHooks()` 的配套验证场景。
     pub fn clientStream(
