@@ -185,10 +185,10 @@ pub const Client = struct {
             }
         }
 
-        // 去掉 gRPC 长度前缀，解出消息
+        // 去掉 gRPC 长度前缀，解出消息（压缩消息自动解压）
         for (results, bodies) |*r, b| {
             var list: std.ArrayListUnmanaged([]const u8) = .empty;
-            var it = grpc.MessageIterator{ .data = b.items };
+            var it = grpc.MessageIterator{ .data = b.items, .alloc = arena };
             while (it.next()) |m| try list.append(arena, m.payload);
             r.messages = list.items;
         }
@@ -277,7 +277,7 @@ pub const Client = struct {
         }
 
         var list: std.ArrayListUnmanaged([]const u8) = .empty;
-        var it = grpc.MessageIterator{ .data = resp.items };
+        var it = grpc.MessageIterator{ .data = resp.items, .alloc = arena };
         while (it.next()) |m| try list.append(arena, m.payload);
         result.messages = list.items;
         return result;
@@ -291,6 +291,8 @@ pub const Client = struct {
             .{ .name = ":authority", .value = self.opts.authority },
             .{ .name = "content-type", .value = "application/grpc" },
             .{ .name = "te", .value = "trailers" },
+            // 声明可接受 gzip：否则服务端永远不会压缩响应（大消息白耗带宽）
+            .{ .name = "grpc-accept-encoding", .value = "gzip" },
         }, &block, arena);
         try writeFrame(self.writer, .headers, h2.Flags.end_headers, stream_id, block.items);
     }
