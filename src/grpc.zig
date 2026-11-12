@@ -73,6 +73,23 @@ const grpc_content_type = [_]hpack.Header{
     .{ .name = "content-type", .value = "application/grpc" },
 };
 
+/// 识别 content-type：原生 gRPC 或 gRPC-Web（浏览器可达）。返回 false 表示不是 gRPC 流量。
+fn describeContentType(req: h2.Request, call: *Call) bool {
+    const ct = req.header("content-type") orelse return false;
+    // 必须先判 web：`application/grpc-web` 也以 `application/grpc` 开头
+    if (std.mem.startsWith(u8, ct, "application/grpc-web")) {
+        call.web = true;
+        call.resp_content_type = "application/grpc-web+proto";
+        return true;
+    }
+    if (std.mem.startsWith(u8, ct, "application/grpc")) {
+        call.web = false;
+        call.resp_content_type = "application/grpc";
+        return true;
+    }
+    return false;
+}
+
 /// 一次调用：业务通过它读请求消息、写响应消息、设状态。
 pub const Call = struct {
     req: h2.Request,
@@ -83,6 +100,12 @@ pub const Call = struct {
     error_message: []const u8 = "",
     sent_any: bool = false,
     finished: bool = false,
+
+    /// gRPC-Web（浏览器可达）：响应 `content-type: application/grpc-web+proto`，
+    /// **trailers 走 body 尾帧**而不是 HTTP trailers。
+    web: bool = false,
+    /// 响应 content-type（web / 原生）
+    resp_content_type: []const u8 = "application/grpc",
 
     // --- 流式模式状态（由 `Server.streamHooks` 驱动）---
     /// 跨 DATA 帧的累积缓冲（整请求路由存原始帧，流式路由存待切分帧）
@@ -105,7 +128,8 @@ pub const Call = struct {
     pub fn sendMessage(self: *Call, payload: []const u8) !void {
         if (self.finished) return error.AlreadyFinished;
         if (!self.sent_any) {
-            try self.rsp.begin("200", &grpc_content_type);
+            const ct = [_]hpack.Header{.{ .name = "content-type", .value = self.resp_content_type }};
+            try self.rsp.begin("200", &ct);
             self.sent_any = true;
         }
         var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -124,16 +148,43 @@ pub const Call = struct {
         self.finished = true;
 
         const a = self.alloc;
-        var trailers: std.ArrayListUnmanaged(hpack.Header) = .empty;
         var code_buf: [8]u8 = undefined;
         const code = try std.fmt.bufPrint(&code_buf, "{d}", .{@intFromEnum(self.status)});
+
+        // gRPC-Web：trailers 做成 body 尾帧（0x80 | 4B 长度 | "k: v\r\n"...）
+        if (self.web) {
+            var block: std.ArrayListUnmanaged(u8) = .empty;
+            try block.append(a, 0x80);
+            const len_pos = block.items.len;
+            try block.appendSlice(a, "\x00\x00\x00\x00");
+            const start = block.items.len;
+            try block.appendSlice(a, "grpc-status: ");
+            try block.appendSlice(a, code);
+            try block.appendSlice(a, "\r\n");
+            if (self.error_message.len > 0) {
+                try block.appendSlice(a, "grpc-message: ");
+                try block.appendSlice(a, self.error_message);
+                try block.appendSlice(a, "\r\n");
+            }
+            std.mem.writeInt(u32, block.items[len_pos..][0..4], @intCast(block.items.len - start), .big);
+
+            if (!self.sent_any) {
+                const ct = [_]hpack.Header{.{ .name = "content-type", .value = self.resp_content_type }};
+                try self.rsp.begin("200", &ct);
+                self.sent_any = true;
+            }
+            return self.rsp.endData(block.items);
+        }
+
+        var trailers: std.ArrayListUnmanaged(hpack.Header) = .empty;
         try trailers.append(a, .{ .name = "grpc-status", .value = code });
         if (self.error_message.len > 0) {
             try trailers.append(a, .{ .name = "grpc-message", .value = self.error_message });
         }
 
         if (!self.sent_any) {
-            try self.rsp.begin("200", &grpc_content_type);
+            const ct = [_]hpack.Header{.{ .name = "content-type", .value = self.resp_content_type }};
+            try self.rsp.begin("200", &ct);
             self.sent_any = true;
         }
         try self.rsp.end(trailers.items);
@@ -222,9 +273,8 @@ pub const Server = struct {
             call.setStatus(.unimplemented, "gRPC 只支持 POST");
             return call.finish();
         }
-        const ct = req.header("content-type") orelse "";
-        if (!std.mem.startsWith(u8, ct, "application/grpc")) {
-            call.setStatus(.invalid_argument, "content-type 必须是 application/grpc");
+        if (!describeContentType(req, &call)) {
+            call.setStatus(.invalid_argument, "content-type 必须是 application/grpc 或 application/grpc-web");
             return call.finish();
         }
 
@@ -258,9 +308,8 @@ pub const Server = struct {
             call.setStatus(.unimplemented, "gRPC 只支持 POST");
             return call.finish();
         }
-        const ct = req.header("content-type") orelse "";
-        if (!std.mem.startsWith(u8, ct, "application/grpc")) {
-            call.setStatus(.invalid_argument, "content-type 必须是 application/grpc");
+        if (!describeContentType(req, call)) {
+            call.setStatus(.invalid_argument, "content-type 必须是 application/grpc 或 application/grpc-web");
             return call.finish();
         }
 
@@ -659,4 +708,79 @@ test "grpc：流式模式下整请求路由仍可用（累积到 END_STREAM）" 
     var it = MessageIterator{ .data = resp.items };
     try testing.expectEqualStrings("pong", it.next().?.payload);
     try testing.expectEqualStrings("0", grpc_status);
+}
+
+test "grpc：gRPC-Web（trailers 走 body 尾帧，不发 trailer HEADERS）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, h2.client_preface);
+    try h2.appendFrame(&input, a, .settings, 0, 0, &.{});
+
+    var block: std.ArrayListUnmanaged(u8) = .empty;
+    try hpack.encode(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/test.Echo/Ping" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = "content-type", .value = "application/grpc-web+proto" },
+    }, &block, a);
+    try h2.appendFrame(&input, a, .headers, h2.Flags.end_headers, 1, block.items);
+
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    try encodeMessage(&body, a, "ping");
+    try h2.appendFrame(&input, a, .data, h2.Flags.end_stream, 1, body.items);
+
+    var routes = [_]Route{.{ .path = "/test.Echo/Ping", .handler = pingHandler }};
+    var dummy: u8 = 0;
+    var server = Server{ .routes = &routes, .outer_ctx = &dummy };
+
+    var r = std.Io.Reader.fixed(input.items);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var conn = h2.Connection.init(testing.allocator, &r, &aw.writer, .{});
+    defer conn.deinit();
+    conn.serve(server.context(), server.handler()) catch |e| {
+        if (e != error.ConnectionClosed) return e;
+    };
+
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    var pos: usize = 0;
+    var resp_ct: []const u8 = "";
+    var saw_trailer_headers = false;
+    while (h2.nextFrame(aw.written(), &pos)) |f| {
+        switch (f.ftype) {
+            .data => try resp.appendSlice(a, f.payload),
+            .headers => {
+                var dec = hpack.Decoder.init(testing.allocator);
+                defer dec.deinit();
+                var hs: std.ArrayListUnmanaged(hpack.Header) = .empty;
+                try dec.decode(f.payload, &hs, a);
+                for (hs.items) |h| {
+                    if (std.mem.eql(u8, h.name, "content-type")) resp_ct = h.value;
+                    if (std.mem.eql(u8, h.name, "grpc-status")) saw_trailer_headers = true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    try testing.expectEqualStrings("application/grpc-web+proto", resp_ct);
+    // web 模式下 trailers 必须在 body 里，不能是 trailer HEADERS
+    try testing.expect(!saw_trailer_headers);
+
+    // body = [5 字节头 + 消息] + [0x80 尾帧]
+    var it = MessageIterator{ .data = resp.items };
+    const first = it.next() orelse return error.MissingMessage;
+    try testing.expectEqualStrings("pong", first.payload);
+
+    const msg_frame_len = 5 + first.payload.len;
+    try testing.expect(resp.items.len > msg_frame_len);
+    try testing.expectEqual(@as(u8, 0x80), resp.items[msg_frame_len]);
+    const tlen = std.mem.readInt(u32, resp.items[msg_frame_len + 1 ..][0..4], .big);
+    const tbytes = resp.items[msg_frame_len + 5 .. msg_frame_len + 5 + tlen];
+    try testing.expect(std.mem.indexOf(u8, tbytes, "grpc-status: 0") != null);
 }

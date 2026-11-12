@@ -2,4 +2,7 @@
 zig-out/
 *.log
 artifacts/
+# Rust 对拍工具的构建产物（tools/interop-rust 是工具，不参与 zig build）
+tools/interop-rust/target/
+tools/interop-rust/build.log
 

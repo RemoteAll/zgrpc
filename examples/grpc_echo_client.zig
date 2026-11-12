@@ -8,14 +8,23 @@
 const std = @import("std");
 const zgrpc = @import("zgrpc");
 
-const port: u16 = 18051;
+const default_port: u16 = 18051;
 const method = "/echo.Echo/Say";
+const chat_method = "/echo.Echo/Chat";
 
-pub fn main() !void {
-    const allocator = std.heap.page_allocator;
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+/// 端口取首个命令行参数（默认 18051）—— 便于连 Rust 对拍服务端（`zig-out/bin/echo-client 18061`）。
+fn parsePort(init: std.process.Init) u16 {
+    var it = std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa) catch return default_port;
+    defer it.deinit();
+    _ = it.skip(); // 程序名
+    const a = it.next() orelse return default_port;
+    return std.fmt.parseInt(u16, a, 10) catch default_port;
+}
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const port = parsePort(init);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -63,7 +72,7 @@ pub fn main() !void {
     std.debug.print("[zgrpc] 两条并发流均成功（同一条 TCP 连接）\n", .{});
 
     // ---- 客户端流 / bidi：一次发 3 条消息，服务端每条即时回一条 ----
-    const chat = try client.clientStream("/echo.Echo/Chat", &.{ "a", "b", "c" }, a);
+    const chat = try client.clientStream(chat_method, &.{ "a", "b", "c" }, a);
     var n: usize = 0;
     for (chat.messages) |m| {
         std.debug.print("[zgrpc] bidi 响应[{d}]={s}\n", .{ n, m });

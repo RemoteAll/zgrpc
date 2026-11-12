@@ -168,6 +168,40 @@ pub const Responder = struct {
         );
         self.ended = true;
     }
+
+    /// 发送最后一段正文并结束流（gRPC-Web 把 trailers 放在 body 尾帧，需要这种收尾方式）。
+    pub fn endData(self: *Responder, bytes: []const u8) !void {
+        if (self.ended) return error.AlreadyEnded;
+        if (!self.begun) try self.begin("200", &.{});
+        if (bytes.len == 0) {
+            try self.conn.writeFrame(.data, Flags.end_stream, self.stream.id, &.{});
+            self.ended = true;
+            return;
+        }
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const room = @min(self.conn.send_window, self.stream.send_window);
+            if (room <= 0) {
+                try self.conn.pumpForWindow(self.stream);
+                continue;
+            }
+            const want: usize = @intCast(@min(
+                @as(i64, @intCast(@min(bytes.len - off, self.conn.peer_max_frame_size))),
+                room,
+            ));
+            const last = off + want == bytes.len;
+            try self.conn.writeFrame(
+                .data,
+                if (last) Flags.end_stream else 0,
+                self.stream.id,
+                bytes[off .. off + want],
+            );
+            self.conn.send_window -= @as(i64, @intCast(want));
+            self.stream.send_window -= @as(i64, @intCast(want));
+            off += want;
+        }
+        self.ended = true;
+    }
 };
 
 pub const HandlerFn = *const fn (

@@ -1,0 +1,16 @@
+[package]
+name = "zgrpc-interop"
+version = "0.1.0"
+edition = "2024"
+description = "Rust 实现的 gRPC 服务端/客户端，用于与 zgrpc（Zig）双向对拍验证"
+
+[[bin]]
+name = "zgrpc-interop"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+hyper = { version = "1", features = ["server", "client", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
