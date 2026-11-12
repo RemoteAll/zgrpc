@@ -20,379 +20,19 @@
 
 const std = @import("std");
 
-// ---------------------------------------------------------------------------
-// 词法
-// ---------------------------------------------------------------------------
+const zproto = @import("zgrpc").proto;
 
-const TokenKind = enum { ident, number, string, sym, eof };
-
-const Token = struct {
-    kind: TokenKind,
-    text: []const u8,
-    line: usize,
-};
-
-const Lexer = struct {
-    src: []const u8,
-    pos: usize = 0,
-    line: usize = 1,
-
-    fn next(self: *Lexer) !Token {
-        try self.skipSpaceAndComments();
-        if (self.pos >= self.src.len) return .{ .kind = .eof, .text = "", .line = self.line };
-        const start = self.pos;
-        const c = self.src[self.pos];
-
-        if (std.ascii.isAlphabetic(c) or c == '_') {
-            while (self.pos < self.src.len) {
-                const d = self.src[self.pos];
-                if (!(std.ascii.isAlphanumeric(d) or d == '_' or d == '.')) break;
-                self.pos += 1;
-            }
-            return .{ .kind = .ident, .text = self.src[start..self.pos], .line = self.line };
-        }
-        if (std.ascii.isDigit(c)) {
-            while (self.pos < self.src.len and (std.ascii.isDigit(self.src[self.pos]) or self.src[self.pos] == 'x')) self.pos += 1;
-            return .{ .kind = .number, .text = self.src[start..self.pos], .line = self.line };
-        }
-        if (c == '"' or c == '\'') {
-            const quote = c;
-            self.pos += 1;
-            const s = self.pos;
-            while (self.pos < self.src.len and self.src[self.pos] != quote) self.pos += 1;
-            const text = self.src[s..self.pos];
-            if (self.pos < self.src.len) self.pos += 1;
-            return .{ .kind = .string, .text = text, .line = self.line };
-        }
-        self.pos += 1;
-        return .{ .kind = .sym, .text = self.src[start..self.pos], .line = self.line };
-    }
-
-    fn skipSpaceAndComments(self: *Lexer) !void {
-        while (self.pos < self.src.len) {
-            const c = self.src[self.pos];
-            if (c == '\n') {
-                self.line += 1;
-                self.pos += 1;
-            } else if (c == ' ' or c == '\t' or c == '\r') {
-                self.pos += 1;
-            } else if (c == '/' and self.pos + 1 < self.src.len and self.src[self.pos + 1] == '/') {
-                while (self.pos < self.src.len and self.src[self.pos] != '\n') self.pos += 1;
-            } else if (c == '/' and self.pos + 1 < self.src.len and self.src[self.pos + 1] == '*') {
-                self.pos += 2;
-                while (self.pos + 1 < self.src.len and !(self.src[self.pos] == '*' and self.src[self.pos + 1] == '/')) {
-                    if (self.src[self.pos] == '\n') self.line += 1;
-                    self.pos += 1;
-                }
-                self.pos += 2;
-            } else break;
-        }
-    }
-};
-
-// ---------------------------------------------------------------------------
-// 语法树
-// ---------------------------------------------------------------------------
-
-const Scalar = enum { double, float, int32, int64, uint32, uint64, sint32, sint64, fixed32, fixed64, sfixed32, sfixed64, bool, string, bytes };
-
-const FieldType = union(enum) {
-    scalar: Scalar,
-    /// 引用同文件内的 message / enum（按末段名字查）
-    named: []const u8,
-};
-
-const Field = struct {
-    name: []const u8,
-    number: u32,
-    ftype: FieldType,
-    repeated: bool,
-};
-
-const Message = struct {
-    name: []const u8,
-    fields: []Field,
-};
-
-const EnumValue = struct { name: []const u8, value: i32 };
-const EnumDef = struct { name: []const u8, values: []EnumValue };
-
-const Rpc = struct {
-    name: []const u8,
-    req: []const u8,
-    rsp: []const u8,
-    client_stream: bool,
-    server_stream: bool,
-};
-
-const Service = struct { name: []const u8, rpcs: []Rpc };
-
-const Proto = struct {
-    package: []const u8 = "",
-    messages: []Message = &.{},
-    enums: []EnumDef = &.{},
-    services: []Service = &.{},
-};
-
-// ---------------------------------------------------------------------------
-// 语法分析
-// ---------------------------------------------------------------------------
-
-const ParseError = error{ Syntax, Unsupported, InvalidNumber, OutOfMemory };
-
-const Parser = struct {
-    lex: Lexer,
-    tok: Token = .{ .kind = .eof, .text = "", .line = 0 },
-    a: std.mem.Allocator,
-
-    fn init(a: std.mem.Allocator, src: []const u8) !Parser {
-        var p = Parser{ .lex = .{ .src = src }, .a = a };
-        p.tok = try p.lex.next();
-        return p;
-    }
-
-    fn advance(self: *Parser) !void {
-        self.tok = try self.lex.next();
-    }
-
-    fn fail(self: *Parser, comptime msg: []const u8) ParseError {
-        std.debug.print("[proto_gen] 第 {d} 行：{s}（遇到 `{s}`）\n", .{ self.tok.line, msg, self.tok.text });
-        return error.Syntax;
-    }
-
-    fn expectSym(self: *Parser, s: []const u8) !void {
-        if (self.tok.kind != .sym or !std.mem.eql(u8, self.tok.text, s)) {
-            std.debug.print("[proto_gen] 第 {d} 行：期望 `{s}`，实际 `{s}`\n", .{ self.tok.line, s, self.tok.text });
-            return error.Syntax;
-        }
-        try self.advance();
-    }
-
-    fn expectIdent(self: *Parser) ![]const u8 {
-        if (self.tok.kind != .ident) {
-            std.debug.print("[proto_gen] 第 {d} 行：期望标识符，实际 `{s}`\n", .{ self.tok.line, self.tok.text });
-            return error.Syntax;
-        }
-        const t = self.tok.text;
-        try self.advance();
-        return t;
-    }
-
-    fn atSym(self: *Parser, s: []const u8) bool {
-        return self.tok.kind == .sym and std.mem.eql(u8, self.tok.text, s);
-    }
-
-    fn atIdent(self: *Parser, s: []const u8) bool {
-        return self.tok.kind == .ident and std.mem.eql(u8, self.tok.text, s);
-    }
-
-    fn parseFile(self: *Parser) ParseError!Proto {
-        var out = Proto{};
-        var messages: std.ArrayListUnmanaged(Message) = .empty;
-        var enums: std.ArrayListUnmanaged(EnumDef) = .empty;
-        var services: std.ArrayListUnmanaged(Service) = .empty;
-
-        while (self.tok.kind != .eof) {
-            if (self.atIdent("syntax")) {
-                try self.advance();
-                try self.expectSym("=");
-                if (self.tok.kind != .string) return self.fail("syntax 值必须是字符串");
-                if (!std.mem.eql(u8, self.tok.text, "proto3")) {
-                    std.debug.print("[proto_gen] 第 {d} 行：只支持 proto3\n", .{self.tok.line});
-                    return error.Unsupported;
-                }
-                try self.advance();
-                try self.expectSym(";");
-            } else if (self.atIdent("package")) {
-                try self.advance();
-                out.package = try self.expectIdent();
-                try self.expectSym(";");
-            } else if (self.atIdent("message")) {
-                try self.advance();
-                const name = try self.expectIdent();
-                try messages.append(self.a, try self.parseMessage(name));
-            } else if (self.atIdent("enum")) {
-                try self.advance();
-                const name = try self.expectIdent();
-                try enums.append(self.a, try self.parseEnum(name));
-            } else if (self.atIdent("service")) {
-                try self.advance();
-                const name = try self.expectIdent();
-                try services.append(self.a, try self.parseService(name));
-            } else if (self.atIdent("import") or self.atIdent("option")) {
-                std.debug.print("[proto_gen] 第 {d} 行：不支持 `{s}`\n", .{ self.tok.line, self.tok.text });
-                return error.Unsupported;
-            } else {
-                return self.fail("顶层只支持 syntax/package/message/enum/service");
-            }
-        }
-
-        out.messages = messages.items;
-        out.enums = enums.items;
-        out.services = services.items;
-        return out;
-    }
-
-    fn parseMessage(self: *Parser, name: []const u8) ParseError!Message {
-        var fields: std.ArrayListUnmanaged(Field) = .empty;
-        try self.expectSym("{");
-        while (!self.atSym("}")) {
-            if (self.tok.kind == .eof) return self.fail("message 未闭合");
-            if (self.atIdent("reserved") or self.atIdent("extend") or self.atIdent("oneof") or
-                self.atIdent("optional") or self.atIdent("required") or self.atIdent("group"))
-            {
-                std.debug.print("[proto_gen] 第 {d} 行：不支持 `{s}`\n", .{ self.tok.line, self.tok.text });
-                return error.Unsupported;
-            }
-            if (self.atIdent("message") or self.atIdent("enum")) {
-                std.debug.print("[proto_gen] 第 {d} 行：不支持嵌套定义\n", .{self.tok.line});
-                return error.Unsupported;
-            }
-            if (self.atIdent("map")) {
-                std.debug.print("[proto_gen] 第 {d} 行：不支持 map\n", .{self.tok.line});
-                return error.Unsupported;
-            }
-
-            var repeated = false;
-            if (self.atIdent("repeated")) {
-                repeated = true;
-                try self.advance();
-            }
-            const type_name = try self.expectIdent();
-            const fname = try self.expectIdent();
-            try self.expectSym("=");
-            if (self.tok.kind != .number) return self.fail("字段号必须是数字");
-            const number = std.fmt.parseInt(u32, self.tok.text, 10) catch return error.InvalidNumber;
-            try self.advance();
-
-            // 跳过字段选项（如 [packed = true]、[default = x]）
-            if (self.atSym("[")) {
-                while (!self.atSym("]")) {
-                    if (self.tok.kind == .eof) return self.fail("字段选项未闭合");
-                    try self.advance();
-                }
-                try self.advance();
-            }
-            try self.expectSym(";");
-
-            const ftype: FieldType = if (scalarFromName(type_name)) |s|
-                .{ .scalar = s }
-            else
-                .{ .named = type_name };
-
-            if (repeated) {
-                switch (ftype) {
-                    .scalar => |s| if (s == .string or s == .bytes) {
-                        std.debug.print("[proto_gen] 第 {d} 行：repeated string/bytes 暂不支持\n", .{self.tok.line});
-                        return error.Unsupported;
-                    },
-                    .named => {
-                        std.debug.print("[proto_gen] 第 {d} 行：repeated message/enum 暂不支持\n", .{self.tok.line});
-                        return error.Unsupported;
-                    },
-                }
-            }
-
-            try fields.append(self.a, .{ .name = fname, .number = number, .ftype = ftype, .repeated = repeated });
-        }
-        try self.expectSym("}");
-        return .{ .name = name, .fields = fields.items };
-    }
-
-    fn parseEnum(self: *Parser, name: []const u8) ParseError!EnumDef {
-        var values: std.ArrayListUnmanaged(EnumValue) = .empty;
-        try self.expectSym("{");
-        while (!self.atSym("}")) {
-            if (self.tok.kind == .eof) return self.fail("enum 未闭合");
-            const vname = try self.expectIdent();
-            try self.expectSym("=");
-            if (self.tok.kind != .number) return self.fail("枚举值必须是数字");
-            const v = std.fmt.parseInt(i32, self.tok.text, 10) catch return error.InvalidNumber;
-            try self.advance();
-            if (self.atSym("[")) {
-                while (!self.atSym("]")) try self.advance();
-                try self.advance();
-            }
-            try self.expectSym(";");
-            try values.append(self.a, .{ .name = vname, .value = v });
-        }
-        try self.expectSym("}");
-        return .{ .name = name, .values = values.items };
-    }
-
-    fn parseService(self: *Parser, name: []const u8) ParseError!Service {
-        var rpcs: std.ArrayListUnmanaged(Rpc) = .empty;
-        try self.expectSym("{");
-        while (!self.atSym("}")) {
-            if (self.tok.kind == .eof) return self.fail("service 未闭合");
-            if (!self.atIdent("rpc")) return self.fail("service 内只支持 rpc");
-            try self.advance();
-            const mname = try self.expectIdent();
-            try self.expectSym("(");
-            var client_stream = false;
-            if (self.atIdent("stream")) {
-                client_stream = true;
-                try self.advance();
-            }
-            const req = try self.expectIdent();
-            try self.expectSym(")");
-            if (!self.atIdent("returns")) return self.fail("rpc 缺少 returns");
-            try self.advance();
-            try self.expectSym("(");
-            var server_stream = false;
-            if (self.atIdent("stream")) {
-                server_stream = true;
-                try self.advance();
-            }
-            const rsp = try self.expectIdent();
-            try self.expectSym(")");
-
-            // 跳过 rpc 选项 { ... } 或 ;
-            if (self.atSym("{")) {
-                var depth: usize = 0;
-                while (true) {
-                    if (self.tok.kind == .eof) return self.fail("rpc 选项未闭合");
-                    if (self.atSym("{")) depth += 1;
-                    if (self.atSym("}")) {
-                        depth -= 1;
-                        if (depth == 0) {
-                            try self.advance();
-                            break;
-                        }
-                    }
-                    try self.advance();
-                }
-            } else {
-                try self.expectSym(";");
-            }
-            try rpcs.append(self.a, .{
-                .name = mname,
-                .req = req,
-                .rsp = rsp,
-                .client_stream = client_stream,
-                .server_stream = server_stream,
-            });
-        }
-        try self.expectSym("}");
-        return .{ .name = name, .rpcs = rpcs.items };
-    }
-};
-
-fn scalarFromName(n: []const u8) ?Scalar {
-    // Zig 0.17 的 Enum TypeInfo 是 field_names + field_values（不再是 fields）
-    const names = @typeInfo(Scalar).@"enum".field_names;
-    inline for (names, 0..) |name, i| {
-        if (std.mem.eql(u8, n, name)) return @enumFromInt(i);
-    }
-    return null;
-}
-
-/// 取类型名末段（`a.b.Foo` → `Foo`）。
-fn lastSegment(name: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
-    return name;
-}
-
+// 解析器与语法树统一在 `src/proto.zig`（`zgrpc.proto`）：codegen 与服务反射共用同一份实现，
+// 避免两处漂移。这里只做「语法树 → Zig 代码」。
+const Scalar = zproto.Scalar;
+const Field = zproto.Field;
+const Message = zproto.Message;
+const EnumDef = zproto.EnumDef;
+const Service = zproto.Service;
+const Rpc = zproto.Rpc;
+const Proto = zproto.Proto;
+const scalarFromName = zproto.scalarFromName;
+const lastSegment = zproto.lastSegment;
 // ---------------------------------------------------------------------------
 // 代码生成
 // ---------------------------------------------------------------------------
@@ -695,15 +335,14 @@ pub fn main(init: std.process.Init) !void {
         return e;
     };
 
-    var p = try Parser.init(a, src);
-    const proto = try p.parseFile();
+    const parsed = try zproto.parse(a, src);
 
     // 校验：named 类型必须已定义
-    for (proto.messages) |m| {
+    for (parsed.messages) |m| {
         for (m.fields) |f| {
             switch (f.ftype) {
                 .scalar => {},
-                .named => |n| if (!isMessage(proto, n) and !isEnum(proto, n)) {
+                .named => |n| if (!isMessage(parsed, n) and !isEnum(parsed, n)) {
                     std.debug.print("[proto_gen] {s} 的字段 {s} 引用了未定义类型 {s}\n", .{ m.name, f.name, n });
                     return error.UnknownType;
                 },
@@ -711,10 +350,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const code = try generate(a, proto, in_path);
+    const code = try generate(a, parsed, in_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = code });
     std.debug.print("[proto_gen] 已生成 {s}（{d} 字节，{d} 个 message / {d} 个 enum / {d} 个 service）\n", .{
-        out_path, code.len, proto.messages.len, proto.enums.len, proto.services.len,
+        out_path, code.len, parsed.messages.len, parsed.enums.len, parsed.services.len,
     });
 }
 
@@ -744,18 +383,17 @@ test "proto_gen：解析 proto3 子集" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var p = try Parser.init(a, src);
-    const proto = try p.parseFile();
-    try std.testing.expectEqualStrings("demo.v1", proto.package);
-    try std.testing.expectEqual(@as(usize, 2), proto.messages.len);
-    try std.testing.expectEqual(@as(usize, 1), proto.enums.len);
-    try std.testing.expectEqual(@as(usize, 1), proto.services.len);
-    try std.testing.expectEqual(@as(usize, 5), proto.messages[1].fields.len);
-    try std.testing.expect(proto.messages[1].fields[3].repeated);
-    try std.testing.expect(proto.services[0].rpcs[1].client_stream);
-    try std.testing.expect(proto.services[0].rpcs[1].server_stream);
+    const parsed = try zproto.parse(a, src);
+    try std.testing.expectEqualStrings("demo.v1", parsed.package);
+    try std.testing.expectEqual(@as(usize, 2), parsed.messages.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.enums.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.services.len);
+    try std.testing.expectEqual(@as(usize, 5), parsed.messages[1].fields.len);
+    try std.testing.expect(parsed.messages[1].fields[3].repeated);
+    try std.testing.expect(parsed.services[0].rpcs[1].client_stream);
+    try std.testing.expect(parsed.services[0].rpcs[1].server_stream);
 
-    const code = try generate(a, proto, "demo.proto");
+    const code = try generate(a, parsed, "demo.proto");
     try std.testing.expect(std.mem.indexOf(u8, code, "pub const Outer = struct {") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "pub const Color = enum(i32)") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "\"/demo.v1.Demo/Say\"") != null);

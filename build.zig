@@ -46,6 +46,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    gen_mod.addImport("zgrpc", zgrpc);
     const gen_exe = b.addExecutable(.{ .name = "proto_gen", .root_module = gen_mod });
     const gen_run = b.addRunArtifact(gen_exe);
     gen_run.addArgs(&.{ "examples/echo.proto", "examples/echo.pb.zig" });
