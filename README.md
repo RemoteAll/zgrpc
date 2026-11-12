@@ -85,13 +85,13 @@ zig run tools/proto_gen.zig -- my.proto my.pb.zig
 ```
 
 支持：`syntax = "proto3"`、`package`、`message`（标量 / `string` / `bytes` / 枚举 / 嵌套 message 字段 /
-**`repeated` 任意元素**：标量、`string`、`bytes`、enum、message / **`map<K,V>`**：key 为整数或 `string`）、
-`enum`、`service`（含 `stream` 标记，生成路由常量）。
+**`repeated` 任意元素**：标量、`string`、`bytes`、enum、message / **`map<K,V>`**：key 为整数或 `string` /
+**`oneof`**：生成 Zig tagged union）、`enum`、`service`（含 `stream` 标记，生成路由常量）。
 
 `map` 生成的形式是 `[]const XxxEntry`（`XxxEntry = struct { key: K, value: V }`）+ `get<Field>(k)`
 线性查找辅助 —— **零依赖、不引入 hash 容器**，小 map 足够快；条目类型名与描述符里的嵌套类型同名，便于双向对照。
 
-**不支持**（遇到会报错并给行号，不静默忽略）：`import`、`oneof`、`optional`、`reserved`、
+**不支持**（遇到会报错并给行号，不静默忽略）：`import`、`optional`、`reserved`、
 `extend`、`option`、嵌套 message/enum **定义**。
 
 ## 服务反射（`grpcurl` 无需 `.proto`）

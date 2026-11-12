@@ -9,13 +9,13 @@
 //! - `syntax = "proto3";`、`package a.b.c;`
 //! - `message Name { ... }`：标量、`string`/`bytes`、`enum` 字段、同文件 message 字段，
 //!   `repeated` 支持**任意元素**（标量 / `string` / `bytes` / enum / message），
-//!   `map<K, V>`（key 限整数或 `string`）
+//!   `map<K, V>`（key 限整数或 `string`），`oneof { ... }`
 //! - `enum Name { A = 0; ... }`
 //! - `service Name { rpc M(Req) returns (Res); rpc S(stream Req) returns (stream Res); }`
 //!
 //! ## 明确不支持（报错并指出行号，不静默忽略）
 //!
-//! `import`、`oneof`、`optional`、`reserved`、`extend`、`group`、嵌套 `message`/`enum` 定义。
+//! `import`、`optional`、`reserved`、`extend`、`group`、嵌套 `message`/`enum` 定义。
 
 const std = @import("std");
 
@@ -114,11 +114,15 @@ pub const Field = struct {
     number: u32,
     ftype: FieldType,
     repeated: bool,
+    /// 属于哪个 oneof（索引到 `Message.oneofs`）；非 oneof 成员为 null
+    oneof_index: ?u32 = null,
 };
 
 pub const Message = struct {
     name: []const u8,
     fields: []Field,
+    /// oneof 名字（按出现顺序）
+    oneofs: []const []const u8 = &.{},
 };
 
 pub const EnumValue = struct { name: []const u8, value: i32 };
@@ -242,10 +246,11 @@ pub const Parser = struct {
 
     fn parseMessage(self: *Parser, name: []const u8) ParseError!Message {
         var fields: std.ArrayListUnmanaged(Field) = .empty;
+        var oneofs: std.ArrayListUnmanaged([]const u8) = .empty;
         try self.expectSym("{");
         while (!self.atSym("}")) {
             if (self.tok.kind == .eof) return self.fail("message 未闭合");
-            if (self.atIdent("reserved") or self.atIdent("extend") or self.atIdent("oneof") or
+            if (self.atIdent("reserved") or self.atIdent("extend") or
                 self.atIdent("optional") or self.atIdent("required") or self.atIdent("group"))
             {
                 std.debug.print("[zgrpc.proto] 第 {d} 行：不支持 `{s}`\n", .{ self.tok.line, self.tok.text });
@@ -259,38 +264,74 @@ pub const Parser = struct {
                 try fields.append(self.a, try self.parseMapField());
                 continue;
             }
+            if (self.atIdent("oneof")) {
+                try self.advance();
+                const oname = try self.expectIdent();
+                try oneofs.append(self.a, oname);
+                const idx: u32 = @intCast(oneofs.items.len - 1);
+                try self.expectSym("{");
+                while (!self.atSym("}")) {
+                    if (self.tok.kind == .eof) return self.fail("oneof 未闭合");
+                    // oneof 成员不能是 repeated / map（protobuf 规定）
+                    if (self.atIdent("repeated") or self.atIdent("map")) {
+                        std.debug.print("[zgrpc.proto] 第 {d} 行：oneof 成员不能是 `{s}`\n", .{ self.tok.line, self.tok.text });
+                        return error.Unsupported;
+                    }
+                    if (self.atIdent("option")) {
+                        try self.advance();
+                        while (!self.atSym(";")) {
+                            if (self.tok.kind == .eof) return self.fail("option 未闭合");
+                            try self.advance();
+                        }
+                        try self.advance();
+                        continue;
+                    }
+                    var f = try self.parsePlainField();
+                    f.oneof_index = idx;
+                    try fields.append(self.a, f);
+                }
+                try self.expectSym("}");
+                continue;
+            }
 
             var repeated = false;
             if (self.atIdent("repeated")) {
                 repeated = true;
                 try self.advance();
             }
-            const type_name = try self.expectIdent();
-            const fname = try self.expectIdent();
-            try self.expectSym("=");
-            if (self.tok.kind != .number) return self.fail("字段号必须是数字");
-            const number = std.fmt.parseInt(u32, self.tok.text, 10) catch return error.InvalidNumber;
-            try self.advance();
-
-            // 跳过字段选项（如 [packed = true]、[default = x]）
-            if (self.atSym("[")) {
-                while (!self.atSym("]")) {
-                    if (self.tok.kind == .eof) return self.fail("字段选项未闭合");
-                    try self.advance();
-                }
-                try self.advance();
-            }
-            try self.expectSym(";");
-
-            const ftype: FieldType = if (scalarFromName(type_name)) |s|
-                .{ .scalar = s }
-            else
-                .{ .named = type_name };
-
-            try fields.append(self.a, .{ .name = fname, .number = number, .ftype = ftype, .repeated = repeated });
+            var f = try self.parsePlainField();
+            f.repeated = repeated;
+            try fields.append(self.a, f);
         }
         try self.expectSym("}");
-        return .{ .name = name, .fields = fields.items };
+        return .{ .name = name, .fields = fields.items, .oneofs = oneofs.items };
+    }
+
+    /// `type name = N [options];`（不含 repeated / map 前缀）
+    fn parsePlainField(self: *Parser) ParseError!Field {
+        const type_name = try self.expectIdent();
+        const fname = try self.expectIdent();
+        try self.expectSym("=");
+        if (self.tok.kind != .number) return self.fail("字段号必须是数字");
+        const number = std.fmt.parseInt(u32, self.tok.text, 10) catch return error.InvalidNumber;
+        try self.advance();
+
+        // 跳过字段选项（如 [packed = true]、[default = x]）
+        if (self.atSym("[")) {
+            while (!self.atSym("]")) {
+                if (self.tok.kind == .eof) return self.fail("字段选项未闭合");
+                try self.advance();
+            }
+            try self.advance();
+        }
+        try self.expectSym(";");
+
+        const ftype: FieldType = if (scalarFromName(type_name)) |s|
+            .{ .scalar = s }
+        else
+            .{ .named = type_name };
+
+        return .{ .name = fname, .number = number, .ftype = ftype, .repeated = false };
     }
 
     /// `map<K, V> name = N [options];`
@@ -501,11 +542,13 @@ test "proto：不支持的语法报错而不静默忽略" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nimport \"x.proto\";\n"));
-    try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { oneof k { int32 a = 1; } }\n"));
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { message N { int32 a = 1; } }\n"));
     // map 的 key 不能是 float / double / bytes
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { map<double,int32> m = 1; }\n"));
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { map<bytes,int32> m = 1; }\n"));
+    // oneof 成员不能是 repeated / map
+    try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { oneof k { repeated int32 a = 1; } }\n"));
+    try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { oneof k { map<string,int32> m = 1; } }\n"));
 }
 
 test "proto：map<K,V> 解析（含 message 值）" {

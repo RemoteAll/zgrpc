@@ -102,6 +102,7 @@ fn writeField(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, msg_
         },
     }
     // json_name：protobuf 的默认规则是下划线转驼峰，客户端不传也能推导，故省略。
+    if (f.oneof_index) |oi| try inner.int32(9, @intCast(oi)); // FieldDescriptorProto.oneof_index = 9
 
     try w.message(2, inner.bytes()); // DescriptorProto.field = 2
 }
@@ -176,6 +177,13 @@ fn writeMessage(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, p:
             .map => |mt| try writeMapEntry(&inner, alloc, package, p, mt, f.name),
             else => {},
         }
+    }
+    // oneof 声明：`DescriptorProto.oneof_decl = 8`，`OneofDescriptorProto.name = 1`
+    for (m.oneofs) |oname| {
+        var od = pb.Writer.init(alloc);
+        defer od.deinit();
+        try od.string(1, oname);
+        try inner.message(8, od.bytes());
     }
 
     try w.message(4, inner.bytes()); // FileDescriptorProto.message_type = 4

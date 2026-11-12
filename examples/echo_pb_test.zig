@@ -118,3 +118,40 @@ test "proto_gen：map<string,int32> 与 map<int32,message> 往返" {
     try std.testing.expectEqualStrings("seven", seven.tag);
     try std.testing.expect(back.getById(8) == null);
 }
+
+test "proto_gen：oneof 往返（tagged union）" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 成员一：string
+    const s1 = echo.Summary{ .payload = .{ .text = "hello" } };
+    const back1 = try echo.Summary.decode(try s1.encode(a), a);
+    try std.testing.expect(back1.payload != null);
+    try std.testing.expectEqualStrings("hello", back1.payload.?.text);
+
+    // 成员二：message
+    const s2 = echo.Summary{ .payload = .{ .rich = .{ .value = 5, .tag = "r" } } };
+    const back2 = try echo.Summary.decode(try s2.encode(a), a);
+    try std.testing.expectEqual(@as(i32, 5), back2.payload.?.rich.value);
+
+    // 未设置：编码为空，解码回 null
+    const s3 = echo.Summary{};
+    try std.testing.expectEqual(@as(usize, 0), (try s3.encode(a)).len);
+    try std.testing.expect((try echo.Summary.decode("", a)).payload == null);
+}
+
+test "proto_gen：oneof 成员取默认值也要写入（区别于普通字段的零值不写）" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 显式设置 text = ""：必须写出 field 13，否则接收方无法区分「空串」与「未设置」
+    const s = echo.Summary{ .payload = .{ .text = "" } };
+    const bytes = try s.encode(a);
+    try std.testing.expect(bytes.len > 0);
+
+    const back = try echo.Summary.decode(bytes, a);
+    try std.testing.expect(back.payload != null);
+    try std.testing.expectEqualStrings("", back.payload.?.text);
+}

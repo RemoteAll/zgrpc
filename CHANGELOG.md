@@ -6,6 +6,10 @@
 ## 未发布
 
 ### 新增
+- **`oneof` 支持**：生成 Zig 的 tagged union（语义天然对应「同时只能有一个」），
+  `DescriptorProto.oneof_decl = 8` + `FieldDescriptorProto.oneof_index = 9`；`grpcurl describe` 实测
+  渲染为 `oneof payload { string text = 13; .echo.BumpResponse rich = 14; }`。
+  oneof 成员**即使取默认值也会写入**（用于区分「未设置」），与普通字段的「零值不写」规则不同。
 - **`map<K, V>` 支持**（代码生成 + 服务反射两侧）：key 限整数或 `string`（protobuf 规定），
   value 可以是标量 / enum / message。（见下方详细说明）
 - **`repeated` 支持任意元素类型**（此前只允许数字标量）：`repeated string` / `bytes` / enum / message
@@ -34,6 +38,8 @@
 - `echo-server` 支持 `--port N`（回归脚本用它做端口隔离）。
 
 ### 修复
+- **enum 字段为 null 时曾写入默认值**：生成器旧逻辑是 `if (v) |x| ... else try w.enumField(N, 首个枚举值)`，
+  导致空 message 也会输出 2 字节。proto3 的默认值（0）本就不该序列化，改为 `if (@intFromEnum(v) != 0)`。
 - **`FieldDescriptorProto.type` 与 `type_name` 不一致**：enum 字段曾被一律编成 `TYPE_MESSAGE(11)`，
   导致 `protoreflect` 报 `resolved "echo.Status", but it is not an message`，`describe` / 调用全部失败。
   现在按本文件 enum 表判定：enum→`14`、message→`11`。

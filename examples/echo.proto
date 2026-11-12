@@ -39,6 +39,11 @@ message Summary {
   // map：生成 []const XxxEntry（零依赖，另带 get<Field> 线性查找辅助）
   map<string, int32> counts = 11;
   map<int32, BumpResponse> by_id = 12;
+  // oneof：生成 Zig tagged union（同时只能有一个成员）
+  oneof payload {
+    string text = 13;
+    BumpResponse rich = 14;
+  }
 }
 
 service Echo {

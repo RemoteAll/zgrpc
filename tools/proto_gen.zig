@@ -219,10 +219,9 @@ fn writeEncodeField(w: anytype, proto: Proto, f: Field, pad: []const u8) !void {
         },
         .named => |n| {
             if (isEnum(proto, n)) {
-                const t = lastSegment(n);
-                try w.print("{s}if (self.{s}) |v| try w.enumField({d}, v) else try w.enumField({d}, {s}.{s});\n", .{
-                    pad, f.name, fnum, fnum, t, proto.enums[enumIndexOf(proto, n)].values[0].name,
-                });
+                // proto3：默认值（0）不序列化；`null` 表示跟随默认值，同样不写。
+                // oneof 成员不走这里（见 `writeValueStmt`）——它们显式设置就必须写。
+                try w.print("{s}if (self.{s}) |v| {{ if (@intFromEnum(v) != 0) try w.enumField({d}, v); }}\n", .{ pad, f.name, fnum });
             } else {
                 try w.print("{s}if (self.{s}) |v| try w.message({d}, try v.encode(a));\n", .{ pad, f.name, fnum });
             }
@@ -258,7 +257,28 @@ fn enumIndexOf(proto: Proto, name: []const u8) usize {
     return 0;
 }
 
-fn writeDecodeField(a: std.mem.Allocator, w: anytype, proto: Proto, f: Field, pad: []const u8) !void {
+/// 把单个值按字段号写入（不带「!= 0」判断）。
+/// oneof 成员被显式设置时**即使值是默认值也要写**（用于区分「未设置」），所以不能用
+/// `writeEncodeField` 那套“零值不写”的规则。
+fn writeValueStmt(w: anytype, proto: Proto, f: Field, val: []const u8, pad: []const u8) !void {
+    const fnum = f.number;
+    switch (f.ftype) {
+        .scalar => |s| switch (s) {
+            .string, .bytes => try w.print("{s}try w.string({d}, {s});\n", .{ pad, fnum, val }),
+            .bool => try w.print("{s}try w.boolField({d}, {s});\n", .{ pad, fnum, val }),
+            .double => try w.print("{s}try w.doubleField({d}, {s});\n", .{ pad, fnum, val }),
+            .float => try w.print("{s}try w.floatField({d}, {s});\n", .{ pad, fnum, val }),
+            else => try w.print("{s}try w.{s}({d}, {s});\n", .{ pad, scalarWriteFn(s), fnum, val }),
+        },
+        .named => |n| if (isEnum(proto, n))
+            try w.print("{s}try w.enumField({d}, {s});\n", .{ pad, fnum, val })
+        else
+            try w.print("{s}try w.message({d}, try {s}.encode(a));\n", .{ pad, fnum, val }),
+        .map => unreachable,
+    }
+}
+
+fn writeDecodeField(a: std.mem.Allocator, w: anytype, proto: Proto, m: Message, f: Field, pad: []const u8) !void {
     const fnum = f.number;
     if (f.repeated) {
         // 反复出现的同号字段（以及 packed / 非 packed 混用）都累积到局部 list
@@ -315,15 +335,26 @@ fn writeDecodeField(a: std.mem.Allocator, w: anytype, proto: Proto, f: Field, pa
     switch (f.ftype) {
         .scalar => |s| {
             const expr = scalarReadExpr(s);
-            try w.print("{s}{d} => self.{s} = {s},\n", .{ pad, fnum, f.name, expr });
+            if (f.oneof_index) |oi| {
+                try w.print("{s}{d} => self.{s} = .{{ .{s} = {s} }},\n", .{ pad, fnum, m.oneofs[@intCast(oi)], f.name, expr });
+            } else {
+                try w.print("{s}{d} => self.{s} = {s},\n", .{ pad, fnum, f.name, expr });
+            }
         },
         .named => |n| {
+            const t = lastSegment(n);
             if (isEnum(proto, n)) {
-                const t = lastSegment(n);
-                try w.print("{s}{d} => self.{s} = f.asEnum({s}),\n", .{ pad, fnum, f.name, t });
+                if (f.oneof_index) |oi| {
+                    try w.print("{s}{d} => if (f.asEnum({s})) |v| {{ self.{s} = .{{ .{s} = v }}; }},\n", .{ pad, fnum, t, m.oneofs[@intCast(oi)], f.name });
+                } else {
+                    try w.print("{s}{d} => self.{s} = f.asEnum({s}),\n", .{ pad, fnum, f.name, t });
+                }
             } else {
-                const t = lastSegment(n);
-                try w.print("{s}{d} => self.{s} = try {s}.decode(f.asBytes(), a),\n", .{ pad, fnum, f.name, t });
+                if (f.oneof_index) |oi| {
+                    try w.print("{s}{d} => self.{s} = .{{ .{s} = try {s}.decode(f.asBytes(), a) }},\n", .{ pad, fnum, m.oneofs[@intCast(oi)], f.name, t });
+                } else {
+                    try w.print("{s}{d} => self.{s} = try {s}.decode(f.asBytes(), a),\n", .{ pad, fnum, f.name, t });
+                }
             }
         },
         .map => {},
@@ -415,12 +446,41 @@ fn generate(a: std.mem.Allocator, proto: Proto, src_path: []const u8) ![]const u
                 else => {},
             }
         }
+        // oneof → Zig 的 tagged union（语义天然对应：同时只能有一个）
+        for (m.oneofs, 0..) |oname, oi| {
+            try w.print("    /// oneof `{s}`\n", .{oname});
+            try w.print("    pub const {s} = union(enum) {{\n", .{try proto_toPascalCase(a, oname)});
+            for (m.fields) |f| {
+                const fi = f.oneof_index orelse continue;
+                if (@as(usize, fi) != oi) continue;
+                try w.print("        {s}: {s},\n", .{ f.name, try elemType(a, f) });
+            }
+            try w.writeAll("    };\n");
+        }
         for (m.fields) |f| {
+            if (f.oneof_index != null) continue; // oneof 成员在 union 里，不是独立字段
             try w.print("    {s}: {s} = {s},\n", .{ f.name, try zigType(a, proto, f), defaultValue(proto, f) });
+        }
+        for (m.oneofs) |oname| {
+            try w.print("    {s}: ?{s} = null,\n", .{ oname, try proto_toPascalCase(a, oname) });
         }
         try w.writeAll("\n    pub fn encode(self: @This(), a: std.mem.Allocator) ![]const u8 {\n");
         try w.writeAll("        var w = pb.Writer.init(a);\n");
-        for (m.fields) |f| try writeEncodeField(w, proto, f, "        ");
+        for (m.fields) |f| {
+            if (f.oneof_index != null) continue;
+            try writeEncodeField(w, proto, f, "        ");
+        }
+        for (m.oneofs, 0..) |oname, oi| {
+            try w.print("        if (self.{s}) |c| switch (c) {{\n", .{oname});
+            for (m.fields) |f| {
+                const fi = f.oneof_index orelse continue;
+                if (@as(usize, fi) != oi) continue;
+                try w.print("            .{s} => |v| {{\n", .{f.name});
+                try writeValueStmt(w, proto, f, "v", "                ");
+                try w.writeAll("            },\n");
+            }
+            try w.writeAll("        };\n");
+        }
         try w.writeAll("        return w.bytes();\n    }\n\n");
         try w.writeAll("    pub fn decode(bytes: []const u8, a: std.mem.Allocator) !@This() {\n");
         if (!decodeNeedsAlloc(proto, m)) {
@@ -438,7 +498,7 @@ fn generate(a: std.mem.Allocator, proto: Proto, src_path: []const u8) ![]const u
         }
         try w.writeAll("        var r = pb.Reader{ .data = bytes };\n");
         try w.writeAll("        while (r.next()) |f| switch (f.number) {\n");
-        for (m.fields) |f| try writeDecodeField(a, w, proto, f, "            ");
+        for (m.fields) |f| try writeDecodeField(a, w, proto, m, f, "            ");
         try w.writeAll("            else => {},\n");
         try w.writeAll("        };\n");
         for (m.fields) |f| {

@@ -67,6 +67,11 @@ pub const Summary = struct {
     pub const CountsEntry = struct { key: []const u8, value: i32 };
     /// `map<int32, ..> by_id = 12` 的条目
     pub const ByIdEntry = struct { key: i32, value: BumpResponse };
+    /// oneof `payload`
+    pub const Payload = union(enum) {
+        text: []const u8,
+        rich: BumpResponse,
+    };
     note: []const u8 = "",
     status: ?Status = null,
     last: ?BumpResponse = null,
@@ -79,11 +84,12 @@ pub const Summary = struct {
     states: []const Status = &.{},
     counts: []const CountsEntry = &.{},
     by_id: []const ByIdEntry = &.{},
+    payload: ?Payload = null,
 
     pub fn encode(self: @This(), a: std.mem.Allocator) ![]const u8 {
         var w = pb.Writer.init(a);
         if (self.note.len > 0) try w.string(1, self.note);
-        if (self.status) |v| try w.enumField(2, v) else try w.enumField(2, Status.UNKNOWN);
+        if (self.status) |v| { if (@intFromEnum(v) != 0) try w.enumField(2, v); }
         if (self.last) |v| try w.message(3, try v.encode(a));
         try w.packedVarint(4, self.samples);
         try w.packedVarint(5, self.counters);
@@ -104,6 +110,14 @@ pub const Summary = struct {
             try ew.message(2, try e.value.encode(a));
             try w.message(12, ew.bytes());
         }
+        if (self.payload) |c| switch (c) {
+            .text => |v| {
+                try w.string(13, v);
+            },
+            .rich => |v| {
+                try w.message(14, try v.encode(a));
+            },
+        };
         return w.bytes();
     }
 
@@ -160,6 +174,8 @@ pub const Summary = struct {
                 };
                 try lst_by_id.append(a, .{ .key = ek, .value = ev });
             },
+            13 => self.payload = .{ .text = f.asBytes() },
+            14 => self.payload = .{ .rich = try BumpResponse.decode(f.asBytes(), a) },
             else => {},
         };
         self.samples = lst_samples.items;
