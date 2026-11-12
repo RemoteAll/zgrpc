@@ -33,6 +33,22 @@ fn chatHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, msg: []const u8) anyerro
     try call.sendMessage(out);
 }
 
+/// 方法 `/echo.Echo/Slow`：故意睡 300ms，用于验证 `grpc-timeout` → `DEADLINE_EXCEEDED`。
+fn slowHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator) anyerror!void {
+    _ = ctx;
+    _ = arena;
+    std.debug.print("[zgrpc] /echo.Echo/Slow：睡 300ms（客户端 grpc-timeout 小于它就会超时）\n", .{});
+    zgrpc.clock.sleepNs(300 * std.time.ns_per_ms);
+    try call.sendMessage("slow done");
+}
+
+/// 标准 `grpc.health.v1.Health` 的业务判定：空服务名 / echo.Echo 视为健康。
+fn healthCheck(ctx: ?*anyopaque, service: []const u8) zgrpc.health.ServingStatus {
+    _ = ctx;
+    if (service.len == 0 or std.mem.eql(u8, service, "echo.Echo")) return .serving;
+    return .service_unknown;
+}
+
 pub fn main() !void {
     // 多线程服务端：Io 必须用线程安全分配器构造（page_allocator）
     const allocator = std.heap.page_allocator;
@@ -40,8 +56,15 @@ pub fn main() !void {
     defer threaded.deinit();
     const io = threaded.io();
 
+    var health_checker = zgrpc.health.Checker{ .check = healthCheck };
+    var health_svc = zgrpc.health.Service{ .checker = &health_checker };
+    const health_routes = health_svc.routes();
+
     var routes = [_]zgrpc.grpc.Route{
         .{ .path = "/echo.Echo/Say", .handler = sayHandler },
+        .{ .path = "/echo.Echo/Slow", .handler = slowHandler },
+        health_routes[0],
+        health_routes[1],
     };
     var stream_routes = [_]zgrpc.grpc.StreamRoute{
         .{ .path = "/echo.Echo/Chat", .on_message = chatHandler },
@@ -57,7 +80,8 @@ pub fn main() !void {
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
-    std.debug.print("[zgrpc] gRPC(h2c) 监听 127.0.0.1:{d}，方法 /echo.Echo/Say（unary）、/echo.Echo/Chat（bidi）\n", .{port});
+    std.debug.print("[zgrpc] gRPC(h2c) 监听 127.0.0.1:{d}，方法 /echo.Echo/Say（unary）、/echo.Echo/Chat（bidi）、" ++
+        "/echo.Echo/Slow（超时验证）、/grpc.health.v1.Health/{{Check,Watch}}\n", .{port});
 
     while (true) {
         const stream = listener.accept(io) catch |e| {

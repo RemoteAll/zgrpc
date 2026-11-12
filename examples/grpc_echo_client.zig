@@ -12,19 +12,36 @@ const default_port: u16 = 18051;
 const method = "/echo.Echo/Say";
 const chat_method = "/echo.Echo/Chat";
 
-/// 端口取首个命令行参数（默认 18051）—— 便于连 Rust 对拍服务端（`zig-out/bin/echo-client 18061`）。
-fn parsePort(init: std.process.Init) u16 {
-    var it = std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa) catch return default_port;
+const Args = struct {
+    port: u16 = default_port,
+    /// 只跑跨实现共有的 echo 方法（对拍 Rust 服务端时用；它没有 health / Slow）
+    basic: bool = false,
+};
+
+/// 端口取首个命令行参数（默认 18051）—— 便于连 Rust 对拍服务端（`zig-out/bin/echo-client 18061 --basic`）。
+fn parseArgs(init: std.process.Init) Args {
+    var out: Args = .{};
+    var it = std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa) catch return out;
     defer it.deinit();
     _ = it.skip(); // 程序名
-    const a = it.next() orelse return default_port;
-    return std.fmt.parseInt(u16, a, 10) catch default_port;
+    if (it.next()) |a| {
+        if (std.mem.eql(u8, a, "--basic")) {
+            out.basic = true;
+        } else if (std.fmt.parseInt(u16, a, 10)) |p| {
+            out.port = p;
+        } else |_| {}
+    }
+    if (it.next()) |a| {
+        if (std.mem.eql(u8, a, "--basic")) out.basic = true;
+    }
+    return out;
 }
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
-    const port = parsePort(init);
+    const args = parseArgs(init);
+    const port = args.port;
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -83,4 +100,34 @@ pub fn main(init: std.process.Init) !void {
         return error.GrpcStatusNotOk;
     }
     std.debug.print("[zgrpc] bidi 流成功：3 条请求 → 3 条响应\n", .{});
+
+    if (args.basic) {
+        // 对拍外部服务端（如 Rust hyper）时只跑共有方法：health / Slow 是 zgrpc 自家扩展
+        std.debug.print("[zgrpc] --basic：跳过 health 与 grpc-timeout 段\n", .{});
+        return;
+    }
+
+    // ---- 标准健康检查 `grpc.health.v1.Health/Check`（空请求 = 整体健康）----
+    const hc = try client.unary(zgrpc.health.check_path, "", a);
+    if (!hc.ok() or hc.messages.len != 1 or
+        !std.mem.eql(u8, hc.messages[0], &.{ 0x08, 0x01 }))
+    {
+        std.debug.print("[zgrpc] 健康检查失败：status={d} message={s} 响应字节数={d}\n", .{
+            hc.status, hc.message, if (hc.messages.len > 0) hc.messages[0].len else 0,
+        });
+        return error.GrpcStatusNotOk;
+    }
+    std.debug.print("[zgrpc] 健康检查 SERVING（grpc-status=0，ServingStatus=1）\n", .{});
+
+    // ---- `grpc-timeout`：80ms 调一个睡 300ms 的方法，期望 DEADLINE_EXCEEDED(4) ----
+    const slow = try client.callMany(&.{
+        .{ .method = "/echo.Echo/Slow", .timeout_ms = 80 },
+    }, a);
+    if (slow[0].status != @intFromEnum(zgrpc.grpc.Status.deadline_exceeded)) {
+        std.debug.print("[zgrpc] 超时验证失败：期望 grpc-status=4，实际 {d}（message={s}）\n", .{
+            slow[0].status, slow[0].message,
+        });
+        return error.GrpcStatusNotOk;
+    }
+    std.debug.print("[zgrpc] grpc-timeout 生效：grpc-status=4（{s}）\n", .{slow[0].message});
 }

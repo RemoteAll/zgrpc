@@ -1,19 +1,23 @@
 //! gRPC 语义层（跑在 `h2` 之上）：消息分帧、状态码、路由、unary 与服务端流式。
 //!
-//! 协议要点（gRPC over HTTP/2）：
+//! 协议要点（gRPC over HTTP/2，对照 `doc/PROTOCOL-HTTP2.md`）：
 //! - 请求：`POST /{service}/{method}`、`content-type: application/grpc*`、`te: trailers`；
 //! - 消息分帧：`[压缩标志:1][长度:4 大端][payload]`，可在一帧内多条（流式）；
 //! - 响应：`:status 200` + `content-type: application/grpc`，**状态放在 trailers 的 `grpc-status`**；
+//! - 错误文本 `grpc-message` 按规范做 **percent-encoding**（非 ASCII 直接发会违反规范）；
+//! - `grpc-timeout` 换算成截止时刻，超时回 `DEADLINE_EXCEEDED`（见 `Call.expired`）；
 //! - 本库不做 protobuf 编解码：业务拿到/给出的是**已序列化的字节**，由调用方自带 protobuf 实现
 //!   （服务间自控两端时通常是零成本；要对接现成 .proto 再接一个 codegen 即可，不必改动本层）。
 //!
-//! 未支持（明确写出，避免误解）：压缩（`grpc-encoding`）、客户端流/bidi 的背压、
-//! `grpc-timeout` 强制取消、`grpc-message` 的 percent-encoding（仅透传 ASCII）。
+//! 未支持（明确写出，避免误解）：`-bin` 二进制 metadata（base64）、`grpc-status-details-bin`、
+//! `application/grpc-web-text`（base64 文本流）、`grpc-timeout` 的**强制中断**（本层只判超时状态，
+//! 不会打断已经阻塞在业务里的调用）、客户端流/bidi 的背压。
 
 const std = @import("std");
 const h2 = @import("h2.zig");
 const hpack = @import("hpack.zig");
 const gzip = @import("gzip.zig");
+const clock = @import("clock.zig");
 
 /// gRPC 状态码（https://grpc.io/docs/guides/status-codes/）。
 pub const Status = enum(u32) {
@@ -77,6 +81,76 @@ pub fn encodeMessage(
     try out.appendSlice(alloc, payload);
 }
 
+// ---------------------------------------------------------------------------
+// 协议级工具：`grpc-timeout` 解析、`grpc-message` 的 percent 编解码
+// ---------------------------------------------------------------------------
+
+/// 解析 `grpc-timeout`（规范：≤ 8 位正整数 + 单位 H/M/S/m/u/n），返回**纳秒**。
+/// 格式非法返回 null（调用方按「无限超时」处理，并留日志）。
+pub fn parseTimeout(value: []const u8) ?i128 {
+    if (value.len < 2) return null;
+    const digits = value[0 .. value.len - 1];
+    if (digits.len > 8) return null; // 规范上限：至多 8 位
+    const unit = value[value.len - 1];
+    var n: i128 = 0;
+    for (digits) |c| {
+        if (c < '0' or c > '9') return null;
+        n = n * 10 + @as(i128, c - '0');
+    }
+    const per: i128 = switch (unit) {
+        'H' => std.time.ns_per_hour,
+        'M' => std.time.ns_per_min,
+        'S' => std.time.ns_per_s,
+        'm' => std.time.ns_per_ms,
+        'u' => std.time.ns_per_us,
+        'n' => 1,
+        else => return null,
+    };
+    return n * per;
+}
+
+/// `grpc-message` 编码：规范只允许 `%x20-%x24` 与 `%x26-%x7E`（`%` 除外），其余一律 `%HH`。
+pub fn percentEncode(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    const hex = "0123456789ABCDEF";
+    for (s) |c| {
+        if (c >= 0x20 and c <= 0x7e and c != '%') {
+            try out.append(alloc, c);
+        } else {
+            try out.append(alloc, '%');
+            try out.append(alloc, hex[c >> 4]);
+            try out.append(alloc, hex[c & 0x0f]);
+        }
+    }
+    return out.items;
+}
+
+/// `grpc-message` 解码：非法 `%xx` **原样保留**（规范要求解码方不得报错）。
+pub fn percentDecode(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '%' and i + 2 < s.len) {
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch {
+                try out.append(alloc, s[i]);
+                i += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch {
+                try out.append(alloc, s[i]);
+                i += 1;
+                continue;
+            };
+            try out.append(alloc, hi * 16 + lo);
+            i += 3;
+            continue;
+        }
+        try out.append(alloc, s[i]);
+        i += 1;
+    }
+    return out.items;
+}
+
 const grpc_content_type = [_]hpack.Header{
     .{ .name = "content-type", .value = "application/grpc" },
 };
@@ -98,6 +172,23 @@ fn describeContentType(req: h2.Request, call: *Call) bool {
     // 客户端声明可接受的响应压缩算法（`grpc-accept-encoding: gzip, deflate`）
     if (req.header("grpc-accept-encoding")) |ae| {
         call.accept_gzip = containsIgnoreCase(ae, "gzip");
+    }
+
+    // `grpc-timeout`：换算成单调时钟上的绝对截止时刻（规范：缺省视为无限超时）
+    if (req.header("grpc-timeout")) |v| {
+        if (parseTimeout(v)) |ns| {
+            call.timeout_ns = ns;
+            call.deadline_ns = clock.monotonicNs() + ns;
+        } else {
+            std.debug.print("[zgrpc.grpc] 忽略非法的 grpc-timeout：{s}\n", .{v});
+        }
+    }
+
+    // `te: trailers` 是规范要求的请求头（用于探测不兼容代理）。缺失时宽容处理但留痕，
+    // 因为多数能跑到这里的客户端（包括我们的 Rust 对拍工具）都会带。
+    const te_ok = if (req.header("te")) |v| containsIgnoreCase(v, "trailers") else false;
+    if (!te_ok) {
+        std.debug.print("[zgrpc.grpc] 请求缺少 te: trailers（{s}）\n", .{req.path});
     }
     return true;
 }
@@ -134,6 +225,12 @@ pub const Call = struct {
     /// 响应消息是否真压过（决定是否发 `grpc-encoding: gzip` 头）
     resp_gzip: bool = false,
 
+    // --- 截止时间（`grpc-timeout`）---
+    /// 客户端给的超时纳秒数（null = 未指定，视为无限）
+    timeout_ns: ?i128 = null,
+    /// 换算出的绝对截止时刻（单调时钟纳秒）；null = 无限
+    deadline_ns: ?i128 = null,
+
     // --- 流式模式状态（由 `Server.streamHooks` 驱动）---
     /// 跨 DATA 帧的累积缓冲（整请求路由存原始帧，流式路由存待切分帧）
     accum: std.ArrayListUnmanaged(u8) = .empty,
@@ -151,6 +248,24 @@ pub const Call = struct {
         return .{ .data = self.req.body, .alloc = self.alloc };
     }
 
+    /// 距截止时刻还有多少纳秒（未设超时返回 null；已过期则为负数）。
+    pub fn remainingNs(self: *const Call) ?i128 {
+        const d = self.deadline_ns orelse return null;
+        return d - clock.monotonicNs();
+    }
+
+    /// 是否已过截止时刻。
+    pub fn expired(self: *const Call) bool {
+        const r = self.remainingNs() orelse return false;
+        return r <= 0;
+    }
+
+    /// 业务在耗时循环（大钡循环 / 多阶段处理）里主动检查：过期就 `error.DeadlineExceeded`。
+    /// 说明：本层不做强制中断（Zig 无抢占式取消），长时间阻塞的 handler 要靠业务自己插检查点。
+    pub fn checkDeadline(self: *const Call) !void {
+        if (self.expired()) return error.DeadlineExceeded;
+    }
+
     /// 发送一条响应消息（服务端流式可多次调用）。
     ///
     /// 客户端在 `grpc-accept-encoding` 里声明 gzip 且消息够大时，自动压缩并置帧标志位。
@@ -158,15 +273,18 @@ pub const Call = struct {
         if (self.finished) return error.AlreadyFinished;
         if (!self.sent_any) {
             const should_gzip = self.accept_gzip and payload.len >= compress_min_size;
-            var hs: [2]hpack.Header = undefined;
+            // 顺序按规范 ABNF：HTTP-Status [Message-Encoding] [Message-Accept-Encoding] Content-Type
+            var hs: [3]hpack.Header = undefined;
             var n: usize = 0;
-            hs[n] = .{ .name = "content-type", .value = self.resp_content_type };
-            n += 1;
             if (should_gzip) {
                 hs[n] = .{ .name = "grpc-encoding", .value = "gzip" };
                 n += 1;
                 self.resp_gzip = true;
             }
+            hs[n] = .{ .name = "grpc-accept-encoding", .value = "gzip" };
+            n += 1;
+            hs[n] = .{ .name = "content-type", .value = self.resp_content_type };
+            n += 1;
             try self.rsp.begin("200", hs[0..n]);
             self.sent_any = true;
         }
@@ -210,15 +328,20 @@ pub const Call = struct {
             try block.appendSlice(a, code);
             try block.appendSlice(a, "\r\n");
             if (self.error_message.len > 0) {
+                // 规范：Status-Message 概念上是 UTF-8 文本，物理上必须 percent-encoding
+                const enc = try percentEncode(a, self.error_message);
                 try block.appendSlice(a, "grpc-message: ");
-                try block.appendSlice(a, self.error_message);
+                try block.appendSlice(a, enc);
                 try block.appendSlice(a, "\r\n");
             }
             std.mem.writeInt(u32, block.items[len_pos..][0..4], @intCast(block.items.len - start), .big);
 
             if (!self.sent_any) {
-                const ct = [_]hpack.Header{.{ .name = "content-type", .value = self.resp_content_type }};
-                try self.rsp.begin("200", &ct);
+                const hs = [_]hpack.Header{
+                    .{ .name = "grpc-accept-encoding", .value = "gzip" },
+                    .{ .name = "content-type", .value = self.resp_content_type },
+                };
+                try self.rsp.begin("200", &hs);
                 self.sent_any = true;
             }
             return self.rsp.endData(block.items);
@@ -227,17 +350,31 @@ pub const Call = struct {
         var trailers: std.ArrayListUnmanaged(hpack.Header) = .empty;
         try trailers.append(a, .{ .name = "grpc-status", .value = code });
         if (self.error_message.len > 0) {
-            try trailers.append(a, .{ .name = "grpc-message", .value = self.error_message });
+            // 规范：非 ASCII 的错误文本必须 percent-encoding 后才能进 header
+            const enc = try percentEncode(a, self.error_message);
+            try trailers.append(a, .{ .name = "grpc-message", .value = enc });
         }
 
         if (!self.sent_any) {
-            const ct = [_]hpack.Header{.{ .name = "content-type", .value = self.resp_content_type }};
-            try self.rsp.begin("200", &ct);
+            const hs = [_]hpack.Header{
+                .{ .name = "grpc-accept-encoding", .value = "gzip" },
+                .{ .name = "content-type", .value = self.resp_content_type },
+            };
+            try self.rsp.begin("200", &hs);
             self.sent_any = true;
         }
         try self.rsp.end(trailers.items);
     }
 };
+
+/// 非 gRPC 流量（非 POST / content-type 不符）按 HTTP 状态码回，而不是伪装成 `:status 200` 的 gRPC 响应。
+/// 规范：Content-Type 不以 `application/grpc` 开头时服务端 SHOULD 返回 415，
+/// 目的正是「不让其它 HTTP/2 客户端把错误当成成功的 gRPC 响应」。
+fn httpError(rsp: *h2.Responder, status: []const u8, text: []const u8) !void {
+    const hs = [_]hpack.Header{.{ .name = "content-type", .value = "text/plain; charset=utf-8" }};
+    try rsp.begin(status, &hs);
+    return rsp.endData(text);
+}
 
 pub const HandlerFn = *const fn (
     ctx: *anyopaque,
@@ -321,12 +458,12 @@ pub const Server = struct {
         var call = Call{ .req = req, .rsp = rsp, .alloc = arena };
 
         if (!std.mem.eql(u8, req.method, "POST")) {
-            call.setStatus(.unimplemented, "gRPC 只支持 POST");
-            return call.finish();
+            std.debug.print("[zgrpc.grpc] 非 POST 请求 {s} {s} → 405\n", .{ req.method, req.path });
+            return httpError(rsp, "405", "gRPC requires POST");
         }
         if (!describeContentType(req, &call)) {
-            call.setStatus(.invalid_argument, "content-type 必须是 application/grpc 或 application/grpc-web");
-            return call.finish();
+            std.debug.print("[zgrpc.grpc] 不支持的 content-type（{s}）→ 415\n", .{req.header("content-type") orelse "缺失"});
+            return httpError(rsp, "415", "content-type must be application/grpc[+proto] or application/grpc-web[+proto]");
         }
 
         const route = self.find(req.path) orelse {
@@ -337,10 +474,22 @@ pub const Server = struct {
 
         const route_ctx = route.ctx orelse self.outer_ctx;
         route.handler(route_ctx, &call, arena) catch |e| {
-            // 业务未显式设过状态时兜底为 internal，并留下可定位日志
-            if (call.status == .ok) call.setStatus(.internal, @errorName(e));
-            std.debug.print("[zgrpc.grpc] 处理 {s} 失败：{s}\n", .{ req.path, @errorName(e) });
+            if (call.expired()) {
+                // 过期优先：即便 handler 报的是别的错，对客户端而言语义就是「超了」
+                call.setStatus(.deadline_exceeded, "超过 grpc-timeout");
+                std.debug.print("[zgrpc.grpc] 处理 {s} 超过了 grpc-timeout（{s}）\n", .{ req.path, @errorName(e) });
+            } else {
+                // 业务未显式设过状态时兜底为 internal，并留下可定位日志
+                if (call.status == .ok) call.setStatus(.internal, @errorName(e));
+                std.debug.print("[zgrpc.grpc] 处理 {s} 失败：{s}\n", .{ req.path, @errorName(e) });
+            }
         };
+
+        // handler 正常返回但已经超过 `grpc-timeout`：语义上仍是超时，不能眼睁睁回 OK
+        if (call.status == .ok and call.expired()) {
+            call.setStatus(.deadline_exceeded, "超过 grpc-timeout");
+            std.debug.print("[zgrpc.grpc] 处理 {s} 正常返回但已超时 → DEADLINE_EXCEEDED\n", .{req.path});
+        }
         return call.finish();
     }
 
@@ -356,12 +505,12 @@ pub const Server = struct {
         rsp.stream.user_data = call;
 
         if (!std.mem.eql(u8, req.method, "POST")) {
-            call.setStatus(.unimplemented, "gRPC 只支持 POST");
-            return call.finish();
+            std.debug.print("[zgrpc.grpc] 非 POST 请求 {s} {s} → 405\n", .{ req.method, req.path });
+            return httpError(rsp, "405", "gRPC requires POST");
         }
         if (!describeContentType(req, call)) {
-            call.setStatus(.invalid_argument, "content-type 必须是 application/grpc 或 application/grpc-web");
-            return call.finish();
+            std.debug.print("[zgrpc.grpc] 不支持的 content-type（{s}）→ 415\n", .{req.header("content-type") orelse "缺失"});
+            return httpError(rsp, "415", "content-type must be application/grpc[+proto] or application/grpc-web[+proto]");
         }
 
         if (self.findStreamRoute(req.path)) |sr| {
@@ -387,6 +536,12 @@ pub const Server = struct {
         const call: *Call = @ptrCast(@alignCast(p));
         if (call.finished) return;
 
+        // 超过 `grpc-timeout`：不再把请求交给业务，直接以 DEADLINE_EXCEEDED 收尾
+        if (call.expired()) {
+            call.setStatus(.deadline_exceeded, "超过 grpc-timeout");
+            return call.finish();
+        }
+
         // ① 整请求路由：原样累积（含 gRPC 长度前缀），END_STREAM 时一次交付
         if (call.unary_route) |route| {
             try call.accum.appendSlice(call.alloc, data);
@@ -394,9 +549,18 @@ pub const Server = struct {
             if (end_stream) {
                 call.req.body = call.accum.items;
                 route.handler(call.route_ctx, call, call.alloc) catch |e| {
-                    if (call.status == .ok) call.setStatus(.internal, @errorName(e));
-                    std.debug.print("[zgrpc.grpc] 处理 {s} 失败：{s}\n", .{ call.req.path, @errorName(e) });
+                    if (call.expired()) {
+                        call.setStatus(.deadline_exceeded, "超过 grpc-timeout");
+                        std.debug.print("[zgrpc.grpc] 处理 {s} 超过了 grpc-timeout（{s}）\n", .{ call.req.path, @errorName(e) });
+                    } else {
+                        if (call.status == .ok) call.setStatus(.internal, @errorName(e));
+                        std.debug.print("[zgrpc.grpc] 处理 {s} 失败：{s}\n", .{ call.req.path, @errorName(e) });
+                    }
                 };
+                // 慢 handler 正常返回但已超时：仍然按超时告知客户端
+                if (call.status == .ok and call.expired()) {
+                    call.setStatus(.deadline_exceeded, "超过 grpc-timeout");
+                }
                 return call.finish();
             }
             return;
@@ -415,8 +579,13 @@ pub const Server = struct {
             if (avail - 5 < len) break;
             const msg = call.accum.items[pos + 5 .. pos + 5 + len];
             sr.on_message(call.route_ctx, call, msg) catch |e| {
-                if (call.status == .ok) call.setStatus(.internal, @errorName(e));
-                std.debug.print("[zgrpc.grpc] 流式处理 {s} 失败：{s}\n", .{ call.req.path, @errorName(e) });
+                if (call.expired()) {
+                    call.setStatus(.deadline_exceeded, "超过 grpc-timeout");
+                    std.debug.print("[zgrpc.grpc] 流式处理 {s} 超过了 grpc-timeout（{s}）\n", .{ call.req.path, @errorName(e) });
+                } else {
+                    if (call.status == .ok) call.setStatus(.internal, @errorName(e));
+                    std.debug.print("[zgrpc.grpc] 流式处理 {s} 失败：{s}\n", .{ call.req.path, @errorName(e) });
+                }
                 return call.finish();
             };
             pos += 5 + len;
@@ -930,4 +1099,130 @@ test "grpc：压缩请求自动解压 + 大响应按 grpc-accept-encoding 压缩
     try testing.expectEqualStrings(plain, back);
     try testing.expect(saw_grpc_encoding);
     try testing.expectEqualStrings("0", grpc_status);
+}
+// ---------------------------------------------------------------------------
+// 协议一致性（对照 doc/PROTOCOL-HTTP2.md）
+// ---------------------------------------------------------------------------
+
+test "grpc：grpc-timeout 解析（各单位 / 8 位上限 / 非法值）" {
+    try testing.expectEqual(@as(?i128, 1 * std.time.ns_per_hour), parseTimeout("1H"));
+    try testing.expectEqual(@as(?i128, 90 * std.time.ns_per_min), parseTimeout("90M"));
+    try testing.expectEqual(@as(?i128, 5 * std.time.ns_per_s), parseTimeout("5S"));
+    try testing.expectEqual(@as(?i128, 500 * std.time.ns_per_ms), parseTimeout("500m"));
+    try testing.expectEqual(@as(?i128, 100 * std.time.ns_per_us), parseTimeout("100u"));
+    try testing.expectEqual(@as(?i128, 7), parseTimeout("7n"));
+    // 规范：TimeoutValue 至多 8 位数字
+    try testing.expect(parseTimeout("123456789m") == null);
+    // 非法：无单位 / 单位未知 / 空 / 非数字
+    try testing.expect(parseTimeout("5") == null);
+    try testing.expect(parseTimeout("5x") == null);
+    try testing.expect(parseTimeout("") == null);
+    try testing.expect(parseTimeout("abcS") == null);
+}
+
+test "grpc：grpc-message percent 编解码（中文必须编码，非法 %xx 原样保留）" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ASCII 可见字符（除 %）原样保留
+    try testing.expectEqualStrings("not found", try percentEncode(a, "not found"));
+    // % 本身必须编码，否则解码会歧义
+    try testing.expectEqualStrings("100%25", try percentEncode(a, "100%"));
+    // 中文 → UTF-8 逐字节 %HH（"中" = E4 B8 AD）
+    try testing.expectEqualStrings("%E4%B8%AD", try percentEncode(a, "中"));
+
+    // 往返
+    const msg = "错误：目标不存在（code=5%）";
+    const enc = try percentEncode(a, msg);
+    try testing.expectEqualStrings(msg, try percentDecode(a, enc));
+
+    // 规范：解码遇到非法 %xx 必须不报错（原样保留）
+    try testing.expectEqualStrings("100%", try percentDecode(a, "100%"));
+    try testing.expectEqualStrings("%zz", try percentDecode(a, "%zz"));
+}
+// ---------------------------------------------------------------------------
+// 405 / 415：非 gRPC 流量必须用 HTTP 状态码回（规范 SHOULD 415，只看 POST）
+// ---------------------------------------------------------------------------
+
+fn okHandlerForTest(ctx: *anyopaque, call: *Call, arena: std.mem.Allocator) anyerror!void {
+    _ = ctx;
+    _ = arena;
+    try call.sendMessage("ok");
+}
+
+fn encodeHeadersForTest(
+    a: std.mem.Allocator,
+    method: []const u8,
+    path: []const u8,
+    content_type: []const u8,
+) !std.ArrayListUnmanaged(u8) {
+    var block: std.ArrayListUnmanaged(u8) = .empty;
+    try hpack.encode(&.{
+        .{ .name = ":method", .value = method },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = "content-type", .value = content_type },
+        .{ .name = "te", .value = "trailers" },
+    }, &block, a);
+    return block;
+}
+
+/// 走完整 h2 帧（preface → SETTINGS → HEADERS → 空 DATA/END_STREAM），返回响应的 `:status`。
+fn roundTripStatus(
+    a: std.mem.Allocator,
+    method: []const u8,
+    content_type: []const u8,
+) ![]const u8 {
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, h2.client_preface);
+    try h2.appendFrame(&input, a, .settings, 0, 0, &.{});
+    const block = try encodeHeadersForTest(a, method, "/echo.Echo/Say", content_type);
+    try h2.appendFrame(&input, a, .headers, h2.Flags.end_headers, 1, block.items);
+    try h2.appendFrame(&input, a, .data, h2.Flags.end_stream, 1, &.{});
+
+    var reader = std.Io.Reader.fixed(input.items);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var conn = h2.Connection.init(testing.allocator, &reader, &aw.writer, .{});
+    defer conn.deinit();
+
+    var routes = [_]Route{.{ .path = "/echo.Echo/Say", .handler = okHandlerForTest }};
+    var dummy: u8 = 0;
+    var server = Server{ .routes = &routes, .outer_ctx = &dummy };
+    conn.serve(server.context(), server.handler()) catch |e| {
+        if (e != error.ConnectionClosed) return e;
+    };
+
+    var pos: usize = 0;
+    var status: []const u8 = "";
+    while (h2.nextFrame(aw.written(), &pos)) |f| {
+        if (f.ftype != .headers) continue;
+        var dec = hpack.Decoder.init(testing.allocator);
+        defer dec.deinit();
+        var hs: std.ArrayListUnmanaged(hpack.Header) = .empty;
+        try dec.decode(f.payload, &hs, a);
+        for (hs.items) |h| {
+            if (std.mem.eql(u8, h.name, ":status")) status = h.value;
+        }
+    }
+    return status;
+}
+
+test "grpc：非 POST 回 HTTP 405（不伪装成 :status 200）" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("405", try roundTripStatus(a, "GET", "application/grpc"));
+}
+
+test "grpc：content-type 不符回 HTTP 415（规范指定）" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("415", try roundTripStatus(a, "POST", "text/plain"));
+    // 正例：application/grpc 才走 gRPC 语义（200）
+    try testing.expectEqualStrings("200", try roundTripStatus(a, "POST", "application/grpc"));
 }
