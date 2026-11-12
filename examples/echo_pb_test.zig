@@ -94,3 +94,27 @@ test "proto_gen：repeated 数字兼容非 packed 编码（对端 [packed=false]
     const back = try echo.Summary.decode(w.bytes(), a);
     try std.testing.expectEqualSlices(i32, &.{ 7, 9 }, back.samples);
 }
+
+test "proto_gen：map<string,int32> 与 map<int32,message> 往返" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const s = echo.Summary{
+        .counts = &.{ .{ .key = "a", .value = 1 }, .{ .key = "中文", .value = -2 } },
+        .by_id = &.{ .{ .key = 7, .value = .{ .value = 70, .tag = "seven" } } },
+    };
+    const bytes = try s.encode(a);
+    const back = try echo.Summary.decode(bytes, a);
+
+    try std.testing.expectEqual(@as(usize, 2), back.counts.len);
+    try std.testing.expectEqual(@as(i32, 1), back.getCounts("a").?);
+    try std.testing.expectEqual(@as(i32, -2), back.getCounts("中文").?);
+    try std.testing.expect(back.getCounts("missing") == null);
+
+    try std.testing.expectEqual(@as(usize, 1), back.by_id.len);
+    const seven = back.getById(7).?;
+    try std.testing.expectEqual(@as(i32, 70), seven.value);
+    try std.testing.expectEqualStrings("seven", seven.tag);
+    try std.testing.expect(back.getById(8) == null);
+}

@@ -8,14 +8,14 @@
 //!
 //! - `syntax = "proto3";`、`package a.b.c;`
 //! - `message Name { ... }`：标量、`string`/`bytes`、`enum` 字段、同文件 message 字段，
-//!   `repeated` 支持**任意元素**（标量 / `string` / `bytes` / enum / message）
+//!   `repeated` 支持**任意元素**（标量 / `string` / `bytes` / enum / message），
+//!   `map<K, V>`（key 限整数或 `string`）
 //! - `enum Name { A = 0; ... }`
 //! - `service Name { rpc M(Req) returns (Res); rpc S(stream Req) returns (stream Res); }`
 //!
 //! ## 明确不支持（报错并指出行号，不静默忽略）
 //!
-//! `import`、`map<...>`、`oneof`、`optional`、`reserved`、`extend`、`group`、
-//! 嵌套 `message`/`enum` 定义。
+//! `import`、`oneof`、`optional`、`reserved`、`extend`、`group`、嵌套 `message`/`enum` 定义。
 
 const std = @import("std");
 
@@ -95,10 +95,18 @@ const Lexer = struct {
 
 pub const Scalar = enum { double, float, int32, int64, uint32, uint64, sint32, sint64, fixed32, fixed64, sfixed32, sfixed64, bool, string, bytes };
 
+/// `map<K, V>`。key 只能是整数或 string（protobuf 规定）；value 可以是任意标量或命名类型。
+pub const MapType = struct {
+    key: Scalar,
+    /// 指向 arena 上的值类型（用指针避开 union 自引用带来的无限大小）
+    value: *const FieldType,
+};
+
 pub const FieldType = union(enum) {
     scalar: Scalar,
     /// 引用同文件内的 message / enum（按末段名字查）
     named: []const u8,
+    map: MapType,
 };
 
 pub const Field = struct {
@@ -248,8 +256,8 @@ pub const Parser = struct {
                 return error.Unsupported;
             }
             if (self.atIdent("map")) {
-                std.debug.print("[zgrpc.proto] 第 {d} 行：不支持 map\n", .{self.tok.line});
-                return error.Unsupported;
+                try fields.append(self.a, try self.parseMapField());
+                continue;
             }
 
             var repeated = false;
@@ -283,6 +291,52 @@ pub const Parser = struct {
         }
         try self.expectSym("}");
         return .{ .name = name, .fields = fields.items };
+    }
+
+    /// `map<K, V> name = N [options];`
+    fn parseMapField(self: *Parser) ParseError!Field {
+        try self.advance(); // 吃掉 `map`
+        try self.expectSym("<");
+        const kname = try self.expectIdent();
+        const key = scalarFromName(kname) orelse {
+            std.debug.print("[zgrpc.proto] 第 {d} 行：map 的 key 必须是标量类型（不能是 `{s}`）\n", .{ self.tok.line, kname });
+            return error.Unsupported;
+        };
+        // protobuf 规定：key 不能是 float / double / bytes / message / enum
+        switch (key) {
+            .double, .float, .bytes => {
+                std.debug.print("[zgrpc.proto] 第 {d} 行：map 的 key 不能是 `{s}`\n", .{ self.tok.line, kname });
+                return error.Unsupported;
+            },
+            else => {},
+        }
+        try self.expectSym(",");
+        const vname = try self.expectIdent();
+        try self.expectSym(">");
+        const fname = try self.expectIdent();
+        try self.expectSym("=");
+        if (self.tok.kind != .number) return self.fail("字段号必须是数字");
+        const number = std.fmt.parseInt(u32, self.tok.text, 10) catch return error.InvalidNumber;
+        try self.advance();
+        if (self.atSym("[")) {
+            while (!self.atSym("]")) {
+                if (self.tok.kind == .eof) return self.fail("字段选项未闭合");
+                try self.advance();
+            }
+            try self.advance();
+        }
+        try self.expectSym(";");
+
+        const vptr = try self.a.create(FieldType);
+        vptr.* = if (scalarFromName(vname)) |s| .{ .scalar = s } else .{ .named = vname };
+
+        return .{
+            .name = fname,
+            .number = number,
+            // 语义上 map 就是 `repeated Entry`；这里仍标 repeated，消费方按 `.map` 单独处理
+            .ftype = .{ .map = .{ .key = key, .value = vptr } },
+            .repeated = true,
+        };
     }
 
     fn parseEnum(self: *Parser, name: []const u8) ParseError!EnumDef {
@@ -388,6 +442,25 @@ pub fn lastSegment(name: []const u8) []const u8 {
     return name;
 }
 
+/// `foo_bar` → `FooBar`。
+/// protobuf 的 map 字段要在描述符里生成嵌套类型 `<PascalCase(字段名)>Entry`，
+/// 代码生成也要用它当 Zig 类型名 —— 两处共用这一份，避免命名漂移。
+pub fn toPascalCase(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const out = try alloc.alloc(u8, s.len);
+    var n: usize = 0;
+    var upper = true;
+    for (s) |c| {
+        if (c == '_') {
+            upper = true;
+            continue;
+        }
+        out[n] = if (upper) std.ascii.toUpper(c) else c;
+        n += 1;
+        upper = false;
+    }
+    return out[0..n];
+}
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -428,9 +501,38 @@ test "proto：不支持的语法报错而不静默忽略" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nimport \"x.proto\";\n"));
-    try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { map<string,int32> m = 1; }\n"));
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { oneof k { int32 a = 1; } }\n"));
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { message N { int32 a = 1; } }\n"));
+    // map 的 key 不能是 float / double / bytes
+    try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { map<double,int32> m = 1; }\n"));
+    try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { map<bytes,int32> m = 1; }\n"));
+}
+
+test "proto：map<K,V> 解析（含 message 值）" {
+    const src =
+        \\syntax = "proto3";
+        \\package demo;
+        \\message Item { int32 id = 1; }
+        \\message Bag {
+        \\  map<string, int32> counts = 1;
+        \\  map<int32, Item> by_id = 2;
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try parse(arena.allocator(), src);
+
+    const fields = p.messages[1].fields;
+    try testing.expectEqual(@as(usize, 2), fields.len);
+    try testing.expect(fields[0].repeated); // map 语义上就是 repeated entry
+
+    const m0 = fields[0].ftype.map;
+    try testing.expectEqual(Scalar.string, m0.key);
+    try testing.expectEqual(Scalar.int32, m0.value.scalar);
+
+    const m1 = fields[1].ftype.map;
+    try testing.expectEqual(Scalar.int32, m1.key);
+    try testing.expectEqualStrings("Item", m1.value.named);
 }
 
 test "proto：repeated 支持 string / bytes / enum / message 元素" {

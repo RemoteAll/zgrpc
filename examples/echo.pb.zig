@@ -63,6 +63,10 @@ pub const BumpResponse = struct {
 };
 
 pub const Summary = struct {
+    /// `map<string, ..> counts = 11` 的条目
+    pub const CountsEntry = struct { key: []const u8, value: i32 };
+    /// `map<int32, ..> by_id = 12` 的条目
+    pub const ByIdEntry = struct { key: i32, value: BumpResponse };
     note: []const u8 = "",
     status: ?Status = null,
     last: ?BumpResponse = null,
@@ -73,6 +77,8 @@ pub const Summary = struct {
     tags: []const []const u8 = &.{},
     items: []const BumpResponse = &.{},
     states: []const Status = &.{},
+    counts: []const CountsEntry = &.{},
+    by_id: []const ByIdEntry = &.{},
 
     pub fn encode(self: @This(), a: std.mem.Allocator) ![]const u8 {
         var w = pb.Writer.init(a);
@@ -86,6 +92,18 @@ pub const Summary = struct {
         for (self.tags) |v| try w.bytesField(8, v);
         for (self.items) |v| try w.message(9, try v.encode(a));
         for (self.states) |v| try w.enumField(10, v);
+        for (self.counts) |e| {
+            var ew = pb.Writer.init(a);
+            try ew.string(1, e.key);
+            try ew.int32(2, e.value);
+            try w.message(11, ew.bytes());
+        }
+        for (self.by_id) |e| {
+            var ew = pb.Writer.init(a);
+            try ew.int32(1, e.key);
+            try ew.message(2, try e.value.encode(a));
+            try w.message(12, ew.bytes());
+        }
         return w.bytes();
     }
 
@@ -96,6 +114,8 @@ pub const Summary = struct {
         var lst_tags: std.ArrayListUnmanaged([]const u8) = .empty;
         var lst_items: std.ArrayListUnmanaged(BumpResponse) = .empty;
         var lst_states: std.ArrayListUnmanaged(Status) = .empty;
+        var lst_counts: std.ArrayListUnmanaged(CountsEntry) = .empty;
+        var lst_by_id: std.ArrayListUnmanaged(ByIdEntry) = .empty;
         var r = pb.Reader{ .data = bytes };
         while (r.next()) |f| switch (f.number) {
             1 => self.note = f.asBytes(),
@@ -118,6 +138,28 @@ pub const Summary = struct {
             8 => try lst_tags.append(a, f.asBytes()),
             9 => try lst_items.append(a, try BumpResponse.decode(f.asBytes(), a)),
             10 => if (f.asEnum(Status)) |v| try lst_states.append(a, v),
+            11 => {
+                var ek: []const u8 = "";
+                var ev: i32 = 0;
+                var er = pb.Reader{ .data = f.asBytes() };
+                while (er.next()) |ef| switch (ef.number) {
+                    1 => ek = ef.asBytes(),
+                    2 => ev = ef.asInt32(),
+                    else => {},
+                };
+                try lst_counts.append(a, .{ .key = ek, .value = ev });
+            },
+            12 => {
+                var ek: i32 = 0;
+                var ev: BumpResponse = .{};
+                var er = pb.Reader{ .data = f.asBytes() };
+                while (er.next()) |ef| switch (ef.number) {
+                    1 => ek = ef.asInt32(),
+                    2 => ev = try BumpResponse.decode(ef.asBytes(), a),
+                    else => {},
+                };
+                try lst_by_id.append(a, .{ .key = ek, .value = ev });
+            },
             else => {},
         };
         self.samples = lst_samples.items;
@@ -125,7 +167,21 @@ pub const Summary = struct {
         self.tags = lst_tags.items;
         self.items = lst_items.items;
         self.states = lst_states.items;
+        self.counts = lst_counts.items;
+        self.by_id = lst_by_id.items;
         return self;
+    }
+
+    /// `counts` 取一个键（线性查找，未命中返回 null）
+    pub fn getCounts(self: @This(), k: []const u8) ?i32 {
+        for (self.counts) |e| if (std.mem.eql(u8, e.key, k)) return e.value;
+        return null;
+    }
+
+    /// `by_id` 取一个键（线性查找，未命中返回 null）
+    pub fn getById(self: @This(), k: i32) ?BumpResponse {
+        for (self.by_id) |e| if (e.key == k) return e.value;
+        return null;
     }
 };
 

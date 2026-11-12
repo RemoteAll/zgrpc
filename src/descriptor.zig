@@ -43,24 +43,30 @@ fn isEnumName(p: *const proto.Proto, name: []const u8) bool {
 
 fn fieldTypeOf(p: *const proto.Proto, f: proto.Field) i32 {
     return switch (f.ftype) {
-        .scalar => |s| switch (s) {
-            .double => 1,
-            .float => 2,
-            .int64 => 3,
-            .uint64 => 4,
-            .int32 => 5,
-            .fixed64 => 6,
-            .fixed32 => 7,
-            .bool => 8,
-            .string => 9,
-            .bytes => 12,
-            .uint32 => 13,
-            .sfixed32 => 15,
-            .sfixed64 => 16,
-            .sint32 => 17,
-            .sint64 => 18,
-        },
+        .scalar => |s| scalarTypeCode(s),
         .named => |n| if (isEnumName(p, n)) 14 else 11,
+        // map 字段在 wire/描述符层面就是一个 message（指向自动生成的 `XxxEntry`）
+        .map => 11,
+    };
+}
+
+fn scalarTypeCode(s: proto.Scalar) i32 {
+    return switch (s) {
+        .double => 1,
+        .float => 2,
+        .int64 => 3,
+        .uint64 => 4,
+        .int32 => 5,
+        .fixed64 => 6,
+        .fixed32 => 7,
+        .bool => 8,
+        .string => 9,
+        .bytes => 12,
+        .uint32 => 13,
+        .sfixed32 => 15,
+        .sfixed64 => 16,
+        .sint32 => 17,
+        .sint64 => 18,
     };
 }
 
@@ -74,7 +80,7 @@ fn fullyQualified(alloc: std.mem.Allocator, package: []const u8, name: []const u
     return std.fmt.allocPrint(alloc, ".{s}.{s}", .{ package, name });
 }
 
-fn writeField(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, p: *const proto.Proto, f: proto.Field) !void {
+fn writeField(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, msg_name: []const u8, p: *const proto.Proto, f: proto.Field) !void {
     var inner = pb.Writer.init(alloc);
     defer inner.deinit();
 
@@ -85,10 +91,77 @@ fn writeField(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, p: *
     switch (f.ftype) {
         .scalar => {},
         .named => |n| try inner.string(6, try fullyQualified(alloc, package, n)), // type_name
+        .map => {
+            // map 字段在描述符里是 `repeated <Msg>.<Field>Entry`
+            const entry = try mapEntryName(alloc, f.name);
+            const type_name = if (package.len > 0)
+                try std.fmt.allocPrint(alloc, ".{s}.{s}.{s}", .{ package, msg_name, entry })
+            else
+                try std.fmt.allocPrint(alloc, ".{s}.{s}", .{ msg_name, entry });
+            try inner.string(6, type_name);
+        },
     }
     // json_name：protobuf 的默认规则是下划线转驼峰，客户端不传也能推导，故省略。
 
     try w.message(2, inner.bytes()); // DescriptorProto.field = 2
+}
+
+/// `counts` → `CountsEntry`（protobuf 的命名规则：字段名转 PascalCase + `Entry`）。
+fn mapEntryName(alloc: std.mem.Allocator, field_name: []const u8) ![]const u8 {
+    const base = try proto.toPascalCase(alloc, field_name);
+    return std.fmt.allocPrint(alloc, "{s}Entry", .{base});
+}
+
+/// `map<K,V>` 对应的嵌套类型：`key = 1` / `value = 2`，并打 `options.map_entry = true`。
+/// 字段号依据官方 `descriptor.proto`：`DescriptorProto.nested_type = 3`、`options = 7`，
+/// `MessageOptions.map_entry = 7`。
+fn writeMapEntry(
+    w: *pb.Writer,
+    alloc: std.mem.Allocator,
+    package: []const u8,
+    p: *const proto.Proto,
+    mt: proto.MapType,
+    field_name: []const u8,
+) !void {
+    var entry = pb.Writer.init(alloc);
+    defer entry.deinit();
+
+    try entry.string(1, try mapEntryName(alloc, field_name));
+
+    {
+        var kf = pb.Writer.init(alloc);
+        defer kf.deinit();
+        try kf.string(1, "key");
+        try kf.int32(3, 1);
+        try kf.int32(4, Label.optional);
+        try kf.int32(5, scalarTypeCode(mt.key));
+        try entry.message(2, kf.bytes());
+    }
+    {
+        var vf = pb.Writer.init(alloc);
+        defer vf.deinit();
+        try vf.string(1, "value");
+        try vf.int32(3, 2);
+        try vf.int32(4, Label.optional);
+        switch (mt.value.*) {
+            .scalar => |s| try vf.int32(5, scalarTypeCode(s)),
+            .named => |n| {
+                try vf.int32(5, if (isEnumName(p, n)) 14 else 11);
+                try vf.string(6, try fullyQualified(alloc, package, n));
+            },
+            // protobuf 不允许 map 的 value 又是 map（parser 已挡住，这里只是穷尽 switch）
+            .map => return error.Unsupported,
+        }
+        try entry.message(2, vf.bytes());
+    }
+    {
+        var opts = pb.Writer.init(alloc);
+        defer opts.deinit();
+        try opts.boolField(7, true);
+        try entry.message(7, opts.bytes()); // DescriptorProto.options = 7
+    }
+
+    try w.message(3, entry.bytes()); // DescriptorProto.nested_type = 3
 }
 
 fn writeMessage(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, p: *const proto.Proto, m: proto.Message) !void {
@@ -96,7 +169,14 @@ fn writeMessage(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, p:
     defer inner.deinit();
 
     try inner.string(1, m.name);
-    for (m.fields) |f| try writeField(&inner, alloc, package, p, f);
+    for (m.fields) |f| try writeField(&inner, alloc, package, m.name, p, f);
+    // map 字段要额外生成嵌套 Entry 类型（`nested_type`）
+    for (m.fields) |f| {
+        switch (f.ftype) {
+            .map => |mt| try writeMapEntry(&inner, alloc, package, p, mt, f.name),
+            else => {},
+        }
+    }
 
     try w.message(4, inner.bytes()); // FileDescriptorProto.message_type = 4
 }

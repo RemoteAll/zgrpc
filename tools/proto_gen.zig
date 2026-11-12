@@ -33,9 +33,50 @@ const Rpc = zproto.Rpc;
 const Proto = zproto.Proto;
 const scalarFromName = zproto.scalarFromName;
 const lastSegment = zproto.lastSegment;
+const proto_toPascalCase = zproto.toPascalCase;
 // ---------------------------------------------------------------------------
 // 代码生成
 // ---------------------------------------------------------------------------
+
+/// `counts` → `CountsEntry`（与 descriptor 里的嵌套类型同名）
+fn mapEntryTypeName(a: std.mem.Allocator, field_name: []const u8) ![]const u8 {
+    const base = try proto_toPascalCase(a, field_name);
+    return std.fmt.allocPrint(a, "{s}Entry", .{base});
+}
+
+fn mapKeyType(a: std.mem.Allocator, mt: zproto.MapType) ![]const u8 {
+    return elemType(a, .{ .name = "", .number = 0, .ftype = .{ .scalar = mt.key }, .repeated = false });
+}
+
+fn mapValueType(a: std.mem.Allocator, v: zproto.FieldType) ![]const u8 {
+    return elemType(a, .{ .name = "", .number = 0, .ftype = v, .repeated = false });
+}
+
+/// 默认值：map 为空片。
+fn mapDefault() []const u8 {
+    return "&.{}";
+}
+
+/// map 的 key/value 局部变量初值（解码时用）
+fn scalarZero(s: Scalar) []const u8 {
+    return switch (s) {
+        .bool => "false",
+        .string, .bytes => "\"\"",
+        else => "0",
+    };
+}
+
+fn namedZero(proto: Proto, n: []const u8) []const u8 {
+    // enum 用第一个枚举值；message 用空字面量（`.{}`）
+    return if (isEnum(proto, n)) "undefined" else ".{}";
+}
+
+/// `scalarReadExpr` 的表达式里写死了接收者 `f.`；map 条目内部遍历用的是 `ef`，
+/// 所以要把前缀换掉（不做字符串替换就只能把整个 switch 再写一遍）。
+fn retarget(a: std.mem.Allocator, expr: []const u8, recv: []const u8) ![]const u8 {
+    const tail = expr[2..]; // 跳过 `f.`
+    return std.fmt.allocPrint(a, "{s}.{s}", .{ recv, tail });
+}
 
 /// 单个元素（非 repeated）的 Zig 类型写法。
 fn elemType(a: std.mem.Allocator, f: Field) ![]const u8 {
@@ -52,16 +93,24 @@ fn elemType(a: std.mem.Allocator, f: Field) ![]const u8 {
         },
         // 元素是**值**类型（不是 `?T`）
         .named => |n| try std.fmt.allocPrint(a, "{s}", .{lastSegment(n)}),
+        // map 只在字段层处理；作为「元素」不可能出现（parser 已挡），这里只是穷尽 switch
+        .map => unreachable,
     };
 }
 
 /// 生成字段的 Zig 类型写法（named 类型需要拼接，故用分配器）。
 fn zigType(a: std.mem.Allocator, proto: Proto, f: Field) ![]const u8 {
     _ = proto; // named 类型只取末段名字，不需要查表
-    if (f.repeated) return std.fmt.allocPrint(a, "[]const {s}", .{try elemType(a, f)});
+    if (f.repeated) {
+        switch (f.ftype) {
+            .map => return std.fmt.allocPrint(a, "[]const {s}", .{try mapEntryTypeName(a, f.name)}),
+            else => return std.fmt.allocPrint(a, "[]const {s}", .{try elemType(a, f)}),
+        }
+    }
     return switch (f.ftype) {
         .scalar => elemType(a, f),
         .named => |n| try std.fmt.allocPrint(a, "?{s}", .{lastSegment(n)}),
+        .map => std.fmt.allocPrint(a, "[]const {s}", .{try mapEntryTypeName(a, f.name)}),
     };
 }
 
@@ -114,6 +163,7 @@ fn defaultValue(proto: Proto, f: Field) []const u8 {
             else => "0",
         },
         .named => |n| if (isEnum(proto, n)) "null" else "null",
+        .map => mapDefault(),
     };
 }
 
@@ -121,6 +171,22 @@ fn writeEncodeField(w: anytype, proto: Proto, f: Field, pad: []const u8) !void {
     const fnum = f.number;
     if (f.repeated) {
         switch (f.ftype) {
+            // map：每个条目编码成一个 Entry 子消息（key=1 / value=2）
+            .map => |mt| {
+                try w.print("{s}for (self.{s}) |e| {{\n", .{ pad, f.name });
+                try w.print("{s}    var ew = pb.Writer.init(a);\n", .{pad});
+                try w.print("{s}    try ew.{s}(1, e.key);\n", .{ pad, scalarWriteFn(mt.key) });
+                switch (mt.value.*) {
+                    .scalar => |s| try w.print("{s}    try ew.{s}(2, e.value);\n", .{ pad, scalarWriteFn(s) }),
+                    .named => |n| if (isEnum(proto, n))
+                        try w.print("{s}    try ew.enumField(2, e.value);\n", .{pad})
+                    else
+                        try w.print("{s}    try ew.message(2, try e.value.encode(a));\n", .{pad}),
+                    .map => return error.Unsupported,
+                }
+                try w.print("{s}    try w.message({d}, ew.bytes());\n", .{ pad, fnum });
+                try w.print("{s}}}\n", .{pad});
+            },
             .scalar => |s| {
                 if (s == .string or s == .bytes) {
                     // 非 packed：每条一个 tag + 长度
@@ -161,6 +227,7 @@ fn writeEncodeField(w: anytype, proto: Proto, f: Field, pad: []const u8) !void {
                 try w.print("{s}if (self.{s}) |v| try w.message({d}, try v.encode(a));\n", .{ pad, f.name, fnum });
             }
         },
+        .map => {},
     }
 }
 
@@ -192,7 +259,6 @@ fn enumIndexOf(proto: Proto, name: []const u8) usize {
 }
 
 fn writeDecodeField(a: std.mem.Allocator, w: anytype, proto: Proto, f: Field, pad: []const u8) !void {
-    _ = a; // 类型字符串已在结构体字段声明处算好，这里只写分支
     const fnum = f.number;
     if (f.repeated) {
         // 反复出现的同号字段（以及 packed / 非 packed 混用）都累积到局部 list
@@ -218,6 +284,31 @@ fn writeDecodeField(a: std.mem.Allocator, w: anytype, proto: Proto, f: Field, pa
                     try w.print("{s}{d} => try lst_{s}.append(a, try {s}.decode(f.asBytes(), a)),\n", .{ pad, fnum, f.name, t });
                 }
             },
+            .map => |mt| {
+                // 每个条目是独立子消息：先在局部累积 key/value，再 append
+                try w.print("{s}{d} => {{\n", .{ pad, fnum });
+                try w.print("{s}    var ek: {s} = {s};\n", .{ pad, try mapKeyType(a, mt), scalarZero(mt.key) });
+                try w.print("{s}    var ev: {s} = {s};\n", .{ pad, try mapValueType(a, mt.value.*), switch (mt.value.*) {
+                    .scalar => |s| scalarZero(s),
+                    .named => |n| namedZero(proto, n),
+                    .map => return error.Unsupported,
+                } });
+                try w.print("{s}    var er = pb.Reader{{ .data = f.asBytes() }};\n", .{pad});
+                try w.print("{s}    while (er.next()) |ef| switch (ef.number) {{\n", .{pad});
+                try w.print("{s}        1 => ek = {s},\n", .{ pad, try retarget(a, scalarReadExpr(mt.key), "ef") });
+                switch (mt.value.*) {
+                    .scalar => |s| try w.print("{s}        2 => ev = {s},\n", .{ pad, try retarget(a, scalarReadExpr(s), "ef") }),
+                    .named => |n| if (isEnum(proto, n))
+                        try w.print("{s}        2 => if (ef.asEnum({s})) |v| ev = v,\n", .{ pad, lastSegment(n) })
+                    else
+                        try w.print("{s}        2 => ev = try {s}.decode(ef.asBytes(), a),\n", .{ pad, lastSegment(n) }),
+                    .map => return error.Unsupported,
+                }
+                try w.print("{s}        else => {{}},\n", .{pad});
+                try w.print("{s}    }};\n", .{pad});
+                try w.print("{s}    try lst_{s}.append(a, .{{ .key = ek, .value = ev }});\n", .{ pad, f.name });
+                try w.print("{s}}},\n", .{pad});
+            },
         }
         return;
     }
@@ -235,6 +326,7 @@ fn writeDecodeField(a: std.mem.Allocator, w: anytype, proto: Proto, f: Field, pa
                 try w.print("{s}{d} => self.{s} = try {s}.decode(f.asBytes(), a),\n", .{ pad, fnum, f.name, t });
             }
         },
+        .map => {},
     }
 }
 
@@ -277,6 +369,7 @@ fn decodeNeedsAlloc(proto: Proto, m: Message) bool {
         switch (f.ftype) {
             .named => |n| if (!isEnum(proto, n)) return true,
             .scalar => {},
+            .map => return true,
         }
     }
     return false;
@@ -308,6 +401,20 @@ fn generate(a: std.mem.Allocator, proto: Proto, src_path: []const u8) ![]const u
     // 消息
     for (proto.messages) |m| {
         try w.print("pub const {s} = struct {{\n", .{m.name});
+        // map 字段的条目类型（与描述符里的 `XxxEntry` 同名，便于双向对照）
+        for (m.fields) |f| {
+            switch (f.ftype) {
+                .map => |mt| {
+                    try w.print("    /// `map<{s}, ..> {s} = {d}` 的条目\n", .{ @tagName(mt.key), f.name, f.number });
+                    try w.print("    pub const {s} = struct {{ key: {s}, value: {s} }};\n", .{
+                        try mapEntryTypeName(a, f.name),
+                        try mapKeyType(a, mt),
+                        try mapValueType(a, mt.value.*),
+                    });
+                },
+                else => {},
+            }
+        }
         for (m.fields) |f| {
             try w.print("    {s}: {s} = {s},\n", .{ f.name, try zigType(a, proto, f), defaultValue(proto, f) });
         }
@@ -323,7 +430,11 @@ fn generate(a: std.mem.Allocator, proto: Proto, src_path: []const u8) ![]const u
         // repeated 字段用局部 list 累积：同号字段可重复出现，packed 与非 packed 也能混用
         for (m.fields) |f| {
             if (!f.repeated) continue;
-            try w.print("        var lst_{s}: std.ArrayListUnmanaged({s}) = .empty;\n", .{ f.name, try elemType(a, f) });
+            const elem = switch (f.ftype) {
+                .map => try mapEntryTypeName(a, f.name),
+                else => try elemType(a, f),
+            };
+            try w.print("        var lst_{s}: std.ArrayListUnmanaged({s}) = .empty;\n", .{ f.name, elem });
         }
         try w.writeAll("        var r = pb.Reader{ .data = bytes };\n");
         try w.writeAll("        while (r.next()) |f| switch (f.number) {\n");
@@ -334,7 +445,27 @@ fn generate(a: std.mem.Allocator, proto: Proto, src_path: []const u8) ![]const u
             if (!f.repeated) continue;
             try w.print("        self.{s} = lst_{s}.items;\n", .{ f.name, f.name });
         }
-        try w.writeAll("        return self;\n    }\n};\n\n");
+        try w.writeAll("        return self;\n    }\n");
+        // map 的键查找辅助（零依赖；小 map 线性查找足够，不值得引入 hash 容器）
+        for (m.fields) |f| {
+            switch (f.ftype) {
+                .map => |mt| {
+                    const pascal = try proto_toPascalCase(a, f.name);
+                    const kt = try mapKeyType(a, mt);
+                    const vt = try mapValueType(a, mt.value.*);
+                    try w.print("\n    /// `{s}` 取一个键（线性查找，未命中返回 null）\n", .{f.name});
+                    try w.print("    pub fn get{s}(self: @This(), k: {s}) ?{s} {{\n", .{ pascal, kt, vt });
+                    if (mt.key == .string) {
+                        try w.print("        for (self.{s}) |e| if (std.mem.eql(u8, e.key, k)) return e.value;\n", .{f.name});
+                    } else {
+                        try w.print("        for (self.{s}) |e| if (e.key == k) return e.value;\n", .{f.name});
+                    }
+                    try w.writeAll("        return null;\n    }\n");
+                },
+                else => {},
+            }
+        }
+        try w.writeAll("};\n\n");
     }
 
     // 服务：路由常量
@@ -399,6 +530,17 @@ pub fn main(init: std.process.Init) !void {
                 .named => |n| if (!isMessage(parsed, n) and !isEnum(parsed, n)) {
                     std.debug.print("[proto_gen] {s} 的字段 {s} 引用了未定义类型 {s}\n", .{ m.name, f.name, n });
                     return error.UnknownType;
+                },
+                .map => |mt| switch (mt.value.*) {
+                    .scalar => {},
+                    .named => |n| if (!isMessage(parsed, n) and !isEnum(parsed, n)) {
+                        std.debug.print("[proto_gen] {s} 的 map 字段 {s} 取值类型未定义：{s}\n", .{ m.name, f.name, n });
+                        return error.UnknownType;
+                    },
+                    .map => {
+                        std.debug.print("[proto_gen] {s} 的字段 {s}：map 的 value 不能再是 map\n", .{ m.name, f.name });
+                        return error.Unsupported;
+                    },
                 },
             }
         }

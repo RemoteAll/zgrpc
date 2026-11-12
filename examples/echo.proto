@@ -36,6 +36,9 @@ message Summary {
   repeated string tags = 8;
   repeated BumpResponse items = 9;
   repeated Status states = 10;
+  // map：生成 []const XxxEntry（零依赖，另带 get<Field> 线性查找辅助）
+  map<string, int32> counts = 11;
+  map<int32, BumpResponse> by_id = 12;
 }
 
 service Echo {

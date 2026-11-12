@@ -5,7 +5,10 @@
 
 ## 未发布
 
-### 新增- **`repeated` 支持任意元素类型**（此前只允许数字标量）：`repeated string` / `bytes` / enum / message
+### 新增
+- **`map<K, V>` 支持**（代码生成 + 服务反射两侧）：key 限整数或 `string`（protobuf 规定），
+  value 可以是标量 / enum / message。（见下方详细说明）
+- **`repeated` 支持任意元素类型**（此前只允许数字标量）：`repeated string` / `bytes` / enum / message
   现在都能生成与编解码。生成侧按元素类型选正确 wire 编码：
   - 数字/bool → packed（`packedVarint` / `packedSint` / `packedFixed32` / `packedFixed64`）
   - `string`/`bytes`/enum/message → 每条一个 tag + 长度
@@ -13,7 +16,14 @@
 - `pb.Writer` 新增泛型 packed 写入口：`packedVarint`（任意宽度整数/bool）、`packedSint`（zigzag）、
   `packedFixed32`（float/fixed32/sfixed32）、`packedFixed64`（double/fixed64/sfixed64）；
   `pb.Field` 新增 `packedFixed32s` / `packedFixed64s`。此前 `repeated float/double/fixed*` 会被当成
-  varint 编码（**错误**），现在按定长小端处理。- **服务反射（`grpc.reflection.v1` + `v1alpha`）**：`zgrpc.reflection.Service` 让 `grpcurl` / `ghz` / Postman
+  varint 编码（**错误**），现在按定长小端处理。
+- **`map<K, V>`（详细）**：
+  - 生成侧：`[]const XxxEntry` + `pub fn get<Field>(k) ?V` 线性查找辅助，零依赖、不引入 hash 容器；
+    条目类型名与描述符里的嵌套类型同名，便于双向对照。
+  - 反射侧：按官方 `descriptor.proto` 生成嵌套 `XxxEntry`（`DescriptorProto.nested_type = 3`）
+    并打 `options.map_entry = true`（`MessageOptions.map_entry = 7`）；`grpcurl describe` 实测渲染为
+    `map<string, int32> counts = 11;`，说明 protoreflect 认出了 map_entry。
+- **服务反射（`grpc.reflection.v1` + `v1alpha`）**：`zgrpc.reflection.Service` 让 `grpcurl` / `ghz` / Postman
   **不需要 `.proto`** 就能 `list` / `describe` / 直接调用。登记时给 `.proto` 源码即可（示例用 `@embedFile`）。
   - `src/proto.zig`：proto3 子集解析器（从 `tools/proto_gen.zig` 下沉，代码生成与反射共用一份）。
   - `src/descriptor.zig`：语法树 → `google.protobuf.FileDescriptorProto`，字段号严格按官方定义。
