@@ -18,6 +18,7 @@ const std = @import("std");
 pub const hpack = @import("hpack.zig");
 pub const h2 = @import("h2.zig");
 pub const grpc = @import("grpc.zig");
+pub const client = @import("client.zig");
 
 /// 库版本（语义化）。
 pub const version = "0.1.0";
