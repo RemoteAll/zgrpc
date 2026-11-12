@@ -542,7 +542,8 @@ pub const Connection = struct {
     }
 
     fn onRstStream(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
-        _ = payload;
+        // RFC 9113 §6.4：RST_STREAM 载荷必为 4 字节，否则是连接级 FRAME_SIZE_ERROR
+        if (payload.len != 4) return error.FrameSizeError;
         if (self.findStream(hdr.stream_id)) |s| {
             std.debug.print("[zgrpc.h2] 对端重置流 {d}，丢弃其状态\n", .{hdr.stream_id});
             if (self.stream_hooks) |hooks| {
@@ -591,6 +592,12 @@ pub const Connection = struct {
     // -----------------------------------------------------------------------
 
     fn onHeaders(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
+        // RFC 9113 §5.1.1：客户端发起的流号必须是正奇数（偶数是服务端推送专用，本库不用）
+        if (hdr.stream_id == 0 or hdr.stream_id % 2 == 0) {
+            std.debug.print("[zgrpc.h2] 非法流号 {d}（客户端发起必须为奇数）\n", .{hdr.stream_id});
+            try self.sendGoAway(.protocol_error);
+            return error.ProtocolError;
+        }
         const s = self.findStream(hdr.stream_id) orelse blk: {
             if (self.streams.items.len >= self.opts.max_concurrent_streams) {
                 std.debug.print(
@@ -632,8 +639,10 @@ pub const Connection = struct {
 
     fn onContinuation(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
         const s = self.findStream(hdr.stream_id) orelse {
-            try self.skipContinuation();
-            return error.ProtocolError;
+            // 流已不存在（比如上一条 HEADERS 已因超限被 RST/销毁）：**忽略该 CONTINUATION**。
+            // 这里不能返回错误——那会把整条连接拆掉，连带弄死其它正常流（流级错误就按流处理）。
+            std.debug.print("[zgrpc.h2] 忽略孤立的 CONTINUATION（流 {d} 不存在）\n", .{hdr.stream_id});
+            return;
         };
         if (s.headers_done) {
             try self.sendRst(hdr.stream_id, .protocol_error);
@@ -1249,4 +1258,52 @@ test "h2健壮性：PADDED 帧 pad 长度越界 → 拒绝该流（不越界读�
     const out = try driveConn(a, input.items, .{});
     // 必须给出明确拒绝（协议错误），而不是读到缓冲区外
     try testing.expect(findRstCode(out, 1) != null);
+}
+test "h2健壮性：孤立 CONTINUATION（流不存在）不拆连接，后续帧仍被处理" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, client_preface);
+    try appendFrame(&input, a, .settings, 0, 0, &.{});
+    // 流 3 从未建立 → 这条 CONTINUATION 是孤立的
+    try appendFrame(&input, a, .continuation, Flags.end_headers, 3, "junk");
+    // 同一条连接上的 PING 必须仍然被回应（说明连接没被拆）
+    try appendFrame(&input, a, .ping, 0, 0, "12345678");
+
+    const out = try driveConn(a, input.items, .{});
+    var pos: usize = 0;
+    var got_ping_ack = false;
+    while (nextFrame(out, &pos)) |f| {
+        if (f.ftype == .ping and f.flags & Flags.ack != 0) got_ping_ack = true;
+    }
+    try testing.expect(got_ping_ack);
+}
+
+test "h2健壮性：偶数流号（客户端非法）→ GOAWAY + ProtocolError" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, client_preface);
+    try appendFrame(&input, a, .settings, 0, 0, &.{});
+    const b2 = try encodeReqHeaders(a, "/even");
+    try appendFrame(&input, a, .headers, Flags.end_headers, 2, b2.items); // 偶数流号
+
+    try testing.expectError(error.ProtocolError, driveConn(a, input.items, .{}));
+}
+
+test "h2健壮性：RST_STREAM 载荷不是 4 字节 → FRAME_SIZE_ERROR" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, client_preface);
+    try appendFrame(&input, a, .settings, 0, 0, &.{});
+    try appendFrame(&input, a, .rst_stream, 0, 1, &.{ 0x00, 0x01 }); // 只给 2 字节
+
+    try testing.expectError(error.FrameSizeError, driveConn(a, input.items, .{}));
 }
