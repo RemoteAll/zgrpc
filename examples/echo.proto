@@ -44,6 +44,9 @@ message Summary {
     string text = 13;
     BumpResponse rich = 14;
   }
+  // proto3 optional：显式 presence（生成 ?T，默认值也写）
+  optional int32 opt_value = 15;
+  optional string opt_name = 16;
 }
 
 service Echo {

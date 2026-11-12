@@ -84,6 +84,8 @@ pub const Summary = struct {
     states: []const Status = &.{},
     counts: []const CountsEntry = &.{},
     by_id: []const ByIdEntry = &.{},
+    opt_value: ?i32 = null,
+    opt_name: ?[]const u8 = null,
     payload: ?Payload = null,
 
     pub fn encode(self: @This(), a: std.mem.Allocator) ![]const u8 {
@@ -109,6 +111,12 @@ pub const Summary = struct {
             try ew.int32(1, e.key);
             try ew.message(2, try e.value.encode(a));
             try w.message(12, ew.bytes());
+        }
+        if (self.opt_value) |v| {
+            try w.int32(15, v);
+        }
+        if (self.opt_name) |v| {
+            try w.string(16, v);
         }
         if (self.payload) |c| switch (c) {
             .text => |v| {
@@ -176,6 +184,8 @@ pub const Summary = struct {
             },
             13 => self.payload = .{ .text = f.asBytes() },
             14 => self.payload = .{ .rich = try BumpResponse.decode(f.asBytes(), a) },
+            15 => self.opt_value = f.asInt32(),
+            16 => self.opt_name = f.asBytes(),
             else => {},
         };
         self.samples = lst_samples.items;

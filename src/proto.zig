@@ -9,13 +9,13 @@
 //! - `syntax = "proto3";`、`package a.b.c;`
 //! - `message Name { ... }`：标量、`string`/`bytes`、`enum` 字段、同文件 message 字段，
 //!   `repeated` 支持**任意元素**（标量 / `string` / `bytes` / enum / message），
-//!   `map<K, V>`（key 限整数或 `string`），`oneof { ... }`
+//!   `map<K, V>`（key 限整数或 `string`），`oneof { ... }`，`optional`（proto3 显式 presence）
 //! - `enum Name { A = 0; ... }`
 //! - `service Name { rpc M(Req) returns (Res); rpc S(stream Req) returns (stream Res); }`
 //!
 //! ## 明确不支持（报错并指出行号，不静默忽略）
 //!
-//! `import`、`optional`、`reserved`、`extend`、`group`、嵌套 `message`/`enum` 定义。
+//! `import`、`reserved`、`extend`、`group`、嵌套 `message`/`enum` 定义。
 
 const std = @import("std");
 
@@ -116,6 +116,9 @@ pub const Field = struct {
     repeated: bool,
     /// 属于哪个 oneof（索引到 `Message.oneofs`）；非 oneof 成员为 null
     oneof_index: ?u32 = null,
+    /// proto3 的 `optional`：显式 presence。
+    /// 描述符里要合成一个 `_<字段名>` oneof 并打 `proto3_optional = true`。
+    proto3_optional: bool = false,
 };
 
 pub const Message = struct {
@@ -251,7 +254,7 @@ pub const Parser = struct {
         while (!self.atSym("}")) {
             if (self.tok.kind == .eof) return self.fail("message 未闭合");
             if (self.atIdent("reserved") or self.atIdent("extend") or
-                self.atIdent("optional") or self.atIdent("required") or self.atIdent("group"))
+                self.atIdent("required") or self.atIdent("group"))
             {
                 std.debug.print("[zgrpc.proto] 第 {d} 行：不支持 `{s}`\n", .{ self.tok.line, self.tok.text });
                 return error.Unsupported;
@@ -294,13 +297,20 @@ pub const Parser = struct {
                 continue;
             }
 
+            var optional = false;
+            if (self.atIdent("optional")) {
+                optional = true;
+                try self.advance();
+            }
             var repeated = false;
             if (self.atIdent("repeated")) {
                 repeated = true;
                 try self.advance();
             }
+            if (optional and repeated) return self.fail("字段不能同时是 optional 和 repeated");
             var f = try self.parsePlainField();
             f.repeated = repeated;
+            f.proto3_optional = optional;
             try fields.append(self.a, f);
         }
         try self.expectSym("}");

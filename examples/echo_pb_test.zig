@@ -141,6 +141,32 @@ test "proto_gen：oneof 往返（tagged union）" {
     try std.testing.expect((try echo.Summary.decode("", a)).payload == null);
 }
 
+test "proto_gen：proto3 optional 显式 presence（未设置不写、设成默认值要写）" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 未设置：不写任何字节
+    const s1 = echo.Summary{};
+    try std.testing.expectEqual(@as(usize, 0), (try s1.encode(a)).len);
+
+    // 显式设成 0：必须写（普通字段的 0 是不写的）
+    const s2 = echo.Summary{ .opt_value = 0 };
+    const b2 = try s2.encode(a);
+    try std.testing.expect(b2.len > 0);
+    try std.testing.expectEqual(@as(i32, 0), (try echo.Summary.decode(b2, a)).opt_value.?);
+
+    // 显式设成空串：同样要写
+    const s3 = echo.Summary{ .opt_name = "" };
+    try std.testing.expect((try s3.encode(a)).len > 0);
+
+    // 有值往返
+    const s4 = echo.Summary{ .opt_value = -5, .opt_name = "n" };
+    const back = try echo.Summary.decode(try s4.encode(a), a);
+    try std.testing.expectEqual(@as(i32, -5), back.opt_value.?);
+    try std.testing.expectEqualStrings("n", back.opt_name.?);
+}
+
 test "proto_gen：oneof 成员取默认值也要写入（区别于普通字段的零值不写）" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

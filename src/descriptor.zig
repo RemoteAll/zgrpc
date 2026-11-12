@@ -80,7 +80,7 @@ fn fullyQualified(alloc: std.mem.Allocator, package: []const u8, name: []const u
     return std.fmt.allocPrint(alloc, ".{s}.{s}", .{ package, name });
 }
 
-fn writeField(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, msg_name: []const u8, p: *const proto.Proto, f: proto.Field) !void {
+fn writeField(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, msg_name: []const u8, p: *const proto.Proto, f: proto.Field, oneof_index: ?u32) !void {
     var inner = pb.Writer.init(alloc);
     defer inner.deinit();
 
@@ -102,7 +102,8 @@ fn writeField(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, msg_
         },
     }
     // json_name：protobuf 的默认规则是下划线转驼峰，客户端不传也能推导，故省略。
-    if (f.oneof_index) |oi| try inner.int32(9, @intCast(oi)); // FieldDescriptorProto.oneof_index = 9
+    if (oneof_index) |oi| try inner.int32(9, @intCast(oi)); // FieldDescriptorProto.oneof_index = 9
+    if (f.proto3_optional) try inner.boolField(17, true); // FieldDescriptorProto.proto3_optional = 17
 
     try w.message(2, inner.bytes()); // DescriptorProto.field = 2
 }
@@ -111,6 +112,17 @@ fn writeField(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, msg_
 fn mapEntryName(alloc: std.mem.Allocator, field_name: []const u8) ![]const u8 {
     const base = try proto.toPascalCase(alloc, field_name);
     return std.fmt.allocPrint(alloc, "{s}Entry", .{base});
+}
+
+/// `optional` 字段在「合成 oneof 区」里的序号（按字段出现顺序，从 0 开始）。
+fn syntheticIndex(m: proto.Message, target: proto.Field) u32 {
+    var i: u32 = 0;
+    for (m.fields) |f| {
+        if (!f.proto3_optional) continue;
+        if (f.number == target.number) return i;
+        i += 1;
+    }
+    return i;
 }
 
 /// `map<K,V>` 对应的嵌套类型：`key = 1` / `value = 2`，并打 `options.map_entry = true`。
@@ -170,7 +182,14 @@ fn writeMessage(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, p:
     defer inner.deinit();
 
     try inner.string(1, m.name);
-    for (m.fields) |f| try writeField(&inner, alloc, package, m.name, p, f);
+    // 先排真实 oneof，再排 `optional` 字段的合成 oneof（索引必须与实际 oneof_decl 顺序一致）
+    for (m.fields) |f| {
+        if (f.proto3_optional) {
+            try writeField(&inner, alloc, package, m.name, p, f, @intCast(m.oneofs.len + syntheticIndex(m, f)));
+        } else {
+            try writeField(&inner, alloc, package, m.name, p, f, f.oneof_index);
+        }
+    }
     // map 字段要额外生成嵌套 Entry 类型（`nested_type`）
     for (m.fields) |f| {
         switch (f.ftype) {
@@ -183,6 +202,14 @@ fn writeMessage(w: *pb.Writer, alloc: std.mem.Allocator, package: []const u8, p:
         var od = pb.Writer.init(alloc);
         defer od.deinit();
         try od.string(1, oname);
+        try inner.message(8, od.bytes());
+    }
+    // proto3 `optional` 的合成 oneof（名字是 `_<字段名>`，protoc 就是这么干的）
+    for (m.fields) |f| {
+        if (!f.proto3_optional) continue;
+        var od = pb.Writer.init(alloc);
+        defer od.deinit();
+        try od.string(1, try std.fmt.allocPrint(alloc, "_{s}", .{f.name}));
         try inner.message(8, od.bytes());
     }
 

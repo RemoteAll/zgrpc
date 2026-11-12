@@ -6,6 +6,9 @@
 ## 未发布
 
 ### 新增
+- **`optional`（proto3 显式 presence）**：生成 `?T`，**设为默认值也会写盘**（否则无法区分「设成 0」与「未设置」）。
+  描述符侧按 protoc 的做法合成 `_<字段名>` oneof 并打 `FieldDescriptorProto.proto3_optional = 17`；
+  `grpcurl describe` 实测渲染为 `optional int32 opt_value = 15;`（合成 oneof 被正确隐藏）。
 - **`oneof` 支持**：生成 Zig 的 tagged union（语义天然对应「同时只能有一个」），
   `DescriptorProto.oneof_decl = 8` + `FieldDescriptorProto.oneof_index = 9`；`grpcurl describe` 实测
   渲染为 `oneof payload { string text = 13; .echo.BumpResponse rich = 14; }`。

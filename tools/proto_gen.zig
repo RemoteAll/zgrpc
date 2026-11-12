@@ -107,9 +107,11 @@ fn zigType(a: std.mem.Allocator, proto: Proto, f: Field) ![]const u8 {
             else => return std.fmt.allocPrint(a, "[]const {s}", .{try elemType(a, f)}),
         }
     }
+    const base = try elemType(a, f);
     return switch (f.ftype) {
-        .scalar => elemType(a, f),
-        .named => |n| try std.fmt.allocPrint(a, "?{s}", .{lastSegment(n)}),
+        // message 引用本来就是 ?T（表示未设置）；enum / 标量在 `optional` 时才包成 ?T
+        .named => std.fmt.allocPrint(a, "?{s}", .{base}),
+        .scalar => if (f.proto3_optional) std.fmt.allocPrint(a, "?{s}", .{base}) else base,
         .map => std.fmt.allocPrint(a, "[]const {s}", .{try mapEntryTypeName(a, f.name)}),
     };
 }
@@ -155,6 +157,7 @@ fn isMessage(proto: Proto, name: []const u8) bool {
 
 fn defaultValue(proto: Proto, f: Field) []const u8 {
     if (f.repeated) return "&.{}";
+    if (f.proto3_optional) return "null";
     return switch (f.ftype) {
         .scalar => |s| switch (s) {
             .bool => "false",
@@ -204,6 +207,15 @@ fn writeEncodeField(w: anytype, proto: Proto, f: Field, pad: []const u8) !void {
                 }
             },
         }
+        return;
+    }
+    // proto3 `optional`：有值就写，**即使值是默认值**（否则无法表达显式 presence）
+    if (f.proto3_optional) {
+        var pad_buf: [64]u8 = undefined;
+        const pad2 = std.fmt.bufPrint(&pad_buf, "{s}    ", .{pad}) catch pad;
+        try w.print("{s}if (self.{s}) |v| {{\n", .{ pad, f.name });
+        try writeValueStmt(w, proto, f, "v", pad2);
+        try w.print("{s}}}\n", .{pad});
         return;
     }
     switch (f.ftype) {
