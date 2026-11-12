@@ -91,14 +91,14 @@ zig run tools/proto_gen.zig -- my.proto my.pb.zig
 ## 构建与验证
 
 ```bash
-zig build test           # 41 个单元/端到端测试
+zig build test           # 47 个单元/端到端测试（含 6 个 h2 健壮性测试）
 zig build echo-server    # 监听 127.0.0.1:18051
 zig build echo-client    # 并发双流 + bidi + 健康检查 + grpc-timeout 超时 + -bin metadata + grpc-web-text + pb 结构化往返
 ```
 
 实测（2026-11-12，Windows，Zig 0.17.1）：
 
-- `tools\regression.ps1` → 构建 PASS / tests 41（下限 41）/ 冒烟 PASS / **四向 Rust 对拍 PASS**，exit 0；
+- `tools\regression.ps1` → 构建 PASS / tests 47（下限 47）/ 冒烟 PASS / **四向 Rust 对拍 PASS**，exit 0；
 - 真实 socket：unary **并发双流**均 `grpc-status=0`；**bidi** 3 条请求 → 3 条响应（`chat:a/b/c`）；
   **健康检查** `grpc-status=0` + `ServingStatus=1`；**grpc-timeout 生效**：80ms 调睡 300ms 的方法 → `grpc-status=4`；
   **`-bin` metadata 往返**：`x-token-bin` → 响应头 `x-echo-bin` + trailer `x-note`。
@@ -117,6 +117,6 @@ zig build echo-client    # 并发双流 + bidi + 健康检查 + grpc-timeout 超
 Zig 标准库 `std.http` 只有 HTTP/1.1，**没有 h2、没有 hpack**（`lib/std/http` 下仅
 `Server.zig` / `Client.zig` / `HeadParser.zig` / `ChunkParser.zig`）。
 
-## 文档
+## 部署\n\n对外一律**反代终止 TLS**、后端 h2c；nginx / Caddy 样例、并发上限、超时语义、健康检查、上线自检清单见 [`docs/部署.md`](docs/部署.md)。\n\n## 文档
 
 - `docs/决策记录.md` —— 为什么独立成库、关键取舍与实测数据

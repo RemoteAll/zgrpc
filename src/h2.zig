@@ -742,9 +742,18 @@ pub const Connection = struct {
 
         var data = payload;
         if (hdr.flags & Flags.padded != 0) {
-            if (payload.len == 0) return error.ProtocolError;
+            // pad 长度越界：只拒绝该流（不能把错误抛上去，否则一条坏帧就能拆掉整条连接、
+            // 连带弄死其它正常流。RFC 9113 也要求按流处理协议错误）。
+            if (payload.len == 0 or @as(usize, payload[0]) > payload.len - 1) {
+                std.debug.print("[zgrpc.h2] 流 {d} 的 PADDED 帧 pad 长度越界（载荷 {d} 字节），拒绝该流\n", .{
+                    hdr.stream_id, payload.len,
+                });
+                try self.refundWindow(hdr.stream_id, payload.len, true);
+                try self.sendRst(hdr.stream_id, .protocol_error);
+                self.destroyStream(s);
+                return;
+            }
             const pad = @as(usize, payload[0]);
-            if (pad > payload.len - 1) return error.ProtocolError;
             data = payload[1 .. payload.len - pad];
         }
 
@@ -1117,4 +1126,127 @@ test "h2：多路复用（两个流交错收头/收体，各自独立响应）" 
     try testing.expectEqualStrings("three", body3);
     try testing.expect(end1);
     try testing.expect(end3);
+}
+// ---------------------------------------------------------------------------
+// 健壮性：畸形/超限输入必须「明确拒绝」或「干净收尾」，绝不能 panic 或越界读
+// ---------------------------------------------------------------------------
+
+/// 把一段构造好的客户端字节流喂给连接，返回服务端写入的字节（-ConnectionClosed 视为正常收尾）。
+fn driveConn(a: std.mem.Allocator, input: []const u8, opts: Options) ![]const u8 {
+    var r = std.Io.Reader.fixed(input);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+    var conn = Connection.init(testing.allocator, &r, &aw.writer, opts);
+    defer conn.deinit();
+    var dummy: u8 = 0;
+    conn.serve(&dummy, echoHandler) catch |e| {
+        if (e != error.ConnectionClosed) return e;
+    };
+    return try a.dupe(u8, aw.written());
+}
+
+/// 统计输出里指定流收到的 RST_STREAM 的错误码（没有则返回 null）。
+fn findRstCode(out: []const u8, sid: u32) ?u32 {
+    var pos: usize = 0;
+    while (nextFrame(out, &pos)) |f| {
+        if (f.ftype == .rst_stream and f.stream_id == sid and f.payload.len >= 4) {
+            return std.mem.readInt(u32, f.payload[0..4], .big);
+        }
+    }
+    return null;
+}
+
+test "h2健壮性：连接前言不对 → 返回 BadPreface（不 panic）" {
+    const bad = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    var r = std.Io.Reader.fixed(bad);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+    var conn = Connection.init(testing.allocator, &r, &aw.writer, .{});
+    defer conn.deinit();
+    var dummy: u8 = 0;
+    try testing.expectError(error.BadPreface, conn.serve(&dummy, echoHandler));
+}
+
+test "h2健壮性：并发流超上限 → REFUSED_STREAM(7)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, client_preface);
+    try appendFrame(&input, a, .settings, 0, 0, &.{});
+    // 两条都只发 HEADERS（不 END_STREAM）→ 第二条会超过上限 1
+    const b1 = try encodeReqHeaders(a, "/one");
+    try appendFrame(&input, a, .headers, Flags.end_headers, 1, b1.items);
+    const b3 = try encodeReqHeaders(a, "/three");
+    try appendFrame(&input, a, .headers, Flags.end_headers, 3, b3.items);
+
+    const out = try driveConn(a, input.items, .{ .max_concurrent_streams = 1 });
+    try testing.expectEqual(@as(?u32, 7), findRstCode(out, 3)); // REFUSED_STREAM
+}
+
+test "h2健壮性：header block 超上限 → ENHANCE_YOUR_CALM(11)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, client_preface);
+    try appendFrame(&input, a, .settings, 0, 0, &.{});
+    const b1 = try encodeReqHeaders(a, "/big-header");
+    try appendFrame(&input, a, .headers, Flags.end_headers, 1, b1.items);
+
+    // 上限压到 16 字节：上面那块的 HPACK 编码必然超
+    const out = try driveConn(a, input.items, .{ .max_header_block = 16 });
+    try testing.expectEqual(@as(?u32, 11), findRstCode(out, 1)); // ENHANCE_YOUR_CALM
+}
+
+test "h2健壮性：请求体超上限 → ENHANCE_YOUR_CALM(11)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, client_preface);
+    try appendFrame(&input, a, .settings, 0, 0, &.{});
+    const b1 = try encodeReqHeaders(a, "/too-big");
+    try appendFrame(&input, a, .headers, Flags.end_headers, 1, b1.items);
+    try appendFrame(&input, a, .data, 0, 1, "0123456789abcdef"); // 16 字节
+
+    const out = try driveConn(a, input.items, .{ .max_body = 8 });
+    // 实现用 ENHANCE_YOUR_CALM(11)：语义是「请求体太激进」，比 REFUSED_STREAM 更准确
+    try testing.expectEqual(@as(?u32, 11), findRstCode(out, 1));
+}
+
+test "h2健壮性：帧声明长度大于实际字节 → 干净收尾（不 panic）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, client_preface);
+    try appendFrame(&input, a, .settings, 0, 0, &.{});
+    // 头部声明 1024 字节，但只给 3 字节
+    try input.appendSlice(a, &.{ 0x00, 0x04, 0x00, @intFromEnum(FrameType.data), 0, 0, 0, 0, 1 });
+    try input.appendSlice(a, "abc");
+
+    _ = try driveConn(a, input.items, .{});
+}
+
+test "h2健壮性：PADDED 帧 pad 长度越界 → 拒绝该流（不越界读）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, client_preface);
+    try appendFrame(&input, a, .settings, 0, 0, &.{});
+    const b1 = try encodeReqHeaders(a, "/padded");
+    try appendFrame(&input, a, .headers, Flags.end_headers, 1, b1.items);
+    // PADDED 标志 + pad length=200（远超实际载荷）
+    try appendFrame(&input, a, .data, Flags.padded, 1, &.{ 200, 'x' });
+
+    const out = try driveConn(a, input.items, .{});
+    // 必须给出明确拒绝（协议错误），而不是读到缓冲区外
+    try testing.expect(findRstCode(out, 1) != null);
 }
