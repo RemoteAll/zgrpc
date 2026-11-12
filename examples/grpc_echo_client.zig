@@ -183,4 +183,33 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("[zgrpc] grpc-web-text 往返成功：{s}（content-type={s}）\n", .{
         wt.messages[0], wt.header("content-type") orelse "?",
     });
+
+    // ---- protobuf 结构化 message（`zgrpc.pb`）：手写 20 行编解码即可 ----
+    var req_writer = zgrpc.pb.Writer.init(a);
+    try req_writer.int32(1, 41);
+    try req_writer.string(2, "pb-demo");
+    const bump = try client.unary("/echo.Echo/Bump", req_writer.bytes(), a);
+    if (!bump.ok() or bump.messages.len != 1) {
+        std.debug.print("[zgrpc] Bump 调用失败：status={d} message={s} 消息数={d}\n", .{
+            bump.status, bump.message, bump.messages.len,
+        });
+        return error.GrpcStatusNotOk;
+    }
+    var got_value: i32 = 0;
+    var got_tag: []const u8 = "";
+    var calls: u64 = 0;
+    var rd = zgrpc.pb.Reader{ .data = bump.messages[0] };
+    while (rd.next()) |f| switch (f.number) {
+        1 => got_value = f.asInt32(),
+        2 => got_tag = f.asString(),
+        3 => calls = f.asUint64(),
+        else => {},
+    };
+    if (got_value != 42 or !std.mem.eql(u8, got_tag, "pb-demo") or calls == 0) {
+        std.debug.print("[zgrpc] Bump 响应不符：value={d} tag={s} calls={d}\n", .{ got_value, got_tag, calls });
+        return error.MetadataMismatch;
+    }
+    std.debug.print("[zgrpc] pb 结构化往返成功：value 41→{d}，tag={s}，calls={d}\n", .{
+        got_value, got_tag, calls,
+    });
 }

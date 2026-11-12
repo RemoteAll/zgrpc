@@ -28,6 +28,7 @@
 const std = @import("std");
 const grpc = @import("grpc.zig");
 const clock = @import("clock.zig");
+const pb = @import("pb.zig");
 
 /// `grpc.health.v1.HealthCheckResponse.ServingStatus`
 pub const ServingStatus = enum(u8) {
@@ -127,63 +128,23 @@ fn handleWatch(ctx: ?*anyopaque, call: *grpc.Call, arena: std.mem.Allocator) any
 }
 
 // ---------------------------------------------------------------------------
-// 最简 protobuf：只覆盖上面两个 message（字段 1：string / enum）
+// 消息编解码：走 `pb` 模块（不再本地手写 varint）
 // ---------------------------------------------------------------------------
 
-fn writeVarint(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, value: u64) !void {
-    var v = value;
-    while (v >= 0x80) {
-        try out.append(a, @as(u8, @truncate(v)) | 0x80);
-        v >>= 7;
+/// 解 `HealthCheckRequest`：取字段 1（service 字符串）。未知字段自动跳过。
+pub fn decodeService(_: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    var r = pb.Reader{ .data = bytes };
+    while (r.next()) |f| {
+        if (f.number == 1 and f.wire == .len) return f.asString();
     }
-    try out.append(a, @truncate(v));
-}
-
-fn readVarint(bytes: []const u8, pos: *usize) ?u64 {
-    var shift: u6 = 0;
-    var v: u64 = 0;
-    while (pos.* < bytes.len and shift < 64) {
-        const b = bytes[pos.*];
-        pos.* += 1;
-        v |= @as(u64, b & 0x7f) << shift;
-        if (b & 0x80 == 0) return v;
-        shift += 7;
-    }
-    return null;
-}
-
-/// 解 `HealthCheckRequest`：取字段 1（service 字符串）。
-/// 其它字段按 wire type 跳过（宽容：未知字段不得导致失败）。
-pub fn decodeService(a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    var pos: usize = 0;
-    while (pos < bytes.len) {
-        const key = readVarint(bytes, &pos) orelse return "";
-        const field = key >> 3;
-        const wire = key & 0x7;
-        switch (wire) {
-            0 => _ = readVarint(bytes, &pos) orelse return "",
-            1 => pos += 8,
-            5 => pos += 4,
-            2 => {
-                const len = readVarint(bytes, &pos) orelse return "";
-                if (len > bytes.len - pos) return "";
-                const val = bytes[pos .. pos + @as(usize, @intCast(len))];
-                pos += @intCast(len);
-                if (field == 1) return val;
-            },
-            else => return "",
-        }
-    }
-    _ = a;
     return "";
 }
 
-/// 编 `HealthCheckResponse`：字段 1（enum，wire type 0）。
+/// 编 `HealthCheckResponse`：字段 1（enum）。
 pub fn encodeResponse(a: std.mem.Allocator, status: ServingStatus) ![]const u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    try out.append(a, 0x08); // field 1, wire type 0 (varint)
-    try writeVarint(&out, a, @intFromEnum(status));
-    return out.items;
+    var w = pb.Writer.init(a);
+    try w.enumField(1, status);
+    return w.bytes();
 }
 
 // ---------------------------------------------------------------------------
@@ -201,21 +162,18 @@ test "health：encodeResponse / decodeService 往返" {
     try testing.expectEqualSlices(u8, &.{ 0x08, 0x01 }, body);
 
     // 手工构造 HealthCheckRequest{ service = "echo.Echo" }
-    var req: std.ArrayListUnmanaged(u8) = .empty;
-    try req.append(a, 0x0a);
-    try writeVarint(&req, a, "echo.Echo".len);
-    try req.appendSlice(a, "echo.Echo");
-    try testing.expectEqualStrings("echo.Echo", try decodeService(a, req.items));
+    var req = pb.Writer.init(a);
+    try req.string(1, "echo.Echo");
+    try testing.expectEqualStrings("echo.Echo", try decodeService(a, req.bytes()));
 
     // 空请求 → 空 service（表示整体健康）
     try testing.expectEqualStrings("", try decodeService(a, &.{}));
 
     // 未知字段必须被跳过而不是报错：先塞一个 field 2 varint，再给 field 1
-    var with_unknown: std.ArrayListUnmanaged(u8) = .empty;
-    try with_unknown.append(a, 0x10); // field 2, wire type 0
-    try writeVarint(&with_unknown, a, 42);
-    try with_unknown.appendSlice(a, req.items);
-    try testing.expectEqualStrings("echo.Echo", try decodeService(a, with_unknown.items));
+    var with_unknown = pb.Writer.init(a);
+    try with_unknown.uint64(2, 42);
+    try with_unknown.string(1, "echo.Echo");
+    try testing.expectEqualStrings("echo.Echo", try decodeService(a, with_unknown.bytes()));
 }
 
 fn testCheck(ctx: ?*anyopaque, service: []const u8) ServingStatus {

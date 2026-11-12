@@ -50,6 +50,38 @@ fn healthCheck(ctx: ?*anyopaque, service: []const u8) zgrpc.health.ServingStatus
     return .service_unknown;
 }
 
+/// 调用计数（演示 `pb` 模块的 uint64 回填）。
+var bump_calls = std.atomic.Value(u64).init(0);
+
+/// 方法 `/echo.Echo/Bump`：演示 **protobuf 结构化 message**（`zgrpc.pb`）。
+///
+/// ```proto
+/// message BumpRequest  { int32  value = 1; string tag = 2; }
+/// message BumpResponse { int32  value = 1; string tag = 2; uint64 calls = 3; }
+/// ```
+fn bumpHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator) anyerror!void {
+    _ = ctx;
+    const msg = call.firstMessage() orelse {
+        call.setStatus(.invalid_argument, "Bump：缺少请求消息");
+        return;
+    };
+
+    var value: i32 = 0;
+    var tag: []const u8 = "";
+    var r = zgrpc.pb.Reader{ .data = msg.payload };
+    while (r.next()) |f| switch (f.number) {
+        1 => value = f.asInt32(),
+        2 => tag = f.asString(),
+        else => {},
+    };
+
+    var w = zgrpc.pb.Writer.init(arena);
+    try w.int32(1, value + 1);
+    try w.string(2, tag);
+    try w.uint64(3, bump_calls.fetchAdd(1, .monotonic) + 1);
+    try call.sendMessage(w.bytes());
+}
+
 pub fn main() !void {
     // 多线程服务端：Io 必须用线程安全分配器构造（page_allocator）
     const allocator = std.heap.page_allocator;
@@ -64,6 +96,7 @@ pub fn main() !void {
     var routes = [_]zgrpc.grpc.Route{
         .{ .path = "/echo.Echo/Say", .handler = sayHandler },
         .{ .path = "/echo.Echo/Slow", .handler = slowHandler },
+        .{ .path = "/echo.Echo/Bump", .handler = bumpHandler },
         health_routes[0],
         health_routes[1],
     };

@@ -143,6 +143,73 @@ fn read_varint(buf: &[u8], mut pos: usize) -> Option<(u64, usize)> {
     None
 }
 
+// --- 最小 protobuf 写/解（用于 /echo.Echo/Bump，验证跨实现编码一致性）---
+
+fn pb_write_varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn pb_uint(out: &mut Vec<u8>, field: u32, v: u64) {
+    pb_write_varint(out, ((field as u64) << 3) | 0);
+    pb_write_varint(out, v);
+}
+
+fn pb_bytes(out: &mut Vec<u8>, field: u32, data: &[u8]) {
+    pb_write_varint(out, ((field as u64) << 3) | 2);
+    pb_write_varint(out, data.len() as u64);
+    out.extend_from_slice(data);
+}
+
+/// 解 `BumpRequest{ int32 value = 1; string tag = 2; }`
+fn parse_bump(bytes: &[u8]) -> (i64, Vec<u8>) {
+    let mut value: i64 = 0;
+    let mut tag: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let (key, next) = match read_varint(bytes, pos) {
+            Some(v) => v,
+            None => break,
+        };
+        pos = next;
+        let field = key >> 3;
+        match key & 0x7 {
+            0 => {
+                let (v, next) = match read_varint(bytes, pos) {
+                    Some(x) => x,
+                    None => break,
+                };
+                pos = next;
+                if field == 1 {
+                    value = v as i64;
+                }
+            }
+            2 => {
+                let (len, next) = match read_varint(bytes, pos) {
+                    Some(x) => x,
+                    None => break,
+                };
+                pos = next;
+                let len = len as usize;
+                if pos + len > bytes.len() {
+                    break;
+                }
+                if field == 2 {
+                    tag = bytes[pos..pos + len].to_vec();
+                }
+                pos += len;
+            }
+            1 => pos += 8,
+            5 => pos += 4,
+            _ => break,
+        }
+    }
+    (value, tag)
+}
+
 /// 解 `HealthCheckRequest{ string service = 1; }` 的字段 1（缺失/非法返回 None）。
 fn health_service(bytes: &[u8]) -> Option<String> {
     let mut pos = 0usize;
@@ -300,6 +367,15 @@ async fn handle(req: Request<Incoming>) -> Result<Response<GrpcBody>, Infallible
             grpc_message = Some(percent_encode(&format!("未注册的服务：{service}")));
             eprintln!("[interop] health Check(service=\"{service}\") → NOT_FOUND");
         }
+    } else if path == "/echo.Echo/Bump" {
+        // 结构化 message：解 BumpRequest{value,tag}，回 value+1 与 tag
+        let (value, tag) = parse_bump(msgs.first().map(|m| m.as_slice()).unwrap_or(b""));
+        let mut w: Vec<u8> = Vec::new();
+        pb_uint(&mut w, 1, (value + 1) as u64);
+        pb_bytes(&mut w, 2, &tag);
+        pb_uint(&mut w, 3, 1);
+        out.extend_from_slice(&grpc_frame(&w));
+        eprintln!("[interop] /echo.Echo/Bump value={value} → {}", value + 1);
     } else if path == "/echo.Echo/Slow" {
         // 故意慢（300ms）：客户端带了更短的 grpc-timeout 就应拿到 DEADLINE_EXCEEDED(4)
         let sleep = tokio::time::sleep(Duration::from_millis(300));
@@ -700,6 +776,51 @@ async fn run_client(port: u16, web: bool, web_text: bool) -> Result<(), Box<dyn 
     }
     if note.as_deref() != Some("metadata-ok") {
         return Err(format!("x-note 期望 metadata-ok，实际 {note:?}").into());
+    }
+
+    // ⑥ 结构化 message（protobuf）：BumpRequest{int32 value=1; string tag=2;}
+    let mut bump_req: Vec<u8> = Vec::new();
+    pb_uint(&mut bump_req, 1, 41);
+    pb_bytes(&mut bump_req, 2, b"pb-interop");
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://127.0.0.1:{port}/echo.Echo/Bump"))
+        .header(hyper::header::CONTENT_TYPE, ct)
+        .header("te", "trailers")
+        .body(Full::new(Bytes::from(request_body(&bump_req, web_text))))?;
+    let resp = sender.send_request(req).await?;
+    let mut body = resp.into_body();
+    let mut data: Vec<u8> = Vec::new();
+    let mut gs: Option<String> = None;
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Some(d) = frame.data_ref() {
+            data.extend_from_slice(d);
+        }
+        if let Some(t) = frame.trailers_ref() {
+            if let Some(v) = t.get("grpc-status") {
+                gs = Some(v.to_str().unwrap_or("").to_string());
+            }
+        }
+    }
+    let data = untangle_body(data, web_text)?;
+    if is_web {
+        if let Some(s) = web_trailer_status(&data) {
+            gs = Some(s);
+        }
+    }
+    let bmsgs = parse_messages(&data);
+    let (got_value, got_tag) = parse_bump(bmsgs.first().map(|m| m.as_slice()).unwrap_or(b""));
+    println!("  pb Bump：grpc-status={gs:?} value={got_value} tag={:?}", String::from_utf8_lossy(&got_tag));
+    if gs.as_deref() != Some("0") {
+        return Err(format!("Bump 期望 grpc-status=0，实际 {gs:?}").into());
+    }
+    if got_value != 42 || got_tag != b"pb-interop" {
+        return Err(format!(
+            "Bump 响应不符：value={got_value}（期望 42）tag={:?}",
+            String::from_utf8_lossy(&got_tag)
+        )
+        .into());
     }
 
     println!("[interop] 对拍通过");
