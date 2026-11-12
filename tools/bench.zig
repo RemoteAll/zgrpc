@@ -460,20 +460,24 @@ fn workerMain(
 
 /// 并发模式：`conns` 条独立连接同时打，衡量**吞吐**（这才是 async/协程收益体现的场景）。
 fn runConcurrent(io: std.Io, gpa: std.mem.Allocator, addr: std.Io.net.IpAddress, cfg: Args) !void {
-    const n = @min(cfg.conns, 64);
+    const n = cfg.conns;
     const payload = try gpa.alloc(u8, cfg.payload);
     defer gpa.free(payload);
     @memset(payload, 'x');
 
-    var stats: [64]WorkerStat = undefined;
-    var lats: [64][]u64 = undefined;
+    // 动态分配，连接数不设上限（只受系统句柄/线程资源约束）
+    const stats = try gpa.alloc(WorkerStat, n);
+    defer gpa.free(stats);
+    const lats = try gpa.alloc([]u64, n);
+    defer gpa.free(lats);
     for (0..n) |i| {
         lats[i] = try gpa.alloc(u64, cfg.iterations);
         stats[i] = .{ .lat_ns = lats[i] };
     }
     defer for (lats[0..n]) |l| gpa.free(l);
 
-    var threads: [64]std.Thread = undefined;
+    const threads = try gpa.alloc(std.Thread, n);
+    defer gpa.free(threads);
     const t_all0 = zgrpc.clock.monotonicNs();
     for (0..n) |i| {
         threads[i] = try std.Thread.spawn(.{}, workerMain, .{
