@@ -11,6 +11,8 @@ const h2 = @import("h2.zig");
 const hpack = @import("hpack.zig");
 const grpc = @import("grpc.zig");
 
+const TimeoutGuard = @import("timeout_guard.zig").TimeoutGuard;
+
 pub const Request = struct {
     /// 完整方法路径，如 `/echo.Echo/Say`
     method: []const u8,
@@ -92,7 +94,7 @@ pub const Options = struct {
     /// 默认超时（毫秒）；空 = 不设（同规范：缺省视为无限超时）
     timeout_ms: ?u32 = null,
     /// 规范建议的 UA 格式：`grpc-<lang>/<ver>`
-    user_agent: []const u8 = "grpc-zgrpc/0.1.0",
+    user_agent: []const u8 = "grpc-zgrpc/0.2.0",
     /// 用哪种 content-type 形态（web 系列会自动做尾帧与 base64 处理）
     content_type: ContentType = .grpc,
 };
@@ -106,6 +108,11 @@ pub const Client = struct {
     /// 下一个可用流 id（客户端发起的流必须是奇数）
     next_stream_id: u32 = 1,
     started: bool = false,
+    /// 本地超时所需（`enableTimeout` 提供）：watchdog 到点取消挂起的读
+    timeout_stream: ?std.Io.net.Stream = null,
+    timeout_io: ?std.Io = null,
+    /// 本次调用期间看门狗（`callMany` / `clientStream` 内有效）
+    guard: ?TimeoutGuard = null,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -123,7 +130,55 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        self.stopGuard();
         self.decoder.deinit();
+    }
+
+    /// 启用**本地读超时**：watchdog 到点取消挂起的读（见 `timeout_guard.zig`），
+    /// 对外统一表现为 `error.Timeout`。
+    ///
+    /// 为什么需要它：`grpc-timeout` 头只管服务端；服务端卡住（或对端根本不是 gRPC）时，
+    /// 客户端必须能自己退出，而不是无限阻塞在 read 上。
+    pub fn enableTimeout(self: *Client, stream: std.Io.net.Stream, io: std.Io) void {
+        self.timeout_stream = stream;
+        self.timeout_io = io;
+    }
+
+    fn readExact(self: *Client, dest: []u8) !void {
+        return self.reader.readSliceAll(dest);
+    }
+
+    /// 按本次调用起看门狗（多流共用一条 socket，取**最短**的超时）。
+    fn startGuard(self: *Client, reqs: []const Request) void {
+        self.stopGuard();
+        const stream = self.timeout_stream orelse return;
+        const io = self.timeout_io orelse return;
+        var ms: ?u32 = self.opts.timeout_ms;
+        for (reqs) |r| {
+            if (r.timeout_ms) |t| ms = if (ms) |m| @min(m, t) else t;
+        }
+        const v = ms orelse return;
+        if (v == 0) return;
+        self.guard = TimeoutGuard.start(self.alloc, stream, io, @as(u64, v) * std.time.ns_per_ms) catch |e| blk: {
+            std.debug.print("[zgrpc.client] 启动超时看门狗失败：{s}\\n", .{@errorName(e)});
+            break :blk null;
+        };
+    }
+
+    /// 收尾看门狗。
+    fn stopGuard(self: *Client) void {
+        if (self.guard) |*g| {
+            g.cancel();
+            self.guard = null;
+        }
+    }
+
+    /// 读失败时判断是不是「我们自己超时」；是则统一转成 `error.Timeout`。
+    fn mapReadError(self: *Client, err: anyerror) anyerror {
+        if (self.guard) |*g| {
+            if (g.fired()) return error.Timeout;
+        }
+        return err;
     }
 
     /// 发连接前言与本端 SETTINGS（幂等）。
@@ -154,6 +209,9 @@ pub const Client = struct {
     ) ![]Result {
         try self.handshake();
         if (reqs.len == 0) return &.{};
+        // 本次调用的读 deadline（有效期从现在算起，跨整个 callMany 共用）
+        self.startGuard(reqs);
+        defer self.stopGuard();
 
         const results = try arena.alloc(Result, reqs.len);
         const bodies = try arena.alloc(std.ArrayListUnmanaged(u8), reqs.len);
@@ -191,12 +249,12 @@ pub const Client = struct {
 
         var remaining = reqs.len;
         while (remaining > 0) {
-            const hdr = readFrameHeader(self.reader) catch |e| {
+            const hdr = readFrameHeader(self) catch |e| {
                 std.debug.print("[zgrpc.client] 读响应帧结束（{s}）\n", .{@errorName(e)});
                 return error.ConnectionClosed;
             };
             const payload = try arena.alloc(u8, hdr.length);
-            try self.reader.readSliceAll(payload);
+            try self.readExact(payload);
 
             switch (hdr.ftype) {
                 .settings => {
@@ -302,6 +360,8 @@ pub const Client = struct {
         arena: std.mem.Allocator,
     ) !Result {
         try self.handshake();
+        self.startGuard(&.{.{ .method = method, .timeout_ms = self.opts.timeout_ms }});
+        defer self.stopGuard();
         const sid = self.next_stream_id;
         self.next_stream_id += 2;
 
@@ -327,12 +387,12 @@ pub const Client = struct {
         var resp: std.ArrayListUnmanaged(u8) = .empty;
 
         while (true) {
-            const hdr = readFrameHeader(self.reader) catch |e| {
+            const hdr = readFrameHeader(self) catch |e| {
                 std.debug.print("[zgrpc.client] 读响应帧结束（{s}）\n", .{@errorName(e)});
                 return error.ConnectionClosed;
             };
             const payload = try arena.alloc(u8, hdr.length);
-            try self.reader.readSliceAll(payload);
+            try self.readExact(payload);
 
             switch (hdr.ftype) {
                 .settings => {
@@ -544,9 +604,9 @@ const FrameHeader = struct {
     stream_id: u32,
 };
 
-fn readFrameHeader(r: *std.Io.Reader) !FrameHeader {
+fn readFrameHeader(c: *Client) !FrameHeader {
     var b: [9]u8 = undefined;
-    try r.readSliceAll(&b);
+    try c.readExact(&b);
     return .{
         .length = (@as(usize, b[0]) << 16) | (@as(usize, b[1]) << 8) | @as(usize, b[2]),
         .ftype = @enumFromInt(b[3]),

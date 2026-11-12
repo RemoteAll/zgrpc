@@ -54,6 +54,7 @@ pub fn build(b: *std.Build) void {
     // 示例：gRPC echo 服务端 / 客户端（`zig build echo-server` / `zig build echo-client`）
     addExample(b, zgrpc, target, optimize, "echo-server", "grpc_echo_server.zig", "运行 gRPC echo 服务端示例");
     addExample(b, zgrpc, target, optimize, "echo-client", "grpc_echo_client.zig", "运行 gRPC echo 客户端示例");
+    addExample(b, zgrpc, target, optimize, "timeout-probe", "client_timeout_probe.zig", "验证客户端本地读超时（服务端不响应时按时退出）");
 }
 
 fn addExample(
