@@ -1,8 +1,14 @@
-﻿.zig-cache/
+# Zig 构建产物与缓存
 zig-out/
-*.log
+.zig-cache/
+zig-cache/
+# 子工程（含独立 build.zig.zon 的示例）
+examples/with-zio/zig-out/
+examples/with-zio/.zig-cache/
+# 基准与回归产物
 artifacts/
-# Rust 对拍工具的构建产物（tools/interop-rust 是工具，不参与 zig build）
-tools/interop-rust/target/
-tools/interop-rust/build.log
-
+*.log
+# zig fetch 解包的依赖源码（按需重新 fetch）
+zig-pkg/
+# Rust 构建产物（对拍工程）
+target/

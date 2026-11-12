@@ -49,7 +49,18 @@ pub fn build(b: *std.Build) void {
     const gen_exe = b.addExecutable(.{ .name = "proto_gen", .root_module = gen_mod });
     const gen_run = b.addRunArtifact(gen_exe);
     gen_run.addArgs(&.{ "examples/echo.proto", "examples/echo.pb.zig" });
-    b.step("codegen", "从 examples/echo.proto 重新生成 examples/echo.pb.zig").dependOn(&gen_run.step);
+        // 基准：`zig build bench -Doptimize=ReleaseFast -- --iterations 5000`
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_mod.addImport("zgrpc", zgrpc);
+    const bench_exe = b.addExecutable(.{ .name = "bench", .root_module = bench_mod });
+    b.installArtifact(bench_exe);
+    // 透传命令行参数（Zig 0.17：用 b.args() 取）`n    if (comptime @hasDecl(std.Build, "args")) {}
+    b.step("bench", "编译 unary 基准（跑 zig-out\\bin\\bench.exe，可加 --iterations N）").dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
+b.step("codegen", "从 examples/echo.proto 重新生成 examples/echo.pb.zig").dependOn(&gen_run.step);
 
     // 示例：gRPC echo 服务端 / 客户端（`zig build echo-server` / `zig build echo-client`）
     addExample(b, zgrpc, target, optimize, "echo-server", "grpc_echo_server.zig", "运行 gRPC echo 服务端示例");

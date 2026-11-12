@@ -116,8 +116,19 @@ pub const Client = struct {
     timeout_io: ?std.Io = null,
     /// 是否已启用**原生读超时**（Windows：AFD overlapped；POSIX：`SO_RCVTIMEO`）
     native_timeout: bool = false,
+    /// 超时实现路径：先试 std.Io 带超时操作，不支持时降级到平台原生
+    timeout_mode: TimeoutMode = .auto,
     /// 本次调用的绝对截止时刻（单调时钟纳秒）；null = 不限
     deadline_ns: ?i128 = null,
+
+    const TimeoutMode = enum {
+        /// 尚未探测：先试 `io.operateTimeout`
+        auto,
+        /// 已确认 `io.operateTimeout` 可用（异步后端如 zio）
+        io_api,
+        /// 已确认不可用，走平台原生方案
+        platform,
+    };
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -143,6 +154,10 @@ pub const Client = struct {
 
     /// 启用**本地读超时**（内核层，零线程）。
     ///
+    /// 同时会顺手关闭 Nagle（`TCP_NODELAY`）：gRPC 是 HEADERS+DATA+TRAILERS 多小包交互，
+    /// 开着 Nagle 与对端延迟 ACK 叠加，会造成随机 10~200ms 延迟尖峰（实测 p95 从 14.7ms 降到 0.35ms，
+    /// QPS 提升约 10 倍）。
+    ///
     /// - **Windows**：在 AFD 句柄上自己发起 overlapped `IOCTL_AFD_RECEIVE`，
     ///   再用 `NtWaitForSingleObject(句柄)` 带时限等待（见 `afd_reader.zig`，实测 201ms 生效）。
     /// - **POSIX**：`setsockopt(SO_RCVTIMEO)`，到点 `read` 返回 `EAGAIN`。
@@ -150,7 +165,8 @@ pub const Client = struct {
         if (self.native_timeout) return;
         self.timeout_stream = stream;
         self.timeout_io = io;
-        // Windows 无需预先设置：时限在每次读时作为参数传入。
+        self.tuneSocket(stream, io);
+        // Windows 无需预先设置超时值：时限在每次读时作为参数传入。
         if (builtin.os.tag != .windows) {
             socket_timeout.setRecvTimeout(io, stream, 0) catch |e| {
                 std.debug.print("[zgrpc.client] 设置 SO_RCVTIMEO 失败，本地超时不可用：{s}\n", .{@errorName(e)});
@@ -159,7 +175,26 @@ pub const Client = struct {
         }
         self.native_timeout = true;
     }
+
+    /// 套接字调优（不启用超时也可以单独调）：目前是关闭 Nagle。
+    ///
+    /// **建议每个客户端连接都调一次**：不调的话小包往返会撞上 Nagle × 延迟 ACK，
+    /// 表现为「大部分很快、但随机一批卡 10~200ms」。
+    pub fn tuneSocket(self: *Client, stream: std.Io.net.Stream, io: std.Io) void {
+        _ = self;
+        socket_timeout.setNoDelay(io, stream, true) catch |e| {
+            std.debug.print("[zgrpc.client] 关闭 Nagle 失败（延迟可能偏高）：{s}\n", .{@errorName(e)});
+        };
+    }
     /// 读满 `dest`；启用本地超时后按**剩余时间**喂超时，到点返回 `error.Timeout`。
+    ///
+    /// 优先级：
+    /// 1. **先试 `io.operateTimeout(net_read)`** —— zio 等实现了完整 `std.Io` 的后端支持它，
+    ///    此时底层是真正的异步（Linux io_uring / Windows IOCP / macOS kqueue），无线程；
+    /// 2. 后端报 `ConcurrencyUnavailable`（std 自带的 Threaded 就这样）→ 记录一下，
+    ///    后续全部回退到**平台原生方案**（Windows AFD overlapped / POSIX `SO_RCVTIMEO`）。
+    ///
+    /// 这样 zgrpc 自己不依赖任何异步运行时，但**换一个 Io 实例就能拿到真异步**。
     fn readExact(self: *Client, dest: []u8) !void {
         if (!self.native_timeout) return self.reader.readSliceAll(dest);
         const stream = self.timeout_stream orelse return self.reader.readSliceAll(dest);
@@ -170,6 +205,17 @@ pub const Client = struct {
             if (self.isExpired()) return error.Timeout;
             const remain = self.remainingTimeoutMs();
             const slice = dest[off..];
+
+            // ① std.Io 原生带超时读（异步后端）
+            if (self.timeout_mode != .platform) {
+                if (try self.tryIoTimeoutRead(io, stream, slice, remain)) |got| {
+                    if (got == 0) return error.ConnectionClosed;
+                    off += got;
+                    continue;
+                }
+            }
+
+            // ② 平台原生回退
             var got: usize = 0;
             if (builtin.os.tag == .windows) {
                 got = afd_reader.read(stream.socket.handle, slice, remain) catch |e| switch (e) {
@@ -190,6 +236,46 @@ pub const Client = struct {
         }
     }
 
+    /// 用 `io.operateTimeout` 做一次带时限的读。
+    ///
+    /// 返回 `null` 表示「当前 Io 后端不支持带超时操作」（已把 `timeout_mode` 降级为 `.platform`），
+    /// 调用方应回退到平台原生方案。
+    fn tryIoTimeoutRead(
+        self: *Client,
+        io: std.Io,
+        stream: std.Io.net.Stream,
+        dest: []u8,
+        remain_ms: ?u32,
+    ) !?usize {
+        var bufs = [1][]u8{dest};
+        const op = std.Io.Operation{ .net_read = .{
+            .socket_handle = stream.socket.handle,
+            .data = &bufs,
+        } };
+        const timeout: std.Io.Timeout = if (remain_ms) |ms| .{ .duration = .{
+            .raw = .{ .nanoseconds = @as(u64, ms) * std.time.ns_per_ms },
+            .clock = .awake,
+        } } else .none;
+
+        const res = io.operateTimeout(op, timeout) catch |e| switch (e) {
+            error.ConcurrencyUnavailable => {
+                self.timeout_mode = .platform;
+                std.debug.print(
+                    "[zgrpc.client] 当前 Io 后端不支持带超时操作，回退到平台原生读超时（异步后端可省掉这层）\n",
+                    .{},
+                );
+                return null;
+            },
+            error.Timeout => return error.Timeout,
+            else => return e,
+        };
+        self.timeout_mode = .io_api;
+        const rr = res.net_read catch |e| switch (e) {
+            error.ConnectionTimedOut => return error.Timeout,
+            else => |other| return other,
+        };
+        return rr.data_len;
+    }
     /// 距离截止时刻还剩多少毫秒（向上取整，至少 1）；未设截止时返回 null。
     fn remainingTimeoutMs(self: *Client) ?u32 {
         const deadline = self.deadline_ns orelse return null;

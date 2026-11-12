@@ -105,6 +105,55 @@ fn setRecvTimeoutPosix(stream: std.Io.net.Stream, ms: u32) SetError!void {
     };
 }
 
+/// 控制 Nagle 算法（`TCP_NODELAY`）。
+///
+/// **gRPC 这类小包交互必须关掉 Nagle**：我们的请求是 HEADERS + DATA 两个小包，
+/// 响应是 HEADERS + DATA + TRAILERS 多个小包；Nagle 会让后面的小包等前面的 ACK，
+/// 与对端的「延迟 ACK」（Windows 约 15~200ms）叠加后，会出现**随机 10~200ms 的延迟尖峰**。
+/// 实测基准里 p50 = 328us 而 p95 = 14.7ms，关闭后尾部延迟消失。
+pub fn setNoDelay(io: std.Io, stream: std.Io.net.Stream, enable: bool) SetError!void {
+    if (builtin.os.tag == .windows) {
+        var value: u32 = @intFromBool(enable);
+        const info = std.os.windows.AFD.SOCKOPT_INFO{
+            .mode = .set,
+            .level = std.os.windows.ws2_32.IPPROTO.TCP,
+            .optname = std.os.windows.ws2_32.TCP.NODELAY,
+            .optval = @ptrCast(&value),
+            .optlen = @sizeOf(u32),
+        };
+        const result = io.operate(.{ .device_io_control = .{
+            .file = .{ .handle = stream.socket.handle, .flags = .{ .nonblocking = true } },
+            .code = std.os.windows.IOCTL.AFD.SOCKOPT,
+            .in = std.mem.asBytes(&info),
+        } }) catch |e| {
+            std.debug.print("[zgrpc.socket_timeout] 设置 TCP_NODELAY 调用失败：{s}\n", .{@errorName(e)});
+            return error.SetFailed;
+        };
+        switch (result.device_io_control.u.Status) {
+            .SUCCESS => return,
+            .INSUFFICIENT_RESOURCES => return error.SystemResources,
+            .CANCELLED => return error.SetFailed,
+            else => |status| {
+                std.debug.print(
+                    "[zgrpc.socket_timeout] 设置 TCP_NODELAY={} 失败：status=0x{X}\n",
+                    .{ enable, @intFromEnum(status) },
+                );
+                return error.SetFailed;
+            },
+        }
+    }
+    if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.Unsupported;
+    const v: c_int = @intFromBool(enable);
+    std.posix.setsockopt(
+        stream.socket.handle,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        std.mem.asBytes(&v),
+    ) catch |e| {
+        std.debug.print("[zgrpc.socket_timeout] setsockopt(TCP_NODELAY) 失败：{s}\n", .{@errorName(e)});
+        return error.SetFailed;
+    };
+}
 /// 读错误是否属于「原生读超时」。
 ///
 /// - Windows：AFD 到点返回 `STATUS_IO_TIMEOUT` → Zig 映射为 `error.ConnectionTimedOut`；

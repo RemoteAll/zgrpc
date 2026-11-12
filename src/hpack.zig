@@ -3,14 +3,16 @@
 //! 为什么自己实现：Zig 0.17 标准库只有 HTTP/1.1（`std.http` 下无 h2、无 hpack），
 //! gRPC 又强依赖 HTTP/2，所以这一层只能自建。
 //!
-//! 口径（有意的不对称）：
+//! 口径：
 //! - **解码完整实现**：静态表 + 动态表 + Huffman。所有主流 h2 客户端（nghttp2 / h2 / hyper-h2 /
 //!   grpc-*）都会对头部做 Huffman 与索引编码，服务端**必须**解得开；
-//! - **编码刻意简化**：静态表精确匹配走 indexed，其余走 literal-without-indexing + 明文串。
-//!   服务端每次响应只有几个头，省下的几十字节不值得再维护一套 Huffman 编码表与动态表。
+//! - **编码**：静态表精确匹配走 indexed，其余走 literal-without-indexing；
+//!   字符串在**明文与 Huffman 之间取更短的那个**（RFC 7541 §5.2 允许按需选择），
+//!   因此 `:path` / `user-agent` 这类长文本会自动压到约 60~70%。
+//!   动态表仍不参与编码：服务端每次响应头很少，收益小于它带来的跨请求状态风险。
 //!
 //! 内存：动态表条目用 `alloc` 长期持有（跨请求存活）；解码输出复制到调用方给的 arena
-//! （请求级，随请求释放）。
+//! （请求级，随请求释放）。Huffman 编码用**栈上临时区**，零额外分配。
 
 const std = @import("std");
 const huff = @import("hpack_huffman_table.zig");
@@ -238,7 +240,61 @@ fn appendInt(
     try out.append(alloc, @intCast(v));
 }
 
+/// Huffman 编码到 `dest`，返回编码长度；`dest` 不够大时返回 `null`（调用方回退明文）。
+///
+/// RFC 7541 §5.2：码字按 **MSB first** 拼接；末尾不足 8 bit 的部分用 EOS 前缀（全 1）补齐。
+/// 码表最长 30 bit，累加器 `acc` 在循环里始终只保留 < 8 bit 的残余，
+/// 所以 `acc << len` 最多 38 bit，`u64` 完全够用。
+fn huffmanEncodeInto(dest: []u8, s: []const u8) ?usize {
+    var n: usize = 0;
+    var acc: u64 = 0;
+    var nbits: u6 = 0;
+    for (s) |byte| {
+        const len: u6 = @intCast(huff.lengths[byte]);
+        acc = (acc << len) | @as(u64, huff.codes[byte]);
+        nbits += len;
+        while (nbits >= 8) {
+            nbits -= 8;
+            if (n >= dest.len) return null;
+            dest[n] = @truncate(acc >> nbits);
+            n += 1;
+        }
+    }
+    if (nbits > 0) {
+        if (n >= dest.len) return null;
+        const pad: u6 = 8 - nbits;
+        dest[n] = @truncate((acc << pad) | ((@as(u64, 1) << pad) - 1));
+        n += 1;
+    }
+    return n;
+}
+
+/// Huffman 编码的最坏情况长度（每字节 30 bit）。
+fn huffmanWorstCaseLen(n: usize) usize {
+    return n * 30 / 8 + 1;
+}
+
+/// 供**基准/统计**用：返回该字符串经 Huffman 编码后的字节数。
+/// 实际编码时若它不小于原文长度，会回退明文（见 `appendString`）。
+pub fn huffmanEncodedLen(s: []const u8) usize {
+    var bits: usize = 0;
+    for (s) |b| bits += huff.lengths[b];
+    return (bits + 7) / 8;
+}
+
 fn appendString(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+    // 取「明文」与「Huffman」中更短的那个（RFC 7541 §5.2 允许按需选择）。
+    // 头部值通常很短，所以用栈上临时区；超长（极少见）直接回退明文，不分配。
+    if (s.len > 0 and huffmanWorstCaseLen(s.len) <= 2048) {
+        var tmp: [2048]u8 = undefined;
+        if (huffmanEncodeInto(&tmp, s)) |hlen| {
+            if (hlen < s.len) {
+                try appendInt(out, alloc, 0x80, 7, hlen); // H = 1
+                try out.appendSlice(alloc, tmp[0..hlen]);
+                return;
+            }
+        }
+    }
     try appendInt(out, alloc, 0, 7, s.len);
     try out.appendSlice(alloc, s);
 }
@@ -527,4 +583,60 @@ test "hpack：非法 Huffman 尾部填充被拒" {
     try testing.expectError(error.InvalidHuffman, huffmanDecode(testing.allocator, "\xff\xff\xff\xff"));
     // 0x00 = 0000 0000：先解出 '0'(00000)，尾部残留 000 不是全 1 的 EOS 前缀
     try testing.expectError(error.InvalidHuffman, huffmanDecode(testing.allocator, "\x00"));
+}
+
+test "hpack：Huffman 编码 RFC 7541 C.4.1 向量" {
+    // "www.example.com"（15 字节）的 Huffman 编码应为 f1e3 c2e5 f23a 6ba0 ab90 f4ff（12 字节）
+    var buf: [64]u8 = undefined;
+    const n = huffmanEncodeInto(&buf, "www.example.com").?;
+    try testing.expectEqual(@as(usize, 12), n);
+    try testing.expectEqualSlices(
+        u8,
+        &.{ 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff },
+        buf[0..n],
+    );
+}
+
+test "hpack：Huffman 编解码往返" {
+    const cases = [_][]const u8{
+        "www.example.com",
+        "application/grpc",
+        "/echo.Echo/Say",
+        "grpc-zgrpc/0.2.1",
+        "a",
+        "ab",
+        "\x00\x01\xfe\xff",
+    };
+    for (cases) |s| {
+        var buf: [512]u8 = undefined;
+        const n = huffmanEncodeInto(&buf, s).?;
+        const back = try huffmanDecode(testing.allocator, buf[0..n]);
+        defer testing.allocator.free(back);
+        try testing.expectEqualSlices(u8, s, back);
+    }
+}
+
+test "hpack：编码后头部能被本库解码（含 H 位）" {
+
+    const headers = [_]Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/echo.Echo/Say" },
+        .{ .name = "user-agent", .value = "grpc-zgrpc/0.2.1" },
+        .{ .name = "content-type", .value = "application/grpc" },
+    };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try encode(&headers, &out, testing.allocator);
+
+    var dec = Decoder.init(testing.allocator);
+    defer dec.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var got: std.ArrayListUnmanaged(Header) = .empty;
+    try dec.decode(out.items, &got, arena.allocator());
+    try testing.expectEqual(@as(usize, headers.len), got.items.len);
+    for (headers, got.items) |want, have| {
+        try testing.expectEqualStrings(want.name, have.name);
+        try testing.expectEqualStrings(want.value, have.value);
+    }
 }

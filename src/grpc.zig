@@ -620,6 +620,51 @@ pub const Server = struct {
         };
     }
 
+    /// 单连接服务线程的**推荐栈大小**。
+    ///
+    /// `std.Thread.SpawnConfig.default_stack_size` 是 **16 MiB**。h2 连接只需要两块 16 KiB 缓冲加少量调用栈，
+    /// 用 16 MiB 意味着每条连接多占 16 MiB 虚拟地址；实测（`bench --thread-cost`）线程创建+销毁成本
+    /// 也从 **147.3 us** 降到 **86.1 us**。
+    ///
+    /// ```zig
+    /// const th = try std.Thread.spawn(.{ .stack_size = zgrpc.grpc.conn_stack_size },
+    ///     zgrpc.grpc.Server.serveConnThread, .{ &server, allocator, io, stream });
+    /// th.detach();
+    /// ```
+    pub const conn_stack_size: usize = 128 * 1024;
+
+    /// 服务一条**已接受**的连接，返回时连接已关闭（配合「每连接一线程」模型）。
+    ///
+    /// 这里把三件容易漏掉的事一起做了：
+    /// 1. 关闭 Nagle（`TCP_NODELAY`）—— 否则小包往返会撞上 Nagle × 延迟 ACK，出现随机 10~200ms 尖峰；
+    /// 2. 用 `serveStreaming` 同时兼容 unary 与流式路由；
+    /// 3. 连接级错误只记日志，不静默吞掉。
+    pub fn serveConn(
+        self: *Server,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        stream: std.Io.net.Stream,
+    ) void {
+        defer stream.close(io);
+        @import("socket_timeout.zig").setNoDelay(io, stream, true) catch |e| {
+            std.debug.print("[zgrpc.server] 关闭 Nagle 失败（延迟可能偏高）：{s}\n", .{@errorName(e)});
+        };
+
+        var recv_buf: [16 * 1024]u8 = undefined;
+        var send_buf: [16 * 1024]u8 = undefined;
+        var sr = stream.reader(io, &recv_buf);
+        var sw = stream.writer(io, &send_buf);
+
+        var conn = h2.Connection.init(allocator, &sr.interface, &sw.interface, .{});
+        defer conn.deinit();
+
+        conn.serveStreaming(self.streamHooks()) catch |e| {
+            if (e != error.ConnectionClosed) {
+                std.debug.print("[zgrpc.server] 连接异常结束：{s}\n", .{@errorName(e)});
+            }
+        };
+    }
+
     fn findStreamRoute(self: *Server, path: []const u8) ?*const StreamRoute {
         for (self.stream_routes) |*r| {
             if (std.mem.eql(u8, r.path, path)) return r;

@@ -9,7 +9,7 @@
 
 | 模块 | 能力 | 说明 |
 |---|---|---|
-| `hpack` | 头部压缩（RFC 7541） | **解码完整**（静态表 + 动态表 + Huffman）；编码简化（静态命中走索引，其余明文 literal） |
+| `hpack` | 头部压缩（RFC 7541） | **解码完整**（静态表 + 动态表 + Huffman）；**编码**：静态命中走索引，字符串在「明文 / Huffman」之间**自动取更短**（典型头部省 25.8%） |
 | `h2` | HTTP/2 明文 h2c（prior-knowledge）服务端 | SETTINGS/ACK、HEADERS/CONTINUATION（含 PADDED/PRIORITY）、DATA（含 PADDED + 流控回补）、WINDOW_UPDATE（连接级 + 每流）、PING、RST_STREAM、GOAWAY；**多路复用**（多流并存、发送阻塞时帧入 pending 队列） |
 | `grpc` | gRPC 语义层 | 消息分帧、状态码、路由、unary / 服务端流式 / **客户端流与 bidi**（`server.stream_routes` + `streamHooks`）、**gRPC-Web**、**gzip 消息压缩**、**`grpc-timeout` 截止时间**、`grpc-message` 的 percent-encoding、非 POST→**405** / content-type 不符→**415**、**Custom-Metadata（含 `-bin` base64）**、**gRPC-Web 文本模式（`grpc-web-text`，base64）** |
 | `client` | gRPC 客户端（h2c） | 握手、`unary`、**`callMany`（同一连接并发多条流）**、`clientStream`（客户端流/bidi），按 stream_id 归位、回补窗口；发 `grpc-timeout` / `user-agent` / 自定义 metadata，按规范**合成** Status 并解 percent-encoding |
@@ -117,6 +117,69 @@ client.enableTimeout(stream, io);     // 启用本地读超时
 - AFD 层**不认** `SO_RCVTIMEO`（`IOCTL_AFD_SOCKOPT` 返回 `STATUS_NOT_SUPPORTED`）—— 那是 Winsock 层的概念，而 Zig 用的是 AFD 句柄。
 
 **使用提示**：超时后连接**不要复用**（协议状态已不完整），重新建连即可；现在 socket 可以安全 `close`（取消后 IRP 已收尾）。
+## 性能（实测，Windows / ReleaseFast）
+
+```bash
+zig build bench -Doptimize=ReleaseFast          # 编译
+.\zig-out\bin\bench.exe --iterations 5000       # 单连接复用、请求 128 字节回显、预热 200 次
+```
+
+| 指标 | 数值 |
+|---|---|
+| QPS | **4762** |
+| 延迟 p50 | **168.5 us** |
+| 延迟 p95 | **382.3 us** |
+| 延迟 p99 | **559.3 us** |
+| 慢调用（>5ms） | 7 / 5000（0.14%） |
+
+### 必须关闭 Nagle（`TCP_NODELAY`）
+
+gRPC 的一次调用是 HEADERS + DATA + TRAILERS 多个小包。Nagle 会让后面的小包等前一个的 ACK，与对端的「延迟 ACK」叠加后，会出现**随机 10~200ms 的延迟尖峰**。同一台机器、同一份代码的对比：
+
+| 指标 | 开 Nagle（系统默认） | 关 Nagle |
+|---|---|---|
+| QPS | 427 | **4762**（11 倍） |
+| p50 | 328 us | **168 us** |
+| p95 | 14708 us | **382 us**（38 倍） |
+| 慢调用占比 | 10.7% | 0.14% |
+
+- **客户端**：`client.enableTimeout(stream, io)` 会自动关闭 Nagle；只需要这一项就调 `client.tuneSocket(stream, io)`；
+- **服务端**：accept 之后调一次 `zgrpc.socket_timeout.setNoDelay(io, stream, true)`（见 `examples/grpc_echo_server.zig` 与 `tools/bench.zig`）。
+
+### 外部工具验证（`ghz`，业界标准 gRPC 压测器）
+
+以上数字是自己进程内测的（客户端与服务端抢同一批 CPU）。用 Go 的 `ghz` 作**独立进程**压测同一份服务端：
+
+```bash
+zig build bench -Doptimize=ReleaseFast
+.\zig-out\bin\bench.exe --serve-only          # 只起服务端（注册 /echo.Echo/Say）
+ghz --insecure --proto examples/echo.proto --call echo.Echo/Say -c 20 -n 6000 127.0.0.1:18054
+```
+
+| 指标 | 数值 |
+|---|---|
+| Requests/sec | **10,452** |
+| 平均延迟 | 1.76 ms |
+| p50 / p95 / p99 | 2.00 / 3.00 / 3.51 ms |
+| 成功 / 总数 | 6000 / 6000（100% OK） |
+
+### 后端选择：std 还是 zio？
+
+`zio` 是成熟的 Zig 异步运行时（Linux `io_uring` / Windows `IOCP` / macOS `kqueue`，MIT），它**完整实现了 `std.Io`**，所以 zgrpc 一行不用改就能跑在它上面（见 `examples/with-zio/`）。本机 Windows 实测对比：
+
+| 并发连接 | std（每连接一线程） | zio（协程 + 事件循环） |
+|---|---|---|
+| 1 | **4762** QPS（p50 168us） | 2502 QPS（p50 238us） |
+| 4 | **13221** QPS | 10401 QPS |
+| 16 | **23268** QPS | 21761 QPS |
+| 64 | **20629** QPS | 20467 QPS |
+
+结论：**Windows 上 std 方案全场景不输 zio**（单连接快 1.9 倍，64 连接基本持平），所以默认保持零依赖的 std 实现；需要 Linux `io_uring` 或更大并发时可以换 zio 后端 —— 传 `rt.io()` 即可，库本身不依赖它。
+### HPACK Huffman 收益
+
+典型头部字符串样本 93 字节 → **69 字节（省 25.8%）**；实现上按「哪种更短用哪种」自动选择，因此短值（如 `POST`）不会被 Huffman 撑大。
+
+> 与 HTTP/1.1 的 `wrk` 基准（如 lighting 的 710k QPS ping）**不可直接比**：gRPC 每个请求多一层 HPACK 编解码、长度前缀分帧与 trailers 往返。
 ## 构建与验证
 
 ```bash

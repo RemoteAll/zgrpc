@@ -1,0 +1,20 @@
+.{
+    .name = .zgrpc_with_zio,
+    .version = "0.0.0",
+    .fingerprint = 0x197b0ce2188873fe,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .zgrpc = .{
+            .path = "../..",
+        },
+        .zio = .{
+            .url = "git+https://github.com/lalinsky/zio?ref=v0.20.1#c0a6b5877c9bbc71d2d2c0b3374ce7fa61a4ec12",
+            .hash = "zio-0.20.1-xHbVVI0wLwDgE2dXWDCWH0UfCQYEhnBYHs1Td12oAGeR",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+}
