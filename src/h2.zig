@@ -4,11 +4,13 @@
 //! - 不做 TLS/ALPN（由前置反代终止 TLS，或以明文供服务间直连）；
 //! - 不做服务端推送（`PUSH_PROMISE` 只跳过）；
 //! - 不做优先级调度（`PRIORITY` 只跳过）；
-//! - **v1 串行模型**：一条连接同一时刻只处理一个流；并发的新流直接 `RST_STREAM(REFUSED_STREAM)`
-//!   （该错误码语义上「未被处理」，客户端可安全重试）。gRPC unary 在客户端串行调用时完全够用。
+//! - handler 仍是**同步串行执行**（一次跑一个流的业务），但**流的接收是多路复用的**：
+//!   多个流可以同时处于半开状态（已收 HEADERS、body 未收完），互不踢掉 —— 真实 gRPC 客户端
+//!   在一条连接上并发调用时不会被打回 `REFUSED_STREAM`；
+//! - 发送受流控阻塞时，期间读到的业务帧进 `pending` 队列延后处理（不会丢，也不会误拒）。
 //!
-//! 已支持：`SETTINGS`(含 ACK)、`HEADERS`/`CONTINUATION`（含 PADDED）、`DATA`（含 PADDED、流控回补）、
-//! `WINDOW_UPDATE`（连接级 + 流级）、`PING`(ACK)、`RST_STREAM`、`GOAWAY`。
+//! 已支持：`SETTINGS`(含 ACK/并发流上限)、`HEADERS`/`CONTINUATION`（含 PADDED/PRIORITY）、
+//! `DATA`（含 PADDED、流控回补）、`WINDOW_UPDATE`（连接级 + 每流）、`PING`(ACK)、`RST_STREAM`、`GOAWAY`。
 
 const std = @import("std");
 const hpack = @import("hpack.zig");
@@ -60,6 +62,9 @@ pub const ErrorCode = enum(u32) {
 pub const default_max_frame_size: usize = 16384;
 pub const default_window_size: i64 = 65535;
 
+/// handler 嵌套深度上限（发送阻塞 → 读帧 → 又派发新请求 → 再阻塞…）。
+const max_dispatch_depth: u8 = 4;
+
 pub const FrameHeader = struct {
     length: usize,
     ftype: FrameType,
@@ -74,6 +79,8 @@ pub const Options = struct {
     max_body: usize = 4 * 1024 * 1024,
     /// 我们自己声明的 `SETTINGS_INITIAL_WINDOW_SIZE`
     initial_window_size: u32 = @intCast(default_window_size),
+    /// 我们自己声明的 `SETTINGS_MAX_CONCURRENT_STREAMS`
+    max_concurrent_streams: usize = 100,
 };
 
 pub const Request = struct {
@@ -99,14 +106,18 @@ pub const Request = struct {
 /// 响应写入器：`begin` → `sendData`(可多次) → `end`。
 pub const Responder = struct {
     conn: *Connection,
-    stream_id: u32,
+    stream: *StreamState,
     begun: bool = false,
     ended: bool = false,
+
+    pub fn streamId(self: *const Responder) u32 {
+        return self.stream.id;
+    }
 
     /// 发送响应头块（`status` 如 "200"；`extra` 里不要含 `:status`）。
     pub fn begin(self: *Responder, status: []const u8, extra: []const hpack.Header) !void {
         if (self.begun) return error.AlreadyBegun;
-        const a = self.conn.arena.allocator();
+        const a = self.stream.allocator();
 
         var list: std.ArrayListUnmanaged(hpack.Header) = .empty;
         try list.append(a, .{ .name = ":status", .value = status });
@@ -115,7 +126,7 @@ pub const Responder = struct {
         var block: std.ArrayListUnmanaged(u8) = .empty;
         try hpack.encode(list.items, &block, a);
 
-        try self.conn.writeFrame(.headers, Flags.end_headers, self.stream_id, block.items);
+        try self.conn.writeFrame(.headers, Flags.end_headers, self.stream.id, block.items);
         self.begun = true;
     }
 
@@ -126,18 +137,18 @@ pub const Responder = struct {
 
         var off: usize = 0;
         while (off < bytes.len) {
-            const room = @min(self.conn.send_window, self.conn.stream_send_window);
+            const room = @min(self.conn.send_window, self.stream.send_window);
             if (room <= 0) {
-                try self.conn.pumpForWindow();
+                try self.conn.pumpForWindow(self.stream);
                 continue;
             }
             const want: usize = @intCast(@min(
                 @as(i64, @intCast(@min(bytes.len - off, self.conn.peer_max_frame_size))),
                 room,
             ));
-            try self.conn.writeFrame(.data, 0, self.stream_id, bytes[off .. off + want]);
+            try self.conn.writeFrame(.data, 0, self.stream.id, bytes[off .. off + want]);
             self.conn.send_window -= @as(i64, @intCast(want));
-            self.conn.stream_send_window -= @as(i64, @intCast(want));
+            self.stream.send_window -= @as(i64, @intCast(want));
             off += want;
         }
     }
@@ -146,13 +157,13 @@ pub const Responder = struct {
     pub fn end(self: *Responder, trailers: []const hpack.Header) !void {
         if (!self.begun) try self.begin("200", &.{});
         if (self.ended) return error.AlreadyEnded;
-        const a = self.conn.arena.allocator();
+        const a = self.stream.allocator();
         var block: std.ArrayListUnmanaged(u8) = .empty;
         try hpack.encode(trailers, &block, a);
         try self.conn.writeFrame(
             .headers,
             Flags.end_headers | Flags.end_stream,
-            self.stream_id,
+            self.stream.id,
             block.items,
         );
         self.ended = true;
@@ -166,8 +177,11 @@ pub const HandlerFn = *const fn (
     arena: std.mem.Allocator,
 ) anyerror!void;
 
-const StreamState = struct {
+/// 一条流的全部请求状态。**自带 arena**：流结束时整体释放，
+/// 因此多流并存时不会互相污染（不用连接级 arena 的 reset 时机去赌）。
+pub const StreamState = struct {
     id: u32,
+    arena: std.heap.ArenaAllocator,
     header_block: std.ArrayListUnmanaged(u8) = .empty,
     headers: std.ArrayListUnmanaged(hpack.Header) = .empty,
     body: std.ArrayListUnmanaged(u8) = .empty,
@@ -176,13 +190,22 @@ const StreamState = struct {
     path: []const u8 = "",
     scheme: []const u8 = "",
     authority: []const u8 = "",
+    /// 该流剩余发送窗口
+    send_window: i64 = default_window_size,
+
+    pub fn allocator(self: *StreamState) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+};
+
+const PendingFrame = struct {
+    hdr: FrameHeader,
+    payload: []u8,
 };
 
 pub const Connection = struct {
-    /// 连接级长期分配（HPACK 动态表）
+    /// 连接级长期分配（HPACK 动态表、流对象与延后帧）
     alloc: std.mem.Allocator,
-    /// 请求级 arena（header/body/handler 输出），跨请求 `reset(.retain_capacity)`
-    arena: std.heap.ArenaAllocator,
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     opts: Options = .{},
@@ -190,14 +213,19 @@ pub const Connection = struct {
 
     /// 我方剩余发送窗口（连接级）
     send_window: i64 = default_window_size,
-    /// 当前流剩余发送窗口
-    stream_send_window: i64 = default_window_size,
     /// 对端 `SETTINGS_MAX_FRAME_SIZE`
     peer_max_frame_size: usize = default_max_frame_size,
     /// 对端 `SETTINGS_INITIAL_WINDOW_SIZE`（新流的发送窗口初值）
     peer_initial_window: i64 = default_window_size,
 
-    stream: ?StreamState = null,
+    /// 活跃流（多路复用：同一连接可同时存在多个半开流）
+    streams: std.ArrayListUnmanaged(*StreamState) = .empty,
+    /// 发送受流控阻塞期间读到的业务帧：延后到主循环处理（不丢、不误拒）
+    pending: std.ArrayListUnmanaged(PendingFrame) = .empty,
+
+    serve_ctx: ?*anyopaque = null,
+    serve_handler: ?HandlerFn = null,
+    dispatch_depth: u8 = 0,
     /// 已收到对端 SETTINGS（收到前不能算连接就绪）
     got_peer_settings: bool = false,
 
@@ -209,26 +237,71 @@ pub const Connection = struct {
     ) Connection {
         return .{
             .alloc = alloc,
-            .arena = std.heap.ArenaAllocator.init(alloc),
             .reader = reader,
             .writer = writer,
             .opts = opts,
             .decoder = hpack.Decoder.init(alloc),
-            .stream_send_window = @intCast(opts.initial_window_size),
         };
     }
 
     pub fn deinit(self: *Connection) void {
-        self.decoder.deinit();
-        if (self.stream) |*s| {
-            // 用 arena 分配，随 arena 释放
-            _ = s;
+        for (self.streams.items) |s| {
+            s.arena.deinit();
+            self.alloc.destroy(s);
         }
-        self.arena.deinit();
+        self.streams.deinit(self.alloc);
+        for (self.pending.items) |pf| self.alloc.free(pf.payload);
+        self.pending.deinit(self.alloc);
+        self.decoder.deinit();
+    }
+
+    /// 当前活跃流数（可观测/测试用）。
+    pub fn activeStreams(self: *const Connection) usize {
+        return self.streams.items.len;
+    }
+
+    fn findStream(self: *Connection, id: u32) ?*StreamState {
+        for (self.streams.items) |s| {
+            if (s.id == id) return s;
+        }
+        return null;
+    }
+
+    fn createStream(self: *Connection, id: u32) !*StreamState {
+        const s = try self.alloc.create(StreamState);
+        s.* = .{
+            .id = id,
+            .arena = std.heap.ArenaAllocator.init(self.alloc),
+            .send_window = self.peer_initial_window,
+        };
+        errdefer {
+            s.arena.deinit();
+            self.alloc.destroy(s);
+        }
+        try self.streams.append(self.alloc, s);
+        return s;
+    }
+
+    fn destroyStream(self: *Connection, s: *StreamState) void {
+        for (self.streams.items, 0..) |x, i| {
+            if (x == s) {
+                _ = self.streams.orderedRemove(i);
+                break;
+            }
+        }
+        s.arena.deinit();
+        self.alloc.destroy(s);
     }
 
     /// 阻塞服务一条连接，直到对端 `GOAWAY`/断开。返回 `error.ConnectionClosed` 属正常收尾。
     pub fn serve(self: *Connection, ctx: *anyopaque, handler: HandlerFn) !void {
+        self.serve_ctx = ctx;
+        self.serve_handler = handler;
+        defer {
+            self.serve_ctx = null;
+            self.serve_handler = null;
+        }
+
         var pf: [client_preface.len]u8 = undefined;
         self.reader.readSliceAll(&pf) catch |e| {
             std.debug.print("[zgrpc.h2] 读连接前言失败：{s}\n", .{@errorName(e)});
@@ -243,26 +316,46 @@ pub const Connection = struct {
         try self.sendSettings();
 
         while (true) {
+            // 先消化"发送阻塞期间"暂存的业务帧
+            if (self.pending.items.len > 0) {
+                const p = self.pending.orderedRemove(0);
+                defer self.alloc.free(p.payload);
+                try self.handleFrame(p.hdr, p.payload);
+                continue;
+            }
+
             const hdr = self.readFrameHeader() catch |e| {
                 // 对端关闭/半包 → 正常收尾；其它读错误也在这里定位
                 std.debug.print("[zgrpc.h2] 读帧结束（{s}），连接收尾\n", .{@errorName(e)});
                 return error.ConnectionClosed;
             };
-            switch (hdr.ftype) {
-                .settings => try self.onSettings(hdr),
-                .ping => try self.onPing(hdr),
-                .window_update => try self.onWindowUpdate(hdr),
-                .headers => try self.onHeaders(hdr, ctx, handler),
-                .continuation => try self.onContinuation(hdr, ctx, handler),
-                .data => try self.onData(hdr, ctx, handler),
-                .rst_stream => try self.onRstStream(hdr),
-                .goaway => {
-                    try self.skip(hdr);
-                    return error.ConnectionClosed;
-                },
-                // PRIORITY / PUSH_PROMISE / 未知帧：按 RFC 必须忽略
-                else => try self.skip(hdr),
-            }
+
+            const payload = try self.alloc.alloc(u8, hdr.length);
+            self.reader.readSliceAll(payload) catch |e| {
+                self.alloc.free(payload);
+                std.debug.print("[zgrpc.h2] 读帧体失败（流 {d}，{d} 字节）：{s}\n", .{
+                    hdr.stream_id, hdr.length, @errorName(e),
+                });
+                return error.ConnectionClosed;
+            };
+            defer self.alloc.free(payload);
+
+            try self.handleFrame(hdr, payload);
+        }
+    }
+
+    fn handleFrame(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
+        switch (hdr.ftype) {
+            .settings => try self.onSettings(hdr, payload),
+            .ping => try self.onPing(hdr, payload),
+            .window_update => try self.onWindowUpdate(hdr, payload),
+            .headers => try self.onHeaders(hdr, payload),
+            .continuation => try self.onContinuation(hdr, payload),
+            .data => try self.onData(hdr, payload),
+            .rst_stream => try self.onRstStream(hdr, payload),
+            .goaway => return error.ConnectionClosed,
+            // PRIORITY / PUSH_PROMISE / 未知帧：按 RFC 必须忽略
+            else => {},
         }
     }
 
@@ -304,21 +397,14 @@ pub const Connection = struct {
     }
 
     fn sendSettings(self: *Connection) !void {
-        var payload: [6]u8 = undefined;
+        var payload: [12]u8 = undefined;
+        // MAX_CONCURRENT_STREAMS
+        std.mem.writeInt(u16, payload[0..2], 0x0003, .big);
+        std.mem.writeInt(u32, payload[2..6], @intCast(self.opts.max_concurrent_streams), .big);
         // INITIAL_WINDOW_SIZE
-        std.mem.writeInt(u16, payload[0..2], 0x0004, .big);
-        std.mem.writeInt(u32, payload[2..6], self.opts.initial_window_size, .big);
+        std.mem.writeInt(u16, payload[6..8], 0x0004, .big);
+        std.mem.writeInt(u32, payload[8..12], self.opts.initial_window_size, .big);
         try self.writeFrame(.settings, 0, 0, &payload);
-    }
-
-    fn skip(self: *Connection, hdr: FrameHeader) !void {
-        var buf: [4096]u8 = undefined;
-        var remaining = hdr.length;
-        while (remaining > 0) {
-            const n = @min(remaining, buf.len);
-            try self.reader.readSliceAll(buf[0..n]);
-            remaining -= n;
-        }
     }
 
     fn errBytes(code: ErrorCode) [4]u8 {
@@ -344,30 +430,25 @@ pub const Connection = struct {
     // 控制帧
     // -----------------------------------------------------------------------
 
-    fn onSettings(self: *Connection, hdr: FrameHeader) !void {
-        var buf: [64]u8 = undefined;
-        if (hdr.length > buf.len) {
-            std.debug.print("[zgrpc.h2] SETTINGS 帧过长（{d} 字节），跳过\n", .{hdr.length});
-            try self.skip(hdr);
-            return error.FrameTooLarge;
-        }
-        try self.reader.readSliceAll(buf[0..hdr.length]);
-
+    fn onSettings(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
         if (hdr.flags & Flags.ack != 0) {
-            if (hdr.length != 0) return error.ProtocolError;
+            if (payload.len != 0) return error.ProtocolError;
             self.got_peer_settings = true;
             return;
         }
+        if (payload.len % 6 != 0) return error.FrameSizeError;
 
         var i: usize = 0;
-        while (i + 6 <= hdr.length) : (i += 6) {
-            const id = std.mem.readInt(u16, buf[i..][0..2], .big);
-            const val = std.mem.readInt(u32, buf[i + 2 ..][0..4], .big);
+        while (i + 6 <= payload.len) : (i += 6) {
+            const id = std.mem.readInt(u16, payload[i..][0..2], .big);
+            const val = std.mem.readInt(u32, payload[i + 2 ..][0..4], .big);
             switch (id) {
                 0x0001 => {}, // HEADER_TABLE_SIZE：本库编码不用动态表，忽略
-                0x0004 => { // INITIAL_WINDOW_SIZE
-                    self.peer_initial_window = @intCast(val);
-                    self.stream_send_window = @intCast(val);
+                0x0004 => { // INITIAL_WINDOW_SIZE：按差值调整所有现存流的发送窗口
+                    const new_win: i64 = @intCast(val);
+                    const delta = new_win - self.peer_initial_window;
+                    for (self.streams.items) |s| s.send_window += delta;
+                    self.peer_initial_window = new_win;
                 },
                 0x0005 => { // MAX_FRAME_SIZE
                     if (val < 16384 or val > 16_777_215) return error.ProtocolError;
@@ -380,140 +461,138 @@ pub const Connection = struct {
         try self.writeFrame(.settings, Flags.ack, 0, &.{});
     }
 
-    fn onPing(self: *Connection, hdr: FrameHeader) !void {
-        if (hdr.length != 8) return error.FrameSizeError;
-        var buf: [8]u8 = undefined;
-        try self.reader.readSliceAll(&buf);
+    fn onPing(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
+        if (payload.len != 8) return error.FrameSizeError;
         if (hdr.flags & Flags.ack != 0) return;
-        try self.writeFrame(.ping, Flags.ack, 0, &buf);
+        try self.writeFrame(.ping, Flags.ack, 0, payload);
     }
 
-    fn onWindowUpdate(self: *Connection, hdr: FrameHeader) !void {
-        if (hdr.length != 4) return error.FrameSizeError;
-        var buf: [4]u8 = undefined;
-        try self.reader.readSliceAll(&buf);
-        const inc: i64 = @intCast(std.mem.readInt(u32, &buf, .big) & 0x7fff_ffff);
+    fn onWindowUpdate(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
+        if (payload.len != 4) return error.FrameSizeError;
+        const inc: i64 = @intCast(std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff);
         if (hdr.stream_id == 0) {
             self.send_window += inc;
-        } else {
-            self.stream_send_window += inc;
+        } else if (self.findStream(hdr.stream_id)) |s| {
+            s.send_window += inc;
         }
     }
 
-    fn onRstStream(self: *Connection, hdr: FrameHeader) !void {
-        try self.skip(hdr);
-        if (self.stream) |s| {
-            if (s.id == hdr.stream_id) self.stream = null;
+    fn onRstStream(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
+        _ = payload;
+        if (self.findStream(hdr.stream_id)) |s| {
+            std.debug.print("[zgrpc.h2] 对端重置流 {d}，丢弃其状态\n", .{hdr.stream_id});
+            self.destroyStream(s);
         }
     }
 
-    /// 发送受阻时读帧推进窗口（只处理控制帧；期间的业务帧按「不支持并发」拒绝）。
-    fn pumpForWindow(self: *Connection) !void {
-        while (self.send_window <= 0 or self.stream_send_window <= 0) {
-            const hdr = try self.readFrameHeader();
+    /// 发送受阻时推进窗口：只立即处理控制帧；业务帧进 `pending` 延后（不丢）。
+    fn pumpForWindow(self: *Connection, stream: *StreamState) !void {
+        while (self.send_window <= 0 or stream.send_window <= 0) {
+            const hdr = self.readFrameHeader() catch |e| {
+                std.debug.print("[zgrpc.h2] 等窗口时读帧结束（{s}）\n", .{@errorName(e)});
+                return error.ConnectionClosed;
+            };
+            const payload = try self.alloc.alloc(u8, hdr.length);
+            self.reader.readSliceAll(payload) catch |e| {
+                self.alloc.free(payload);
+                std.debug.print("[zgrpc.h2] 等窗口时读帧体失败：{s}\n", .{@errorName(e)});
+                return error.ConnectionClosed;
+            };
+
             switch (hdr.ftype) {
-                .window_update => try self.onWindowUpdate(hdr),
-                .ping => try self.onPing(hdr),
-                .settings => try self.onSettings(hdr),
+                .window_update, .ping, .settings => {
+                    defer self.alloc.free(payload);
+                    try self.handleFrame(hdr, payload);
+                },
                 .rst_stream => {
-                    try self.onRstStream(hdr);
-                    return error.StreamReset;
+                    defer self.alloc.free(payload);
+                    const reset_id = hdr.stream_id;
+                    try self.handleFrame(hdr, payload);
+                    if (reset_id == stream.id) return error.StreamReset;
                 },
                 .goaway => {
-                    try self.skip(hdr);
+                    self.alloc.free(payload);
                     return error.ConnectionClosed;
                 },
-                .headers, .continuation, .data => {
-                    try self.skip(hdr);
-                    try self.sendRst(hdr.stream_id, .refused_stream);
-                },
-                else => try self.skip(hdr),
+                else => try self.pending.append(self.alloc, .{ .hdr = hdr, .payload = payload }),
             }
         }
     }
 
     // -----------------------------------------------------------------------
-    // 请求帧
+    // 请求帧（多路复用）
     // -----------------------------------------------------------------------
 
-    fn onHeaders(self: *Connection, hdr: FrameHeader, ctx: *anyopaque, handler: HandlerFn) !void {
-        if (self.stream == null) {
-            _ = self.arena.reset(.retain_capacity);
-            self.stream = .{ .id = hdr.stream_id };
-            self.stream_send_window = self.peer_initial_window;
-        } else if (self.stream.?.id != hdr.stream_id or self.stream.?.headers_done) {
-            // v1 不支持并发流 / 同流二次 HEADERS（trailers）
-            std.debug.print(
-                "[zgrpc.h2] 拒绝并发流 {d}（当前 {d}）；v1 为串行模型\n",
-                .{ hdr.stream_id, self.stream.?.id },
-            );
-            try self.skip(hdr);
-            try self.sendRst(hdr.stream_id, .refused_stream);
+    fn onHeaders(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
+        const s = self.findStream(hdr.stream_id) orelse blk: {
+            if (self.streams.items.len >= self.opts.max_concurrent_streams) {
+                std.debug.print(
+                    "[zgrpc.h2] 并发流超上限 {d}，拒绝流 {d}\n",
+                    .{ self.opts.max_concurrent_streams, hdr.stream_id },
+                );
+                try self.sendRst(hdr.stream_id, .refused_stream);
+                return;
+            }
+            break :blk try self.createStream(hdr.stream_id);
+        };
+
+        if (s.headers_done) {
+            // 同流二次 HEADERS（trailers）本库不支持
+            try self.sendRst(hdr.stream_id, .protocol_error);
+            self.destroyStream(s);
             return;
         }
 
-        const s = &self.stream.?;
-        const a = self.arena.allocator();
+        const a = s.allocator();
+        const data = stripHeaderExtras(hdr, payload) orelse {
+            try self.sendRst(hdr.stream_id, .protocol_error);
+            self.destroyStream(s);
+            return;
+        };
 
-        var payload = try a.alloc(u8, hdr.length);
-        try self.reader.readSliceAll(payload);
-
-        // 去掉 PADDED / PRIORITY 前缀
-        var start: usize = 0;
-        var end: usize = payload.len;
-        if (hdr.flags & Flags.padded != 0) {
-            if (payload.len == 0) return error.ProtocolError;
-            const pad = @as(usize, payload[0]);
-            start += 1;
-            if (pad > end - start) return error.ProtocolError;
-            end -= pad;
-        }
-        if (hdr.flags & Flags.priority != 0) {
-            start += 5;
-            if (start > end) return error.ProtocolError;
-        }
-
-        try s.header_block.appendSlice(a, payload[start..end]);
+        try s.header_block.appendSlice(a, data);
         if (s.header_block.items.len > self.opts.max_header_block) {
             std.debug.print("[zgrpc.h2] header block 超上限 {d} 字节\n", .{self.opts.max_header_block});
-            self.stream = null;
             try self.sendRst(hdr.stream_id, .enhance_your_calm);
+            self.destroyStream(s);
             return;
         }
 
         if (hdr.flags & Flags.end_headers != 0) {
-            try self.finishHeaders(s, a);
-            if (hdr.flags & Flags.end_stream != 0) {
-                try self.dispatch(ctx, handler);
-            }
+            try self.finishHeaders(s);
+            if (hdr.flags & Flags.end_stream != 0) try self.dispatch(s);
         }
     }
 
-    fn onContinuation(self: *Connection, hdr: FrameHeader, ctx: *anyopaque, handler: HandlerFn) !void {
-        if (self.stream == null or self.stream.?.id != hdr.stream_id or self.stream.?.headers_done) {
-            // 没有等待中的 header block：协议错误
-            try self.skip(hdr);
+    fn onContinuation(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
+        const s = self.findStream(hdr.stream_id) orelse {
+            try self.skipContinuation();
             return error.ProtocolError;
+        };
+        if (s.headers_done) {
+            try self.sendRst(hdr.stream_id, .protocol_error);
+            self.destroyStream(s);
+            return;
         }
-        const s = &self.stream.?;
-        const a = self.arena.allocator();
-        const payload = try a.alloc(u8, hdr.length);
-        try self.reader.readSliceAll(payload);
+        const a = s.allocator();
         try s.header_block.appendSlice(a, payload);
         if (s.header_block.items.len > self.opts.max_header_block) {
-            self.stream = null;
             try self.sendRst(hdr.stream_id, .enhance_your_calm);
+            self.destroyStream(s);
             return;
         }
         if (hdr.flags & Flags.end_headers != 0) {
-            try self.finishHeaders(s, a);
-            if (hdr.flags & Flags.end_stream != 0) {
-                try self.dispatch(ctx, handler);
-            }
+            try self.finishHeaders(s);
+            if (hdr.flags & Flags.end_stream != 0) try self.dispatch(s);
         }
     }
 
-    fn finishHeaders(self: *Connection, s: *StreamState, a: std.mem.Allocator) !void {
+    fn skipContinuation(self: *Connection) !void {
+        _ = self;
+    }
+
+    fn finishHeaders(self: *Connection, s: *StreamState) !void {
+        const a = s.allocator();
         self.decoder.decode(s.header_block.items, &s.headers, a) catch |e| {
             std.debug.print("[zgrpc.h2] HPACK 解码失败（流 {d}）：{s}\n", .{ s.id, @errorName(e) });
             try self.sendGoAway(.compression_error);
@@ -528,20 +607,12 @@ pub const Connection = struct {
         }
     }
 
-    fn onData(self: *Connection, hdr: FrameHeader, ctx: *anyopaque, handler: HandlerFn) !void {
-        const has_stream = self.stream != null and self.stream.?.id == hdr.stream_id;
-        const a = self.arena.allocator();
-
-        var payload: []const u8 = &.{};
-        if (has_stream) {
-            const buf = try a.alloc(u8, hdr.length);
-            try self.reader.readSliceAll(buf);
-            payload = buf;
-        } else {
-            try self.skip(hdr);
-            try self.sendRst(hdr.stream_id, .refused_stream);
+    fn onData(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
+        const s = self.findStream(hdr.stream_id) orelse {
+            // 流不存在（已结束/从未开启）：回补连接窗口即可，不必回 RST（可能已关闭）
+            try self.refundWindow(hdr.stream_id, payload.len, false);
             return;
-        }
+        };
 
         var data = payload;
         if (hdr.flags & Flags.padded != 0) {
@@ -552,37 +623,44 @@ pub const Connection = struct {
         }
 
         // 无论是否超限都要回补窗口，否则对端会卡住
-        try self.refundWindow(hdr.stream_id, hdr.length);
+        try self.refundWindow(hdr.stream_id, payload.len, true);
 
-        const s = &self.stream.?;
+        const a = s.allocator();
         if (s.body.items.len + data.len > self.opts.max_body) {
             std.debug.print("[zgrpc.h2] 请求体超上限 {d} 字节（流 {d}）\n", .{ self.opts.max_body, s.id });
-            self.stream = null;
             try self.sendRst(hdr.stream_id, .enhance_your_calm);
+            self.destroyStream(s);
             return;
         }
         try s.body.appendSlice(a, data);
 
-        if (hdr.flags & Flags.end_stream != 0) {
-            try self.dispatch(ctx, handler);
-        }
+        if (hdr.flags & Flags.end_stream != 0) try self.dispatch(s);
     }
 
-    /// 收到 DATA 后把窗口补回去（连接级 + 流级各一次）。
-    fn refundWindow(self: *Connection, stream_id: u32, amount: usize) !void {
+    /// 收到 DATA 后把窗口补回去（连接级 + 流级）。
+    fn refundWindow(self: *Connection, stream_id: u32, amount: usize, with_stream: bool) !void {
         if (amount == 0) return;
         const inc: u32 = @intCast(@min(amount, 0x7fff_ffff));
         var buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &buf, inc, .big);
         try self.writeFrame(.window_update, 0, 0, &buf);
-        try self.writeFrame(.window_update, 0, stream_id, &buf);
+        if (with_stream) try self.writeFrame(.window_update, 0, stream_id, &buf);
     }
 
-    fn dispatch(self: *Connection, ctx: *anyopaque, handler: HandlerFn) !void {
-        defer self.stream = null;
-        const s = &self.stream.?;
+    fn dispatch(self: *Connection, s: *StreamState) !void {
+        const ctx = self.serve_ctx orelse return;
+        const handler = self.serve_handler orelse return;
+        defer self.destroyStream(s);
 
-        var rsp = Responder{ .conn = self, .stream_id = s.id };
+        if (self.dispatch_depth >= max_dispatch_depth) {
+            std.debug.print("[zgrpc.h2] 派发嵌套过深（{d}），拒绝流 {d}\n", .{ self.dispatch_depth, s.id });
+            try self.sendRst(s.id, .refused_stream);
+            return;
+        }
+        self.dispatch_depth += 1;
+        defer self.dispatch_depth -= 1;
+
+        var rsp = Responder{ .conn = self, .stream = s };
         const req = Request{
             .stream_id = s.id,
             .method = s.method,
@@ -593,24 +671,38 @@ pub const Connection = struct {
             .body = s.body.items,
         };
 
-        handler(ctx, req, &rsp, self.arena.allocator()) catch |e| {
+        handler(ctx, req, &rsp, s.allocator()) catch |e| {
             std.debug.print("[zgrpc.h2] 处理 {s} {s} 失败（流 {d}）：{s}\n", .{
                 req.method, req.path, s.id, @errorName(e),
             });
-            if (!rsp.begun) {
-                rsp.begin("500", &.{}) catch {};
-            }
-            if (!rsp.ended) {
-                rsp.end(&.{}) catch {};
-            }
+            if (!rsp.begun) rsp.begin("500", &.{}) catch {};
+            if (!rsp.ended) rsp.end(&.{}) catch {};
             return;
         };
 
-        // handler 没显式收尾时补上，保证每个请求都有 END_STREAM
+        // handler 没显式收尾时补上，保证每个流都有 END_STREAM
         if (!rsp.begun) try rsp.begin("200", &.{});
         if (!rsp.ended) try rsp.end(&.{});
     }
 };
+
+/// 去掉 HEADERS 帧的 PADDED / PRIORITY 前缀；非法返回 null。
+fn stripHeaderExtras(hdr: FrameHeader, payload: []const u8) ?[]const u8 {
+    var start: usize = 0;
+    var end: usize = payload.len;
+    if (hdr.flags & Flags.padded != 0) {
+        if (payload.len == 0) return null;
+        const pad = @as(usize, payload[0]);
+        start += 1;
+        if (pad > end - start) return null;
+        end -= pad;
+    }
+    if (hdr.flags & Flags.priority != 0) {
+        start += 5;
+        if (start > end) return null;
+    }
+    return payload[start..end];
+}
 
 // ---------------------------------------------------------------------------
 // 测试：明文 h2c 端到端（构造真实客户端字节流，逐帧断言响应）
@@ -672,29 +764,31 @@ fn echoHandler(
     try rsp.end(&.{.{ .name = "x-done", .value = "1" }});
 }
 
+fn encodeReqHeaders(a: std.mem.Allocator, path: []const u8) !std.ArrayListUnmanaged(u8) {
+    var block: std.ArrayListUnmanaged(u8) = .empty;
+    try hpack.encode(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = "content-type", .value = "text/plain" },
+    }, &block, a);
+    return block;
+}
+
 test "h2：明文 h2c 端到端（preface + SETTINGS + HEADERS/DATA → 响应帧齐全）" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    // --- 构造客户端字节流 ---
     var input: std.ArrayListUnmanaged(u8) = .empty;
     try input.appendSlice(a, client_preface);
-    try appendFrame(&input, a, .settings, 0, 0, &.{}); // 空 SETTINGS
+    try appendFrame(&input, a, .settings, 0, 0, &.{});
 
-    var block: std.ArrayListUnmanaged(u8) = .empty;
-    try hpack.encode(&.{
-        .{ .name = ":method", .value = "POST" },
-        .{ .name = ":path", .value = "/echo" },
-        .{ .name = ":scheme", .value = "http" },
-        .{ .name = ":authority", .value = "localhost" },
-        .{ .name = "content-type", .value = "text/plain" },
-    }, &block, a);
-    // HEADERS 不带 END_STREAM：随后跟 DATA
+    const block = try encodeReqHeaders(a, "/echo");
     try appendFrame(&input, a, .headers, Flags.end_headers, 1, block.items);
     try appendFrame(&input, a, .data, Flags.end_stream, 1, "hello-h2");
 
-    // --- 跑服务端 ---
     var r = std.Io.Reader.fixed(input.items);
     var aw = std.Io.Writer.Allocating.init(testing.allocator);
     defer aw.deinit();
@@ -706,7 +800,6 @@ test "h2：明文 h2c 端到端（preface + SETTINGS + HEADERS/DATA → 响应�
         if (e != error.ConnectionClosed) return e;
     };
 
-    // --- 断言输出帧 ---
     const out = aw.written();
     var pos: usize = 0;
     var saw_settings = false;
@@ -793,13 +886,7 @@ test "h2：收到 DATA 必须回补窗口（连接级 + 流级）" {
     var input: std.ArrayListUnmanaged(u8) = .empty;
     try input.appendSlice(a, client_preface);
     try appendFrame(&input, a, .settings, 0, 0, &.{});
-    var block: std.ArrayListUnmanaged(u8) = .empty;
-    try hpack.encode(&.{
-        .{ .name = ":method", .value = "POST" },
-        .{ .name = ":path", .value = "/echo" },
-        .{ .name = ":scheme", .value = "http" },
-        .{ .name = ":authority", .value = "localhost" },
-    }, &block, a);
+    const block = try encodeReqHeaders(a, "/echo");
     try appendFrame(&input, a, .headers, Flags.end_headers, 1, block.items);
     try appendFrame(&input, a, .data, Flags.end_stream, 1, "1234567890"); // 10 字节
 
@@ -825,4 +912,77 @@ test "h2：收到 DATA 必须回补窗口（连接级 + 流级）" {
     }
     try testing.expectEqual(@as(u32, 10), conn_inc);
     try testing.expectEqual(@as(u32, 10), stream_inc);
+}
+
+test "h2：多路复用（两个流交错收头/收体，各自独立响应）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, client_preface);
+    try appendFrame(&input, a, .settings, 0, 0, &.{});
+
+    const b1 = try encodeReqHeaders(a, "/echo/one");
+    const b3 = try encodeReqHeaders(a, "/echo/three");
+
+    // 交错：两条流都先发 HEADERS（不带 END_STREAM），再分别发 DATA
+    try appendFrame(&input, a, .headers, Flags.end_headers, 1, b1.items);
+    try appendFrame(&input, a, .headers, Flags.end_headers, 3, b3.items);
+    try appendFrame(&input, a, .data, Flags.end_stream, 1, "one");
+    try appendFrame(&input, a, .data, Flags.end_stream, 3, "three");
+
+    var r = std.Io.Reader.fixed(input.items);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var conn = Connection.init(testing.allocator, &r, &aw.writer, .{});
+    defer conn.deinit();
+    var dummy: u8 = 0;
+    conn.serve(&dummy, echoHandler) catch |e| {
+        if (e != error.ConnectionClosed) return e;
+    };
+
+    var pos: usize = 0;
+    var status_count: usize = 0;
+    var body1: []const u8 = "";
+    var body3: []const u8 = "";
+    var end1 = false;
+    var end3 = false;
+    var refused = false;
+
+    while (nextFrame(aw.written(), &pos)) |f| {
+        switch (f.ftype) {
+            .headers => {
+                if (f.stream_id == 0) continue;
+                var dec = hpack.Decoder.init(testing.allocator);
+                defer dec.deinit();
+                var hs: std.ArrayListUnmanaged(hpack.Header) = .empty;
+                try dec.decode(f.payload, &hs, a);
+                var is_status = false;
+                for (hs.items) |h| {
+                    if (std.mem.eql(u8, h.name, ":status")) is_status = true;
+                }
+                if (is_status) status_count += 1;
+                if (f.flags & Flags.end_stream != 0) {
+                    if (f.stream_id == 1) end1 = true;
+                    if (f.stream_id == 3) end3 = true;
+                }
+            },
+            .data => {
+                if (f.stream_id == 1) body1 = f.payload;
+                if (f.stream_id == 3) body3 = f.payload;
+            },
+            .rst_stream => refused = true,
+            else => {},
+        }
+    }
+
+    // 两条流都必须被处理（不是被 REFUSED_STREAM 打回）
+    try testing.expect(!refused);
+    try testing.expectEqual(@as(usize, 2), status_count);
+    try testing.expectEqualStrings("one", body1);
+    try testing.expectEqualStrings("three", body3);
+    try testing.expect(end1);
+    try testing.expect(end3);
 }

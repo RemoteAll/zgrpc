@@ -10,11 +10,11 @@
 | 模块 | 能力 | 说明 |
 |---|---|---|
 | `hpack` | 头部压缩（RFC 7541） | **解码完整**（静态表 + 动态表 + Huffman）；编码简化（静态命中走索引，其余明文 literal） |
-| `h2` | HTTP/2 明文 h2c（prior-knowledge）服务端 | SETTINGS/ACK、HEADERS/CONTINUATION（含 PADDED）、DATA（含 PADDED + 流控回补）、WINDOW_UPDATE、PING、RST_STREAM、GOAWAY |
+| `h2` | HTTP/2 明文 h2c（prior-knowledge）服务端 | SETTINGS/ACK、HEADERS/CONTINUATION（含 PADDED/PRIORITY）、DATA（含 PADDED + 流控回补）、WINDOW_UPDATE（连接级 + 每流）、PING、RST_STREAM、GOAWAY；**多路复用**（多流并存、发送阻塞时帧入 pending 队列） |
 | `grpc` | gRPC 语义层 | 消息分帧、状态码、路由、unary 与**服务端流式**（`sendMessage` 可多次） |
 
 **未做**（明确列出，避免误解为完整实现）：TLS/ALPN、服务端推送、优先级调度、
-并发流（v1 串行，并发新流回 `RST_STREAM(REFUSED_STREAM)`，客户端可安全重试）、
+handler 并行执行（业务仍同步串行，串行只是执行顺序，**不会因此拒绝并发流**）、
 压缩（`grpc-encoding`）、客户端流/bidi 背压、`grpc-timeout`、protobuf 编解码（业务自带）。
 
 ## 快速开始
@@ -45,16 +45,16 @@ try conn.serve(server.context(), server.handler());
 ## 构建与验证
 
 ```bash
-zig build test           # 13 个单元/端到端测试
+zig build test           # 15 个单元/端到端测试
 zig build echo-server    # 监听 127.0.0.1:18051
-zig build echo-client    # 跑一次真实 TCP unary 调用
+zig build echo-client    # 同一条 TCP 连接上并发两个 unary 调用
 ```
 
 实测（2026-11-12，Windows，Zig 0.17.1）：
 
-- `zig build test --summary all` → **13/13 tests passed**，exit 0；
-- 真实 socket：`echo-client` → `grpc-status=0 响应=hello-grpc`，exit 0；
-  服务端日志 `收到 10 字节：hello-grpc`。
+- `zig build test --summary all` → **14/14 tests passed**，exit 0；
+- 真实 socket **并发双流**：`echo-client` → 流 1 `grpc-status=0 响应=stream-one`、
+  流 3 `grpc-status=0 响应=stream-three`，exit 0；服务端日志两条流都被处理。
 
 ## 为什么不直接复用现成 Zig 库
 
