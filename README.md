@@ -1,5 +1,146 @@
 # zgrpc
 
-> 纯 Zig、**零依赖**的 gRPC / HTTP/2 协议栈（h2c）。当前版本 **0.2.0**，见 [CHANGELOG](CHANGELOG.md)。
+纯 Zig、**零依赖**的 gRPC / HTTP/2 协议栈（Zig 0.17.1+）。
 
-> 纯 Zig、**零依赖**的 gRPC / HTTP/2 协议栈（h2c）。当前版本 **0.2.0**，见 [CHANGELOG](CHANGELOG.md)。
+面向「需要 gRPC 的项目」独立成库，**不放进 zzig**：h2 + HPACK + gRPC 是一整套协议栈，
+不该让所有用 zzig 的项目都背上这份编译与维护成本；本库也不依赖 zzig，两边互不绑死。
+
+## 现状
+
+| 模块 | 能力 | 说明 |
+|---|---|---|
+| `hpack` | 头部压缩（RFC 7541） | **解码完整**（静态表 + 动态表 + Huffman）；编码简化（静态命中走索引，其余明文 literal） |
+| `h2` | HTTP/2 明文 h2c（prior-knowledge）服务端 | SETTINGS/ACK、HEADERS/CONTINUATION（含 PADDED/PRIORITY）、DATA（含 PADDED + 流控回补）、WINDOW_UPDATE（连接级 + 每流）、PING、RST_STREAM、GOAWAY；**多路复用**（多流并存、发送阻塞时帧入 pending 队列） |
+| `grpc` | gRPC 语义层 | 消息分帧、状态码、路由、unary / 服务端流式 / **客户端流与 bidi**（`server.stream_routes` + `streamHooks`）、**gRPC-Web**、**gzip 消息压缩**、**`grpc-timeout` 截止时间**、`grpc-message` 的 percent-encoding、非 POST→**405** / content-type 不符→**415**、**Custom-Metadata（含 `-bin` base64）**、**gRPC-Web 文本模式（`grpc-web-text`，base64）** |
+| `client` | gRPC 客户端（h2c） | 握手、`unary`、**`callMany`（同一连接并发多条流）**、`clientStream`（客户端流/bidi），按 stream_id 归位、回补窗口；发 `grpc-timeout` / `user-agent` / 自定义 metadata，按规范**合成** Status 并解 percent-encoding |
+| `health` | 标准 `grpc.health.v1.Health` | `Check`（unary）/ `Watch`（流式，同步模型下默认推一次）；最简 protobuf 手写编解码，零依赖 |
+| `pb` | 最小 protobuf 运行时 | varint/zigzag/tag/length-delimited/fixed/packed 编解码；**不做 .proto 代码生成**，手写 message 约 10 行 |
+| `gzip` / `clock` | 压缩与单调时钟 | `gzip` 走 `std.compress.flate`；`clock` 直问 OS（`QueryPerformanceCounter` / `CLOCK_MONOTONIC`），服务 `grpc-timeout` |
+
+**未做**（明确列出，避免误解为完整实现）：TLS/ALPN、服务端推送、优先级调度、
+handler 并行执行（业务仍同步串行，串行只是执行顺序，**不会因此拒绝并发流**）、
+客户端流/bidi 背压（gRPC-Web 规范本身也不支持 bidi）、`grpc-timeout` 的**强制中断**（本层只判超时并回 `DEADLINE_EXCEEDED`，
+不会打断已阻塞在业务里的调用）、
+well-known types / `Any` / 反射（`.proto` 子集代码生成见下）。
+
+### 对照官方规范的符合性
+
+以 `doc/PROTOCOL-HTTP2.md` 与 `doc/PROTOCOL-WEB.md` 逐条比对（2026-11-12）：
+
+| 规范条款 | 状态 |
+|---|---|
+| `:method POST`、`POST /{service}/{method}` | ✅ 非 POST 回 **HTTP 405**（不伪装成 `:status 200`） |
+| `content-type: application/grpc[+proto]` | ✅ 不符回 **HTTP 415**（规范 SHOULD） |
+| `te: trailers` | ✅ 客户端必发；服务端缺失时宽容处理并**留痕日志** |
+| `grpc-timeout`（≤8 位 + H/M/S/m/u/n） | ✅ 解析为单调时钟截止时刻，超时回 `DEADLINE_EXCEEDED(4)` |
+| `grpc-encoding` / `grpc-accept-encoding` | ✅ gzip；未声明不压缩，响应头按 ABNF 顺序 |
+| `[压缩位:1][长度:4 大端]` 分帧 | ✅ 压缩标志未声明时恒为 0 |
+| `:status 200` + `grpc-status` 在 trailers | ✅ 即使 OK 也发 trailers；支持 Trailers-Only 形态 |
+| `grpc-message` percent-encoding | ✅ 发送侧编码、客户端解码；非法 `%xx` 原样保留（规范 MUST NOT error） |
+| `grpc-status` 十进制无前导零 | ✅ |
+| 客户端遇非 200 / 缺 status 必须**合成** | ✅ 合成 `UNAVAILABLE(14)` / `UNKNOWN(2)` 并附可读 message |
+| gRPC-Web：trailers 走 body 尾帧（MSB=1、键名小写） | ✅ 尾帧 `0x80` + 4B 长度 + `grpc-status: …` |
+| gRPC-Web：缺省格式按 `+proto` | ✅ 响应 `application/grpc-web+proto` |
+| gRPC-Web：文本流（`application/grpc-web-text`，默认 base64，不得假设 padding 只在帧边界） | ✅ 请求整体解码、响应逐帧 base64（带 padding，解码端忽略 `=`） |
+| 建议 `user-agent` 用 `grpc-<lang>/<ver>` | ✅ 默认 `grpc-zgrpc/0.2.1` |
+| Custom-Metadata：`-bin` 用 base64（MUST 接受带/不带 padding，应发无 padding）；重复名可逗号合并 | ✅ `requestBinaryMetadata(All)` / `setBinaryHeader` / `setBinaryTrailer`；`grpc-status-details-bin` 可直接用 `setBinaryTrailer` |
+| `grpc.health.v1.Health` | ✅ `Check` / `Watch`（`zgrpc.health`） |
+
+## 快速开始
+
+```zig
+const zgrpc = @import("zgrpc");
+
+fn say(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator) anyerror!void {
+    _ = ctx;
+    _ = arena;
+    const msg = call.firstMessage() orelse {
+        call.setStatus(.invalid_argument, "缺少请求消息");
+        return;
+    };
+    try call.sendMessage(msg.payload); // 回显
+}
+
+// 路由表 → h2 连接
+var routes = [_]zgrpc.grpc.Route{.{ .path = "/echo.Echo/Say", .handler = say }};
+var server = zgrpc.grpc.Server{ .routes = &routes, .outer_ctx = &some_ctx };
+
+var conn = zgrpc.h2.Connection.init(allocator, reader, writer, .{});
+try conn.serve(server.context(), server.handler());
+```
+
+完整可运行例子见 `examples/grpc_echo_server.zig` / `examples/grpc_echo_client.zig`。
+
+## 代码生成（可选）
+
+`tools/proto_gen.zig` 把 proto3 的**子集**编译成 Zig 结构体 + `encode`/`decode` + 路由常量，
+生成结果直接跑在 `zgrpc.pb` 上（零依赖）：
+
+```bash
+zig build codegen        # 从 examples/echo.proto 生成 examples/echo.pb.zig
+# 或直接指定输入输出：
+zig run tools/proto_gen.zig -- my.proto my.pb.zig
+```
+
+支持：`syntax = "proto3"`、`package`、`message`（标量 / `string` / `bytes` / 枚举 / 嵌套 message / `repeated` 标量）、
+`enum`、`service`（含 `stream` 标记，生成路由常量）。
+
+**不支持**（遇到会报错并给行号，不静默忽略）：`import`、`map`、`oneof`、`optional`、`reserved`、
+`extend`、`option`、嵌套定义、`repeated` message/string。
+
+## 客户端本地读超时（含 Windows）
+
+`Client.Options.timeout_ms` 是**整次调用**的本地超时：等响应头、逐帧读响应体都受它约束。
+
+```zig
+var client = zgrpc.client.Client.init(gpa, &sr.interface, &sw.interface, .{
+    .authority = "127.0.0.1:50051",
+    .timeout_ms = 200,               // 200ms 内没读完就返回 error.Timeout
+});
+defer client.deinit();
+client.enableTimeout(stream, io);     // 启用本地读超时
+```
+
+**原理**：常驻一个读线程把 socket 数据读进缓冲区，主线程用 `io.waitTimeout`（futex / `WaitOnAddress`）带时限等待。
+
+之所以不用 `poll` / `SO_RCVTIMEO` / `CancelIoEx` / `shutdown`：Zig 0.17 在 Windows 上用 **AFD 句柄 + overlapped IO**（不是 Winsock SOCKET），这些手段要么编译期不可用，要么对 AFD 读**完全无效**；`CancelIoEx` 还会因 std 把 `STATUS_CANCELLED` 映射为 `unreachable` 而**直接崩进程**。六种方案逐一实测失败的过程见 [`docs/决策记录.md`](docs/决策记录.md)「增补十六 / 十七」。
+
+**使用约定（重要）**：启用本地超时的连接，**退出时不要 `stream.close(io)`**——读线程可能仍阻塞在底层读上，关掉 socket 会让它拿到 `CONNECTION_ABORTED` 触发 std panic。`Client.deinit()` 在读线程已自行结束时完整回收，否则只标记退出并留下一个有界结构（随进程退出归还）。超时后的连接**不要复用**（协议状态已不完整），重新建连即可。
+
+实测：服务端接受连接但永不应答时，`timeout_ms = 200` 的调用在 **206~210ms** 返回 `error.Timeout`。
+## 构建与验证
+
+```bash
+zig build test           # 50 个单元/端到端测试（含 9 个 h2 健壮性测试）
+zig build echo-server    # 监听 127.0.0.1:18051
+zig build echo-client    # 并发双流 + bidi + 健康检查 + grpc-timeout 超时 + -bin metadata + grpc-web-text + pb 结构化往返
+```
+
+实测（2026-11-12，Windows，Zig 0.17.1）：
+
+- `tools\regression.ps1` → 构建 PASS / tests 50（下限 50）/ 冒烟 PASS / **四向 Rust 对拍 PASS**，exit 0；
+- 真实 socket：unary **并发双流**均 `grpc-status=0`；**bidi** 3 条请求 → 3 条响应（`chat:a/b/c`）；
+  **健康检查** `grpc-status=0` + `ServingStatus=1`；**grpc-timeout 生效**：80ms 调睡 300ms 的方法 → `grpc-status=4`；
+  **`-bin` metadata 往返**：`x-token-bin` → 响应头 `x-echo-bin` + trailer `x-note`。
+- 单测含真实 h2 帧的 **405 / 415** 回归（`roundTripStatus` 走 preface → SETTINGS → HEADERS → DATA）。
+
+## 为什么不直接复用现成 Zig 库
+
+| 候选 | 星 | 最低 Zig | 依赖 | 结论 |
+|---|---|---|---|---|
+| `fanyang89/grpc-lite` | 7 | 0.17.0 | 13 个，含 nghttp2(C)、mbedtls、c-ares、zio、libxev | 独立项目可用，但非「零依赖 Zig 实现」 |
+| `ziglana/gRPC-zig` | 146 | 未声明 | spice + zlib(C) | 可用性未实测 |
+| `hendriknielaender/http2.zig` | 48 | 0.17.0 | boring(TLS)、turboapi-core | 只有 h2，无 gRPC |
+| `nevindra/nilo` | 13 | 0.17.0 | zio、pg.zig、tls.zig、libdeflate、llhttp、zstd | 整套框架 |
+| `zaxified/zig-libs` | 11 | 0.17.1 | 无 | 含 h2 协议但无 gRPC |
+
+Zig 标准库 `std.http` 只有 HTTP/1.1，**没有 h2、没有 hpack**（`lib/std/http` 下仅
+`Server.zig` / `Client.zig` / `HeadParser.zig` / `ChunkParser.zig`）。
+
+## 部署
+
+对外一律**反代终止 TLS**、后端 h2c；nginx / Caddy 样例、并发上限、超时语义、健康检查、上线自检清单见 [`docs/部署.md`](docs/部署.md)。
+
+## 文档
+
+- `docs/决策记录.md` —— 为什么独立成库、关键取舍与实测数据

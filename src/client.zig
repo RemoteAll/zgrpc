@@ -11,7 +11,8 @@ const h2 = @import("h2.zig");
 const hpack = @import("hpack.zig");
 const grpc = @import("grpc.zig");
 
-const TimeoutGuard = @import("timeout_guard.zig").TimeoutGuard;
+const AsyncReader = @import("async_reader.zig").AsyncReader;
+const clock = @import("clock.zig");
 
 pub const Request = struct {
     /// 完整方法路径，如 `/echo.Echo/Say`
@@ -108,11 +109,13 @@ pub const Client = struct {
     /// 下一个可用流 id（客户端发起的流必须是奇数）
     next_stream_id: u32 = 1,
     started: bool = false,
-    /// 本地超时所需（`enableTimeout` 提供）：watchdog 到点取消挂起的读
+    /// 本地超时所需（`enableTimeout` 提供）
     timeout_stream: ?std.Io.net.Stream = null,
     timeout_io: ?std.Io = null,
-    /// 本次调用期间看门狗（`callMany` / `clientStream` 内有效）
-    guard: ?TimeoutGuard = null,
+    /// 带超时的读源（启用后读都走它）
+    async_reader: ?*AsyncReader = null,
+    /// 本次调用的绝对截止时刻（单调时钟纳秒）；null = 不限
+    deadline_ns: ?i128 = null,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -131,53 +134,56 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         self.stopGuard();
+        if (self.async_reader) |ar| {
+            // 读线程可能仍阻塞在底层 socket 读上（Windows 无法打断），这里只让它尽快退出，
+            // 不 join 也不释放——泄漏一个有界结构，换取「绝不 hang 住、绝不 use-after-free」。
+            ar.stop.store(true, .release);
+            self.async_reader = null;
+        }
         self.decoder.deinit();
     }
 
-    /// 启用**本地读超时**：watchdog 到点取消挂起的读（见 `timeout_guard.zig`），
-    /// 对外统一表现为 `error.Timeout`。
+    /// 启用**本地读超时**：起一条常驻读线程，读在条件变量上带超时等待（见 `async_reader.zig`）。
     ///
     /// 为什么需要它：`grpc-timeout` 头只管服务端；服务端卡住（或对端根本不是 gRPC）时，
-    /// 客户端必须能自己退出，而不是无限阻塞在 read 上。
+    /// 客户端必须能自己退出。Windows 上 Zig 的底层读无法被打断，只能用户态做超时。
     pub fn enableTimeout(self: *Client, stream: std.Io.net.Stream, io: std.Io) void {
+        if (self.async_reader != null) return;
         self.timeout_stream = stream;
         self.timeout_io = io;
+        self.async_reader = AsyncReader.start(self.alloc, io, stream) catch |e| blk: {
+            std.debug.print("[zgrpc.client] 启动读线程失败（本地超时不可用）：{s}\\n", .{@errorName(e)});
+            break :blk null;
+        };
     }
 
     fn readExact(self: *Client, dest: []u8) !void {
+        if (self.async_reader) |ar| return ar.readExact(dest, self.deadline_ns);
         return self.reader.readSliceAll(dest);
     }
 
-    /// 按本次调用起看门狗（多流共用一条 socket，取**最短**的超时）。
+    /// 按本次调用计算绝对 deadline（多流共用一条 socket，取**最短**的超时）。
     fn startGuard(self: *Client, reqs: []const Request) void {
-        self.stopGuard();
-        const stream = self.timeout_stream orelse return;
-        const io = self.timeout_io orelse return;
+        self.deadline_ns = null;
+        if (self.async_reader == null) return;
         var ms: ?u32 = self.opts.timeout_ms;
         for (reqs) |r| {
             if (r.timeout_ms) |t| ms = if (ms) |m| @min(m, t) else t;
         }
         const v = ms orelse return;
         if (v == 0) return;
-        self.guard = TimeoutGuard.start(self.alloc, stream, io, @as(u64, v) * std.time.ns_per_ms) catch |e| blk: {
-            std.debug.print("[zgrpc.client] 启动超时看门狗失败：{s}\\n", .{@errorName(e)});
-            break :blk null;
-        };
+        self.deadline_ns = clock.monotonicNs() + @as(i128, v) * std.time.ns_per_ms;
     }
 
-    /// 收尾看门狗。
+    /// 清除 deadline（恢复无限等待）。
     fn stopGuard(self: *Client) void {
-        if (self.guard) |*g| {
-            g.cancel();
-            self.guard = null;
-        }
+        self.deadline_ns = null;
     }
 
-    /// 读失败时判断是不是「我们自己超时」；是则统一转成 `error.Timeout`。
+    /// 读失败时把本地的超时错误统一成 `error.Timeout`。
     fn mapReadError(self: *Client, err: anyerror) anyerror {
-        if (self.guard) |*g| {
-            if (g.fired()) return error.Timeout;
-        }
+        _ = self;
+        if (err == error.Timeout) return error.Timeout;
         return err;
     }
 
@@ -250,6 +256,11 @@ pub const Client = struct {
         var remaining = reqs.len;
         while (remaining > 0) {
             const hdr = readFrameHeader(self) catch |e| {
+                const mapped = self.mapReadError(e);
+                if (mapped == error.Timeout) {
+                    std.debug.print("[zgrpc.client] 读响应超时（本地 timeout 到期）\n", .{});
+                    return error.Timeout;
+                }
                 std.debug.print("[zgrpc.client] 读响应帧结束（{s}）\n", .{@errorName(e)});
                 return error.ConnectionClosed;
             };
@@ -388,6 +399,11 @@ pub const Client = struct {
 
         while (true) {
             const hdr = readFrameHeader(self) catch |e| {
+                const mapped = self.mapReadError(e);
+                if (mapped == error.Timeout) {
+                    std.debug.print("[zgrpc.client] 读响应超时（本地 timeout 到期）\n", .{});
+                    return error.Timeout;
+                }
                 std.debug.print("[zgrpc.client] 读响应帧结束（{s}）\n", .{@errorName(e)});
                 return error.ConnectionClosed;
             };

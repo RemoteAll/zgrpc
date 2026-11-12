@@ -1,75 +1,92 @@
-﻿# 鍙樻洿璁板綍
+# 变更记录
 
-鏈簱閬靛惊 [璇箟鍖栫増鏈琞(https://semver.org/lang/zh-CN/)銆傜増鏈彿鍦?`build.zig.zon`锛?
-杩愯鏃跺彲閫氳繃 `zgrpc.version` 鍙栧埌锛堜篃浼氫綔涓洪粯璁?`user-agent` 鐨勪竴閮ㄥ垎鍙戝嚭锛夈€?
+本库遵循 [语义化版本](https://semver.org/lang/zh-CN/)。版本号在 `build.zig.zon` 中维护，
+运行时可通过 `zgrpc.version` 取到（也会作为默认 `user-agent` 的一部分发出）。
 
-## 0.2.0 鈥?2026-11-12
+## 0.2.1 — 2026-11-13
 
-棣栦釜銆屽姛鑳藉畬鏁淬€佸彲涓婄嚎銆嶇殑鐗堟湰銆傜浉瀵?0.1.0锛堝彧鏈?hpack + h2 + grpc 鏈嶅姟绔鏋讹級锛?
-琛ラ綈浜嗕粠銆屽崗璁纭€с€嶅埌銆岀敓浜у彲鐢ㄦ€с€嶇殑鏁存潯閾捐矾銆?
+### 修复
+- **README 内容丢失**：0.2.0 发版提交误把 `README.md` 截成两行（6364 → 197 字节），本版按上一完整版本恢复，并清掉正文里残留的字面 `\n`。
+- **CHANGELOG 编码损坏**：同一次发版把本文件写成了乱码，本版重建。
 
-### 鏂板
+### 新增
+- **客户端本地读超时（全平台，含 Windows）**：`Client.Options.timeout_ms` 从「只管建连」升级为**整次调用**的时限，用 `client.enableTimeout(stream, io)` 启用。
+  - 实现为「常驻读线程 + `io.waitTimeout`（futex / `WaitOnAddress`）」：读线程持续把 socket 数据读入缓冲，主线程带时限等待数据到达或调用结束。
+  - 实测：服务端接受连接但永不应答时，`timeout_ms = 200` 的调用在 **206~210ms** 返回 `error.Timeout`。
+  - 之所以另起读线程：Zig 0.17 的 Windows socket 是 **AFD 句柄 + overlapped IO**（不是 Winsock SOCKET），`poll` / `WSAPoll` / `setsockopt(SO_RCVTIMEO)` / `CancelIoEx` / `stream.shutdown` 五种手段逐一实测均无效或不可用（`CancelIoEx` 还会因 std 把 `STATUS_CANCELLED` 映射为 `unreachable` 而崩进程）。失败过程与原因见 `docs/决策记录.md`「增补十六 / 十七」。
+  - 使用约定：启用本地超时的连接**退出时不要 `stream.close(io)`**（读线程可能仍阻塞在底层读上，关闭会让它拿到 `CONNECTION_ABORTED` 触发 std panic）；超时后的连接不要复用，重建即可。`Client.deinit()` 在读线程已自行结束时完整回收，否则只标记退出并留下一个有界结构（随进程退出归还）。
+- 新增 `examples/client_timeout_probe.zig`（`zig build timeout-probe`）与回归项「客户端本地读超时」，防止将来退化。
 
-**瀹㈡埛绔?*
-- `client.Client`锛氭彙鎵嬨€乣unary`銆乣callMany`锛堝悓杩炴帴骞跺彂澶氭祦锛夈€乣clientStream`锛堝鎴风娴?/ bidi锛?
-- `Options.content_type` 涓夋。锛氬師鐢?gRPC / `grpc-web` / `grpc-web-text`
-- 鑷姩 SETTINGS ACK銆丳ING ACK銆佺獥鍙ｅ洖琛ワ紱鍝嶅簲鎸?stream_id 褰掍綅
-- 鍙戦€?`grpc-timeout`銆乣user-agent`銆乣grpc-accept-encoding`銆佽嚜瀹氫箟 metadata
-- 鎸夎鑼?*鍚堟垚** Status/Status-Message锛堝绔潪 200 鎴栫己 `grpc-status` 鏃讹級
-- gRPC-Web 灏惧抚鐘舵€佽В鏋愶紱`DATA` 甯?`END_STREAM` 鏃舵纭叧娴?
+### 测试
+- 单元 / 端到端测试 **51** 个（原 50，新增超时相关断言）；回归脚本新增 timeout-probe 段。
 
-**gRPC 璇箟灞?*
-- 鏈嶅姟绔祦寮?/ 瀹㈡埛绔祦 / bidi锛坄Server.stream_routes` + `streamHooks`锛?
-- gRPC-Web锛坱railers 璧?body 灏惧抚锛変笌 **鏂囨湰妯″紡**锛坄application/grpc-web-text`锛宐ase64锛?
-- gzip 娑堟伅鍘嬬缉锛坄grpc-encoding: gzip`锛岄槇鍊?256 瀛楄妭锛屼笌 zzig / DH.RustBase 鍚屽彛寰勶級
-- `grpc-timeout`锛氳В鏋愪负鍗曡皟鏃堕挓鎴鏃跺埢锛岃秴鏃跺洖 `DEADLINE_EXCEEDED(4)`锛?
-  `Call.expired()` / `checkDeadline()` 渚涗笟鍔″煁妫€鏌ョ偣
-- **Custom-Metadata**锛歚-bin` base64锛堢紪鐮佹棤 padding銆佽В鐮佸弻瀹瑰繊銆侀€楀彿鍚堝苟閫愭瑙ｇ爜锛夛紝
+## 0.2.0 — 2026-11-12
+
+首个「功能完整、可上线」的版本。相对 0.1.0（只有 hpack + h2 + grpc 服务端骨架），
+补齐了从「协议正确性」到「生产可用性」的整条链路。
+
+### 新增
+
+**客户端**
+- `client.Client`：握手、`unary`、`callMany`（同连接并发多流）、`clientStream`（客户端流 / bidi）
+- `Options.content_type` 三档：原生 gRPC / `grpc-web` / `grpc-web-text`
+- 自动 SETTINGS ACK、PING ACK、窗口回补；响应按 stream_id 归位
+- 发送 `grpc-timeout`、`user-agent`、`grpc-accept-encoding`、自定义 metadata
+- 按规范**合成** Status/Status-Message（对端非 200 或缺 `grpc-status` 时）
+- gRPC-Web 尾帧状态解析；`DATA` 带 `END_STREAM` 时正确关闭
+
+**gRPC 语义层**
+- 服务端流式 / 客户端流 / bidi（`Server.stream_routes` + `streamHooks`）
+- gRPC-Web（trailers 走 body 尾帧）与**文本模式**（`application/grpc-web-text`，base64）
+- gzip 消息压缩（`grpc-encoding: gzip`，阈值 256 字节，与 zzig / DH.RustBase 同口径）
+- `grpc-timeout`：解析为单调时钟截止时刻，超时回 `DEADLINE_EXCEEDED(4)`；
+  `Call.expired()` / `checkDeadline()` 供业务埋检查点
+- **Custom-Metadata**：`-bin` base64（编码无 padding、解码双容忍、逗号合并逐段解码），
   `setHeader` / `setBinaryHeader` / `setTrailer` / `setBinaryTrailer`
-- `grpc-message` percent-encoding锛堝彂閫佺紪鐮?/ 瀹㈡埛绔В鐮?/ 闈炴硶 `%xx` 鍘熸牱淇濈暀锛?
-- 闈?POST 鈫?**HTTP 405**锛沜ontent-type 涓嶇 鈫?**HTTP 415**
-- 鍝嶅簲澶存寜 ABNF 椤哄簭锛歚[grpc-encoding] [grpc-accept-encoding] content-type` + 鑷畾涔?metadata
+- `grpc-message` percent-encoding（发送编码 / 客户端解码 / 非法 `%xx` 原样保留）
+- 非 POST 或 **HTTP 405**；content-type 不符 → **HTTP 415**
+- 响应头按 ABNF 顺序：`[grpc-encoding] [grpc-accept-encoding] content-type` + 自定义 metadata
 
-**鏍囧噯鏈嶅姟**
-- `health`锛歚grpc.health.v1.Health` 鐨?`Check` / `Watch`锛堥浂渚濊禆鎵嬪啓 protobuf锛?
+**标准服务**
+- `health`：`grpc.health.v1.Health` 的 `Check` / `Watch`（零依赖手写 protobuf）
 
 **protobuf**
-- `pb`锛歷arint / zigzag / tag / length-delimited / fixed / packed 璇诲啓鍘熻锛?
-  鏈煡瀛楁鑷姩璺宠繃銆佹埅鏂暟鎹繑鍥?`null` 涓?panic
-- `tools/proto_gen.zig`锛歱roto3 **瀛愰泦**浠ｇ爜鐢熸垚锛坄.proto` 鈫?Zig struct + `encode`/`decode` + 璺敱甯搁噺锛夛紱
-  瓒呰寖鍥磋娉曪紙`import` / `map` / `oneof` / `optional` / 宓屽瀹氫箟绛夛級**鎶ラ敊甯﹁鍙?*
+- `pb`：varint / zigzag / tag / length-delimited / fixed / packed 读写原语；
+  未知字段自动跳过、截断数据返回 `null` 而不 panic
+- `tools/proto_gen.zig`：proto3 **子集**代码生成（`.proto` → Zig struct + `encode`/`decode` + 路由常量）；
+  超范围语法（`import` / `map` / `oneof` / `optional` / 嵌套定义等）**报错带行号**
 
-**鍩虹璁炬柦**
-- `clock`锛氬崟璋冩椂閽熶笌鐫＄湢锛圸ig 0.17 宸茬Щ闄?`std.time.nanoTimestamp` / `std.Thread.sleep`锛?
-- `gzip`锛氭秷鎭帇缂?
+**基础设施**
+- `clock`：单调时钟与睡眠（Zig 0.17 已移除 `std.time.nanoTimestamp` / `std.Thread.sleep`）
+- `gzip`：消息压缩
 
-### 鍋ュ．鎬?/ 瀹夊叏
+### 健壮性 / 安全
 
-- h2 灞備笂闄愶細`max_concurrent_streams`锛堥粯璁?100锛夈€乣max_header_block`锛堥粯璁?64 KiB锛夈€?
-  `max_body`锛堥粯璁?4 MiB锛夛紝瓒呴檺鏈夋槑纭殑 `RST_STREAM` 鎷掔粷鐮?
-- **娴佺骇閿欒涓嶅啀鎷嗘暣鏉¤繛鎺?*锛歅ADDED 甯?pad 瓒婄晫銆佸绔?CONTINUATION 鍧囨寜娴佸鐞?
-  锛圧FC 9113 瑕佹眰锛夛紝骞舵湁澶氱粍鍥炲綊娴嬭瘯鍊煎畧
-- 瀹㈡埛绔祦鍙峰繀椤讳负姝ｅ鏁帮紱`RST_STREAM` 杞借嵎蹇呴』 4 瀛楄妭
-- 9 涓?h2 鍋ュ．鎬ф祴璇曪紙鍧忓墠瑷€ / 骞跺彂瓒呴檺 / header 瓒呴檺 / body 瓒呴檺 / 鎴柇甯?/ PADDED 瓒婄晫 /
-  瀛ょ珛 CONTINUATION / 鍋舵暟娴佸彿 / RST 闀垮害锛?
+- h2 层上限：`max_concurrent_streams`（默认 100）、`max_header_block`（默认 64 KiB）、
+  `max_body`（默认 4 MiB），超限有明确的 `RST_STREAM` 拒绝码
+- **流级错误不再拆整条连接**：PADDED 的 pad 越界、孤立 CONTINUATION 均按流处理
+  （RFC 9113 要求），并有多组回归测试值守
+- 客户端流号必须为正奇数；`RST_STREAM` 载荷必须 4 字节
+- 9 个 h2 健壮性测试（坏前言 / 并发超限 / header 超限 / body 超限 / 截断帧 / PADDED 越界 /
+  孤立 CONTINUATION / 偶数流号 / RST 长度）
 
-### 娴嬭瘯涓庨獙璇?
+### 测试与验证
 
-- 鍗曞厓 / 绔埌绔祴璇?**50** 涓紙`zig test src/zgrpc.zig`锛? 鐢熸垚浠ｇ爜娴嬭瘯 3 涓紙`zig build test`锛?
-- 涓€閿洖褰?`tools/regression.ps1`锛氭瀯寤?鈫?鍗曟祴 鈫?浠ｇ爜鐢熸垚 鈫?鐪熷疄 socket 鍐掔儫 鈫?**鍥涘悜 Rust 瀵规媿**
-  锛坺grpc client 鈫?Rust server锛汻ust client 鍘熺敓 / gRPC-Web / gRPC-Web-text 鈫?zgrpc server锛?
-- 鍐掔儫瑕嗙洊锛氬苟鍙戝弻娴併€乥idi 3/3銆佸仴搴锋鏌?SERVING銆乣grpc-timeout 鈫?4`銆乣-bin` metadata 寰€杩斻€?
-  grpc-web-text 寰€杩斻€乸b 缁撴瀯鍖栧線杩?
+- 单元 / 端到端测试 **50** 个（`zig test src/zgrpc.zig`）；生成代码测试 3 个（`zig build test`）
+- 一键回归 `tools/regression.ps1`：构建 → 单测 → 代码生成 → 真实 socket 冒烟 → **四向 Rust 对拍**
+  （zgrpc client → Rust server；Rust client 原生 / gRPC-Web / gRPC-Web-text → zgrpc server）
+- 冒烟覆盖：并发双流、bidi 3/3、健康检查 SERVING、`grpc-timeout → 4`、`-bin` metadata 往返、
+  grpc-web-text 往返、pb 结构化往返
 
-### 鏄庣‘涓嶅仛锛堥檮鍘熷洜锛?
+### 明确不做（附原因）
 
-| 椤?| 鍘熷洜 |
+| 项 | 原因 |
 |---|---|
-| 鍐呯疆 TLS | Zig 0.17 鏍囧噯搴撳彧鏈?tls **client** 涓旀棤 ALPN锛涙湇鍔＄ TLS 搴斾氦缁欏弽浠ｏ紙瑙?`docs/閮ㄧ讲.md`锛?|
-| `grpc-timeout` 寮哄埗涓柇 | Zig 鏃犳姠鍗犲紡鍙栨秷锛屽悓姝?handler 鏃犳硶琚閮ㄦ墦鏂紱鏀逛负涓氬姟鍩?`checkDeadline()` |
-| well-known types / 鏈嶅姟鍙嶅皠 | 闇€瑕佸畬鏁?protobuf descriptor 浣撶郴锛岃秴鍑轰紶杈撳眰瀹氫綅 |
-| 瀹屾暣鐨?`.proto` 鏀寔 | 鍚屼笂锛涘綋鍓嶈鐩栨湇鍔￠棿鑷帶涓ょ鐨勫父瑙佸啓娉?|
+| 内置 TLS | Zig 0.17 标准库只有 tls **client** 且无 ALPN；服务端 TLS 应交给反代（见 `docs/部署.md`） |
+| `grpc-timeout` 强制中断 | Zig 无抢占式取消，同步 handler 无法被外部打断；改为业务侧 `checkDeadline()` |
+| well-known types / 服务反射 | 需要完整 protobuf descriptor 体系，超出传输层定位 |
+| 完整的 `.proto` 支持 | 同上；当前覆盖服务间自控两端的常见写法 |
 
-## 0.1.0 鈥?鍒濆鐗堟湰
+## 0.1.0 — 初始版本
 
-- `hpack`锛圧PACK 7541锛岃В鐮佸惈 Huffman锛夈€乣h2`锛堟槑鏂?h2c锛夈€乣grpc` 璇箟灞傞鏋?
+- `hpack`（RFC 7541，解码含 Huffman）、`h2`（明文 h2c）、`grpc` 语义层骨架

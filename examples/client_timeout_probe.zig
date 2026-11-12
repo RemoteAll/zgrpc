@@ -49,14 +49,17 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("[timeout-probe] 连接失败：{s}\n", .{@errorName(e)});
         return e;
     };
-    defer stream.close(io);
+    // 注意：**不要**在启用本地超时后 close 这个 socket。
+    // 超时发生时读线程可能仍阻塞在底层 AFD 读上，close 会让它收到 CONNECTION_ABORTED，
+    // 而 Zig 0.17 的 netReadWindows 对该状态是 `unexpectedStatus`（直接 panic）。
+    // 进程退出时由操作系统回收句柄即可。
 
     var recv_buf: [4096]u8 = undefined;
     var send_buf: [4096]u8 = undefined;
     var sr = stream.reader(io, &recv_buf);
     var sw = stream.writer(io, &send_buf);
 
-    var client = zgrpc.client.Client.init(gpa, &sr.interface, &sw.interface, .{
+    var client = zgrpc.client.Client.init(std.heap.page_allocator, &sr.interface, &sw.interface, .{
         .authority = "127.0.0.1",
         .timeout_ms = timeout_ms,
     });
@@ -76,15 +79,7 @@ pub fn main(init: std.process.Init) !void {
         return error.Unexpected;
     } else |err| {
         if (err != error.Timeout) {
-            if (is_windows) {
-                // Windows：watchdog 的 shutdown 唤不醒 AFD 挂起读，只能等对端断开/内部超时。
-                // 这里如实标注为 SKIP，而不是假装通过。
-                std.debug.print(
-                    "[timeout-probe] SKIP（Windows 无可用原生读超时）：{s}，耗时 {d}ms\n",
-                    .{ @errorName(err), elapsed_ms },
-                );
-                return;
-            }
+
             std.debug.print("[timeout-probe] 失败：期望 error.Timeout，实际 {s}（{d}ms）\n", .{
                 @errorName(err), elapsed_ms,
             });

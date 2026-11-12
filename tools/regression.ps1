@@ -116,6 +116,26 @@ if ($genCode -ne 0) {
     }
 }
 
+# ---------- 2.6 客户端本地读超时：服务端只接连接、永不回包 ----------
+if ($SkipSmoke) {
+    Write-Report "[回归] SKIP：客户端超时探针（-SkipSmoke）"
+} else {
+    $probeExe = Join-Path $root 'zig-out\bin\timeout-probe.exe'
+    if (-not (Test-Path $probeExe)) {
+        Write-Report "[回归] SKIP：客户端超时探针（缺 timeout-probe.exe，先跑一次不带 -SkipBuild 的回归）"
+    } else {
+        $po = & $probeExe 2>&1 | Out-String
+        $pc = $LASTEXITCODE
+        Add-Content -Path $report -Value "[回归] timeout-probe：$po" -Encoding UTF8
+        if ($pc -eq 0) {
+            Write-Report "[回归] PASS：客户端本地读超时（服务端不响应时按设定时间退出）"
+        } else {
+            Write-Report "[回归] FAIL：客户端本地读超时 exit=$pc（详见 $report）"
+            $failed += 'timeout-probe'
+        }
+    }
+}
+
 # ---------- 3. 冒烟：真实 socket 并发双流 ----------
 if ($SkipSmoke) {
     Write-Report "[回归] SKIP：冒烟（-SkipSmoke）"
