@@ -16,7 +16,22 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # 测试数下限：只能抬高，不能降低（降低必须在 docs/决策记录.md 写明依据）
-$minTests = 61
+$minTests = 64
+
+# 随机空闲端口：Windows 上 `Stop-Process -Force`（= TerminateProcess）会让监听 socket
+# 变成 zombie LISTEN（netstat 里 OwningProcess=0），持续数十秒且无法 kill。
+# 固定在 18051/18052 会让下一次回归全部 SKIP，所以每段用独立随机端口。
+function Get-FreePort {
+    for ($i = 0; $i -lt 40; $i++) {
+        $p = Get-Random -Minimum 18200 -Maximum 18999
+        if (-not (Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue)) { return $p }
+    }
+    return (Get-Random -Minimum 18200 -Maximum 18999)
+}
+$smokePort = Get-FreePort
+$reflPort = Get-FreePort
+$rustPort = Get-FreePort
+$zigSrvPort = Get-FreePort
 
 $reportDir = Join-Path $root 'artifacts\regression'
 New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
@@ -165,15 +180,15 @@ if ($SkipSmoke) {
     if (-not (Test-Path $serverExe) -or -not (Test-Path $clientExe)) {
         Write-Report "[回归] SKIP：冒烟（缺少 echo-server/echo-client 产物，先跑一次不带 -SkipBuild 的回归）"
     } else {
-        $ports = Get-NetTCPConnection -LocalPort 18051 -ErrorAction SilentlyContinue
+        $ports = Get-NetTCPConnection -LocalPort $smokePort -State Listen -ErrorAction SilentlyContinue
         if ($ports) {
-            Write-Report "[回归] SKIP：冒烟（18051 已被占用，pid=$(($ports | Select-Object -First 1).OwningProcess)）"
+            Write-Report "[回归] SKIP：冒烟（$smokePort 已被占用，pid=$(($ports | Select-Object -First 1).OwningProcess)）"
         } else {
             $serverOut = "$reportDir\server.log"
-            $server = Start-Process -FilePath $serverExe -RedirectStandardError $serverOut -PassThru -WindowStyle Hidden
+            $server = Start-Process -FilePath $serverExe -ArgumentList @('--port', $smokePort.ToString()) -RedirectStandardError $serverOut -PassThru -WindowStyle Hidden
             Start-Sleep -Milliseconds 700
             try {
-                $clientOut = & $clientExe 2>&1 | Out-String
+                $clientOut = & $clientExe $smokePort 2>&1 | Out-String
                 $clientCode = $LASTEXITCODE
                 Add-Content -Path $report -Value "[回归] 客户端输出：$clientOut" -Encoding UTF8
                 if ($clientCode -eq 0) {
@@ -185,6 +200,48 @@ if ($SkipSmoke) {
             } finally {
                 if ($server -and -not $server.HasExited) { Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue }
             }
+        }
+    }
+}
+
+# ---------- 3.5 服务反射：grpcurl 无 .proto 自省 + 直接调用 ----------
+$grpcurlExe = Join-Path $env:USERPROFILE 'go\bin\grpcurl.exe'
+if ($SkipSmoke) {
+    Write-Report "[回归] SKIP：反射（-SkipSmoke）"
+} elseif (-not (Test-Path $grpcurlExe)) {
+    Write-Report "[回归] SKIP：反射（未找到 grpcurl；go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest）"
+} elseif (-not (Test-Path (Join-Path $root 'zig-out\bin\echo-server.exe'))) {
+    Write-Report "[回归] SKIP：反射（缺少 echo-server 产物）"
+} else {
+    $ports = Get-NetTCPConnection -LocalPort $reflPort -State Listen -ErrorAction SilentlyContinue
+    if ($ports) {
+        Write-Report "[回归] SKIP：反射（$reflPort 已被占用）"
+    } else {
+        $srv = Start-Process -FilePath (Join-Path $root 'zig-out\bin\echo-server.exe') -ArgumentList @('--port', $reflPort.ToString()) -RedirectStandardError "$reportDir\refl-server.log" -PassThru -WindowStyle Hidden
+        Start-Sleep -Milliseconds 700
+        try {
+            $reflOk = $true
+            $listOut = & $grpcurlExe -plaintext "127.0.0.1:$reflPort" list 2>&1 | Out-String
+            Add-Content -Path $report -Value "[回归] grpcurl list：$listOut" -Encoding UTF8
+            if ($listOut -notmatch 'echo\.Echo') { $reflOk = $false; Write-Report "[回归] FAIL：反射 list 未列出 echo.Echo" }
+
+            $descOut = & $grpcurlExe -plaintext "127.0.0.1:$reflPort" describe echo.Echo 2>&1 | Out-String
+            Add-Content -Path $report -Value "[回归] grpcurl describe：$descOut" -Encoding UTF8
+            if ($descOut -notmatch 'rpc Say') { $reflOk = $false; Write-Report "[回归] FAIL：反射 describe 未解出 rpc Say" }
+
+            $msgOut = & $grpcurlExe -plaintext "127.0.0.1:$reflPort" describe echo.Summary 2>&1 | Out-String
+            Add-Content -Path $report -Value "[回归] grpcurl describe Summary：$msgOut" -Encoding UTF8
+            if ($msgOut -notmatch 'echo\.Status') { $reflOk = $false; Write-Report "[回归] FAIL：反射 describe 未正确解出 enum 字段类型 echo.Status" }
+
+            # 注意：PowerShell 5.1 调用原生 exe 时会吞掉内层双引号，JSON 必须走 stdin（-d @）
+            $callOut = '{"value":3,"tag":"reflection-works"}' | & $grpcurlExe -plaintext -d '@' "127.0.0.1:$reflPort" echo.Echo/Say 2>&1 | Out-String
+            Add-Content -Path $report -Value "[回归] grpcurl Say：$callOut" -Encoding UTF8
+            if ($callOut -notmatch 'reflection-works') { $reflOk = $false; Write-Report "[回归] FAIL：反射后无 .proto 调用 Say 失败" }
+
+            if ($reflOk) { Write-Report "[回归] PASS：反射（list + describe service/message + 无 .proto 调用）" }
+            else { $failed += 'reflection' }
+        } finally {
+            if ($srv -and -not $srv.HasExited) { Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue }
         }
     }
 }
@@ -202,14 +259,14 @@ if ($SkipInterop) {
         Write-Report "[回归] SKIP：互操作对拍（缺 zig 示例产物）"
     } else {
         # (a) Rust 服务端 -> zgrpc 客户端
-        $p18061 = Get-NetTCPConnection -LocalPort 18061 -ErrorAction SilentlyContinue
+        $p18061 = Get-NetTCPConnection -LocalPort $rustPort -State Listen -ErrorAction SilentlyContinue
         if ($p18061) {
-            Write-Report "[回归] SKIP：对拍(a)（18061 被占用）"
+            Write-Report "[回归] SKIP：对拍(a)（$rustPort 被占用）"
         } else {
-            $rs = Start-Process -FilePath $interopExe -ArgumentList @('server', '--port', '18061') -RedirectStandardError "$reportDir\rust-server.log" -RedirectStandardOutput "$reportDir\rust-server.out" -PassThru -WindowStyle Hidden
+            $rs = Start-Process -FilePath $interopExe -ArgumentList @('server', '--port', $rustPort.ToString()) -RedirectStandardError "$reportDir\rust-server.log" -RedirectStandardOutput "$reportDir\rust-server.out" -PassThru -WindowStyle Hidden
             Start-Sleep -Milliseconds 900
             try {
-                $zo = & $clientExe2 18061 2>&1 | Out-String
+                $zo = & $clientExe2 $rustPort 2>&1 | Out-String
                 $zc = $LASTEXITCODE
                 Add-Content -Path $report -Value "[回归] zgrpc client -> Rust server：$zo" -Encoding UTF8
                 if ($zc -eq 0) {
@@ -224,14 +281,14 @@ if ($SkipInterop) {
         }
 
         # (b)(c) zgrpc 服务端 -> Rust 客户端（原生 + gRPC-Web）
-        $p18051 = Get-NetTCPConnection -LocalPort 18051 -ErrorAction SilentlyContinue
+        $p18051 = Get-NetTCPConnection -LocalPort $zigSrvPort -State Listen -ErrorAction SilentlyContinue
         if ($p18051) {
-            Write-Report "[回归] SKIP：对拍(b)(c)（18051 被占用，pid=$(($p18051 | Select-Object -First 1).OwningProcess)）"
+            Write-Report "[回归] SKIP：对拍(b)(c)（$zigSrvPort 被占用，pid=$(($p18051 | Select-Object -First 1).OwningProcess)）"
         } else {
-            $zs = Start-Process -FilePath $serverExe2 -RedirectStandardError "$reportDir\zig-server.log" -PassThru -WindowStyle Hidden
+            $zs = Start-Process -FilePath $serverExe2 -ArgumentList @('--port', $zigSrvPort.ToString()) -RedirectStandardError "$reportDir\zig-server.log" -PassThru -WindowStyle Hidden
             Start-Sleep -Milliseconds 700
             try {
-                $ro = & $interopExe client --port 18051 2>&1 | Out-String
+                $ro = & $interopExe client --port $zigSrvPort 2>&1 | Out-String
                 $rc = $LASTEXITCODE
                 Add-Content -Path $report -Value "[回归] Rust client(原生) -> zgrpc server：$ro" -Encoding UTF8
                 if ($rc -eq 0) {
@@ -241,7 +298,7 @@ if ($SkipInterop) {
                     $failed += 'interop-rust-native'
                 }
 
-                $rwo = & $interopExe client --port 18051 --web 2>&1 | Out-String
+                $rwo = & $interopExe client --port $zigSrvPort --web 2>&1 | Out-String
                 $rwc = $LASTEXITCODE
                 Add-Content -Path $report -Value "[回归] Rust client(gRPC-Web) -> zgrpc server：$rwo" -Encoding UTF8
                 if ($rwc -eq 0) {
@@ -251,7 +308,7 @@ if ($SkipInterop) {
                     $failed += 'interop-rust-web'
                 }
 
-                $rto = & $interopExe client --port 18051 --web-text 2>&1 | Out-String
+                $rto = & $interopExe client --port $zigSrvPort --web-text 2>&1 | Out-String
                 $rtc = $LASTEXITCODE
                 Add-Content -Path $report -Value "[回归] Rust client(gRPC-Web-text) -> zgrpc server：$rto" -Encoding UTF8
                 if ($rtc -eq 0) {

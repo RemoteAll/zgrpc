@@ -14,6 +14,8 @@
 | `grpc` | gRPC 语义层 | 消息分帧、状态码、路由、unary / 服务端流式 / **客户端流与 bidi**（`server.stream_routes` + `streamHooks`）、**gRPC-Web**、**gzip 消息压缩**、**`grpc-timeout` 截止时间**、`grpc-message` 的 percent-encoding、非 POST→**405** / content-type 不符→**415**、**Custom-Metadata（含 `-bin` base64）**、**gRPC-Web 文本模式（`grpc-web-text`，base64）** |
 | `client` | gRPC 客户端（h2c） | 握手、`unary`、**`callMany`（同一连接并发多条流）**、`clientStream`（客户端流/bidi），按 stream_id 归位、回补窗口；发 `grpc-timeout` / `user-agent` / 自定义 metadata，按规范**合成** Status 并解 percent-encoding |
 | `health` | 标准 `grpc.health.v1.Health` | `Check`（unary）/ `Watch`（流式，同步模型下默认推一次）；最简 protobuf 手写编解码，零依赖 |
+| `proto` / `descriptor` | proto3 子集语法树 → `google.protobuf.FileDescriptorProto` | 代码生成与服务反射**共用一份解析器**；descriptor 编码严格按官方字段号，enum/message 字段类型可区分 |
+| `reflection` | 标准 `grpc.reflection.v1`（并注册 `v1alpha` 兼容） | grpcurl / ghz **无需 `.proto`** 即可 `list` / `describe` / 直接调用；数据用内部 arena，`deinit` 一次释放 |
 | `pb` | 最小 protobuf 运行时 | varint/zigzag/tag/length-delimited/fixed/packed 编解码；**不做 .proto 代码生成**，手写 message 约 10 行 |
 | `gzip` / `clock` | 压缩与单调时钟 | `gzip` 走 `std.compress.flate`；`clock` 直问 OS（`QueryPerformanceCounter` / `CLOCK_MONOTONIC`），服务 `grpc-timeout` |
 
@@ -21,7 +23,7 @@
 handler 并行执行（业务仍同步串行，串行只是执行顺序，**不会因此拒绝并发流**）、
 客户端流/bidi 背压（gRPC-Web 规范本身也不支持 bidi）、`grpc-timeout` 的**强制中断**（本层只判超时并回 `DEADLINE_EXCEEDED`，
 不会打断已阻塞在业务里的调用）、
-well-known types / `Any` / 反射（`.proto` 子集代码生成见下）。
+well-known types / `Any`（`.proto` 子集代码生成与**服务反射**已支持，见下）。
 
 ### 对照官方规范的符合性
 
@@ -87,6 +89,40 @@ zig run tools/proto_gen.zig -- my.proto my.pb.zig
 
 **不支持**（遇到会报错并给行号，不静默忽略）：`import`、`map`、`oneof`、`optional`、`reserved`、
 `extend`、`option`、嵌套定义、`repeated` message/string。
+
+## 服务反射（`grpcurl` 无需 `.proto`）
+
+实现标准 `grpc.reflection.v1.ServerReflection`（同时注册 `v1alpha` 兼容老工具），
+让 `grpcurl` / `ghz` / Postman 等能**自省**服务定义并直接发请求：
+
+```zig
+// 1. 起服务时登记 .proto 源码（嵌入式，运行时不需要 .proto 文件）
+var refl = try zgrpc.reflection.Service.init(allocator, &.{
+    .{ .file_name = "echo.proto", .source = @embedFile("echo.proto") },
+});
+defer refl.deinit();
+
+// 2. 两条路由（v1 + v1alpha）；ctx 走 per-route，与业务路由共存互不干扰
+var stream_routes = [_]zgrpc.grpc.StreamRoute{
+    .{ .path = "/echo.Echo/Chat", .on_message = chatHandler },
+    refl.streamRoute(),
+    refl.streamRouteV1Alpha(),
+};
+```
+
+```bash
+grpcurl -plaintext 127.0.0.1:18051 list                  # echo.Echo
+grpcurl -plaintext 127.0.0.1:18051 describe echo.Echo     # 服务 + 方法（含 stream 标记）
+grpcurl -plaintext 127.0.0.1:18051 describe echo.Summary  # 消息（含 enum / 嵌套 / repeated）
+grpcurl -plaintext -d '{"value":3,"tag":"hi"}' 127.0.0.1:18051 echo.Echo/Say
+```
+
+要点：
+- **数据一次解析、长期持有**：初始化时把每条 `.proto` 解析成 `FileDescriptorProto` 并存下
+  `file_name` / 符号索引 / 服务名，请求期只做查表，不重复解析。
+- **`v1` 与 `v1alpha` 双注册**：新版工具走 `v1`，老版 `grpcurl`/`ghz` 走 `v1alpha`，协议载荷相同。
+- **enum 字段不能当 message 编码**：`FieldDescriptorProto.type` 必须与 `type_name` 指向的定义一致
+  （enum→14、message→11），写错会让 `protoreflect` 报 `resolved "X", but it is not an message`。
 
 ## 客户端本地读超时（内核层，含 Windows）
 

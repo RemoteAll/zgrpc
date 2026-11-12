@@ -8,6 +8,20 @@ const zgrpc = @import("zgrpc");
 
 const port: u16 = 18051;
 
+/// 端口可被 `--port N` 覆盖：回归脚本用不同端口隔离各段，
+/// 避免被 `Stop-Process -Force` 杀掉的旧实例留下的僵尸 LISTEN socket 干扰。
+fn parsePort(init: std.process.Init) u16 {
+    var it = std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa) catch return port;
+    defer it.deinit();
+    _ = it.skip(); // 程序名
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--port")) {
+            if (it.next()) |v| return std.fmt.parseInt(u16, v, 10) catch port;
+        }
+    }
+    return port;
+}
+
 /// 方法 `/echo.Echo/Say`：把请求消息原样回显。
 fn sayHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator) anyerror!void {
     _ = ctx;
@@ -82,7 +96,9 @@ fn bumpHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator
     try call.sendMessage(w.bytes());
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const listen_port = parsePort(init);
+
     // 多线程服务端：Io 必须用线程安全分配器构造（page_allocator）
     const allocator = std.heap.page_allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});
@@ -100,8 +116,19 @@ pub fn main() !void {
         health_routes[0],
         health_routes[1],
     };
+    // 服务反射：grpcurl / ghz 无需 .proto 即可自省（v1 + v1alpha 双注册）
+    var refl = zgrpc.reflection.Service.init(allocator, &.{
+        .{ .file_name = "echo.proto", .source = @embedFile("echo.proto") },
+    }) catch |e| {
+        std.debug.print("[zgrpc] 反射初始化失败（服务仍可用）：{s}\n", .{@errorName(e)});
+        return e;
+    };
+    defer refl.deinit();
+
     var stream_routes = [_]zgrpc.grpc.StreamRoute{
         .{ .path = "/echo.Echo/Chat", .on_message = chatHandler },
+        refl.streamRoute(),
+        refl.streamRouteV1Alpha(),
     };
     var dummy: u8 = 0;
     var server = zgrpc.grpc.Server{
@@ -110,12 +137,12 @@ pub fn main() !void {
         .outer_ctx = &dummy,
     };
 
-    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", listen_port);
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
     std.debug.print("[zgrpc] gRPC(h2c) 监听 127.0.0.1:{d}，方法 /echo.Echo/Say（unary）、/echo.Echo/Chat（bidi）、" ++
-        "/echo.Echo/Slow（超时验证）、/grpc.health.v1.Health/{{Check,Watch}}\n", .{port});
+        "/echo.Echo/Slow（超时验证）、/grpc.health.v1.Health/{{Check,Watch}}\n", .{listen_port});
 
     while (true) {
         const stream = listener.accept(io) catch |e| {

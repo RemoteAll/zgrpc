@@ -3,6 +3,31 @@
 本库遵循 [语义化版本](https://semver.org/lang/zh-CN/)。版本号在 `build.zig.zon` 中维护，
 运行时可通过 `zgrpc.version` 取到（也会作为默认 `user-agent` 的一部分发出）。
 
+## 未发布
+
+### 新增
+- **服务反射（`grpc.reflection.v1` + `v1alpha`）**：`zgrpc.reflection.Service` 让 `grpcurl` / `ghz` / Postman
+  **不需要 `.proto`** 就能 `list` / `describe` / 直接调用。登记时给 `.proto` 源码即可（示例用 `@embedFile`）。
+  - `src/proto.zig`：proto3 子集解析器（从 `tools/proto_gen.zig` 下沉，代码生成与反射共用一份）。
+  - `src/descriptor.zig`：语法树 → `google.protobuf.FileDescriptorProto`，字段号严格按官方定义。
+  - `src/reflection.zig`：`ServerReflectionInfo` 双向流；按 `file_by_filename` / `file_containing_symbol` /
+    `list_services` 三个请求分支响应；`v1` 与 `v1alpha` 双注册（载荷相同）。
+  - 数据用内部 `ArenaAllocator` 长期持有，`deinit` 一次释放，请求期只查表不重复解析。
+- `grpc.StreamRoute.ctx` 的 per-route 用法正式启用：反射与业务路由可共存，互不抢占 `Server.outer_ctx`。
+- `echo-server` 支持 `--port N`（回归脚本用它做端口隔离）。
+
+### 修复
+- **`FieldDescriptorProto.type` 与 `type_name` 不一致**：enum 字段曾被一律编成 `TYPE_MESSAGE(11)`，
+  导致 `protoreflect` 报 `resolved "echo.Status", but it is not an message`，`describe` / 调用全部失败。
+  现在按本文件 enum 表判定：enum→`14`、message→`11`。
+
+### 回归
+- 新增「反射」段：`grpcurl list` + `describe`（服务与消息）+ 无 `.proto` 调用 `Say`，实测通过。
+- 各段改用**随机空闲端口**：Windows 上 `Stop-Process -Force`（= `TerminateProcess`）会让监听 socket
+  变成 zombie `LISTEN`（`netstat` 里 `OwningProcess=0`），固定端口会让下一次回归全部 SKIP。
+- `Get-NetTCPConnection` 判定补 `-State Listen`，不再把 `TIME_WAIT` 误判为端口占用。
+- 测试下限 61 → **64**（现 64/64）。
+
 ## 0.2.1 — 2026-11-13
 
 ### 修复
