@@ -188,6 +188,68 @@ pub const Writer = struct {
         for (values) |v| try inner.writeVarint(@bitCast(@as(i64, v)));
         try self.message(number, inner.bytes());
     }
+
+    /// packed repeated（**任意宽度**整数或 bool）：代码生成用这个，
+    /// 免得 `repeated int64` / `repeated uint32` / `repeated bool` 各自缺一个重载。
+    pub fn packedVarint(self: *Writer, number: u32, values: anytype) !void {
+        if (values.len == 0) return; // proto3：空 repeated 不写
+        var inner = Writer.init(self.alloc);
+        const Elem = std.meta.Elem(@TypeOf(values));
+        switch (@typeInfo(Elem)) {
+            .bool => for (values) |v| try inner.writeVarint(@intFromBool(v)),
+            .int => |info| {
+                if (info.signedness == .signed) {
+                    for (values) |v| try inner.writeVarint(@bitCast(@as(i64, v)));
+                } else {
+                    for (values) |v| try inner.writeVarint(@as(u64, v));
+                }
+            },
+            else => @compileError("packedVarint 只支持整数或 bool 切片"),
+        }
+        try self.message(number, inner.bytes());
+    }
+
+    /// packed repeated（zigzag：`sint32` / `sint64`）。
+    pub fn packedSint(self: *Writer, number: u32, values: anytype) !void {
+        if (values.len == 0) return;
+        var inner = Writer.init(self.alloc);
+        for (values) |v| try inner.writeVarint(zigzagEncode(@as(i64, v)));
+        try self.message(number, inner.bytes());
+    }
+
+    /// packed repeated（4 字节定长：`float` / `fixed32` / `sfixed32`）。
+    pub fn packedFixed32(self: *Writer, number: u32, values: anytype) !void {
+        if (values.len == 0) return;
+        var inner = Writer.init(self.alloc);
+        for (values) |v| {
+            const bits: u32 = switch (@typeInfo(std.meta.Elem(@TypeOf(values)))) {
+                .float => @bitCast(@as(f32, @floatCast(v))),
+                .int => @bitCast(@as(i32, @intCast(v))),
+                else => @compileError("packedFixed32 只支持 float 或整数切片"),
+            };
+            var b: [4]u8 = undefined;
+            std.mem.writeInt(u32, &b, bits, .little);
+            try inner.rawSlice(&b);
+        }
+        try self.message(number, inner.bytes());
+    }
+
+    /// packed repeated（8 字节定长：`double` / `fixed64` / `sfixed64`）。
+    pub fn packedFixed64(self: *Writer, number: u32, values: anytype) !void {
+        if (values.len == 0) return;
+        var inner = Writer.init(self.alloc);
+        for (values) |v| {
+            const bits: u64 = switch (@typeInfo(std.meta.Elem(@TypeOf(values)))) {
+                .float => @bitCast(@as(f64, @floatCast(v))),
+                .int => @bitCast(@as(i64, @intCast(v))),
+                else => @compileError("packedFixed64 只支持 float 或整数切片"),
+            };
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, bits, .little);
+            try inner.rawSlice(&b);
+        }
+        try self.message(number, inner.bytes());
+    }
 };
 
 /// zigzag 编码（`sint32` / `sint64`）。
@@ -287,6 +349,24 @@ pub const Field = struct {
         const raw = try self.packedVarints(alloc);
         for (raw) |*v| v.* = @bitCast(zigzagDecode(v.*)); // 原地还原（u64 与 i64 同宽）
         return raw;
+    }
+
+    /// 解析 packed repeated 的 4 字节定长载荷（`float` / `fixed32` / `sfixed32`）。
+    pub fn packedFixed32s(self: Field, alloc: std.mem.Allocator) ![]u32 {
+        if (self.data.len % 4 != 0) return error.InvalidVarint; // 长度不是 4 的倍数 → 数据损坏
+        const n = self.data.len / 4;
+        const out = try alloc.alloc(u32, n);
+        for (out, 0..) |*slot, i| slot.* = std.mem.readInt(u32, self.data[i * 4 ..][0..4], .little);
+        return out;
+    }
+
+    /// 解析 packed repeated 的 8 字节定长载荷（`double` / `fixed64` / `sfixed64`）。
+    pub fn packedFixed64s(self: Field, alloc: std.mem.Allocator) ![]u64 {
+        if (self.data.len % 8 != 0) return error.InvalidVarint;
+        const n = self.data.len / 8;
+        const out = try alloc.alloc(u64, n);
+        for (out, 0..) |*slot, i| slot.* = std.mem.readInt(u64, self.data[i * 8 ..][0..8], .little);
+        return out;
     }
 };
 

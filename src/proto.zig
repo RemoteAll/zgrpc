@@ -7,14 +7,15 @@
 //! ## 支持的语法
 //!
 //! - `syntax = "proto3";`、`package a.b.c;`
-//! - `message Name { ... }`：标量、`string`/`bytes`、`enum` 字段、同文件 message 字段、`repeated` 标量
+//! - `message Name { ... }`：标量、`string`/`bytes`、`enum` 字段、同文件 message 字段，
+//!   `repeated` 支持**任意元素**（标量 / `string` / `bytes` / enum / message）
 //! - `enum Name { A = 0; ... }`
 //! - `service Name { rpc M(Req) returns (Res); rpc S(stream Req) returns (stream Res); }`
 //!
 //! ## 明确不支持（报错并指出行号，不静默忽略）
 //!
 //! `import`、`map<...>`、`oneof`、`optional`、`reserved`、`extend`、`group`、
-//! 嵌套 `message`/`enum` 定义、`repeated` 非标量（含 message / string / bytes）。
+//! 嵌套 `message`/`enum` 定义。
 
 const std = @import("std");
 
@@ -278,19 +279,6 @@ pub const Parser = struct {
             else
                 .{ .named = type_name };
 
-            if (repeated) {
-                switch (ftype) {
-                    .scalar => |s| if (s == .string or s == .bytes) {
-                        std.debug.print("[zgrpc.proto] 第 {d} 行：repeated string/bytes 暂不支持\n", .{self.tok.line});
-                        return error.Unsupported;
-                    },
-                    .named => {
-                        std.debug.print("[zgrpc.proto] 第 {d} 行：repeated message/enum 暂不支持\n", .{self.tok.line});
-                        return error.Unsupported;
-                    },
-                }
-            }
-
             try fields.append(self.a, .{ .name = fname, .number = number, .ftype = ftype, .repeated = repeated });
         }
         try self.expectSym("}");
@@ -443,4 +431,31 @@ test "proto：不支持的语法报错而不静默忽略" {
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { map<string,int32> m = 1; }\n"));
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { oneof k { int32 a = 1; } }\n"));
     try testing.expectError(error.Unsupported, parse(arena.allocator(), "syntax = \"proto3\";\nmessage M { message N { int32 a = 1; } }\n"));
+}
+
+test "proto：repeated 支持 string / bytes / enum / message 元素" {
+    const src =
+        \\syntax = "proto3";
+        \\package demo;
+        \\enum Kind { A = 0; }
+        \\message Item { int32 id = 1; }
+        \\message Bag {
+        \\  repeated string tags = 1;
+        \\  repeated bytes blobs = 2;
+        \\  repeated Item items = 3;
+        \\  repeated Kind kinds = 4;
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try parse(arena.allocator(), src);
+
+    const fields = p.messages[1].fields;
+    try testing.expectEqual(@as(usize, 4), fields.len);
+    for (fields) |f| try testing.expect(f.repeated);
+
+    try testing.expectEqual(Scalar.string, fields[0].ftype.scalar);
+    try testing.expectEqual(Scalar.bytes, fields[1].ftype.scalar);
+    try testing.expectEqualStrings("Item", fields[2].ftype.named);
+    try testing.expectEqualStrings("Kind", fields[3].ftype.named);
 }

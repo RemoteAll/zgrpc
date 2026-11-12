@@ -70,46 +70,61 @@ pub const Summary = struct {
     counters: []const u64 = &.{},
     done: bool = false,
     ratio: f64 = 0,
+    tags: []const []const u8 = &.{},
+    items: []const BumpResponse = &.{},
+    states: []const Status = &.{},
 
     pub fn encode(self: @This(), a: std.mem.Allocator) ![]const u8 {
         var w = pb.Writer.init(a);
         if (self.note.len > 0) try w.string(1, self.note);
         if (self.status) |v| try w.enumField(2, v) else try w.enumField(2, Status.UNKNOWN);
         if (self.last) |v| try w.message(3, try v.encode(a));
-        if (self.samples.len > 0) {
-            try w.packedInt32(4, self.samples);
-        }
-        if (self.counters.len > 0) {
-            try w.packedUint64(5, self.counters);
-        }
+        try w.packedVarint(4, self.samples);
+        try w.packedVarint(5, self.counters);
         if (self.done) try w.boolField(6, true);
         if (self.ratio != 0) try w.doubleField(7, self.ratio);
+        for (self.tags) |v| try w.bytesField(8, v);
+        for (self.items) |v| try w.message(9, try v.encode(a));
+        for (self.states) |v| try w.enumField(10, v);
         return w.bytes();
     }
 
     pub fn decode(bytes: []const u8, a: std.mem.Allocator) !@This() {
         var self: @This() = .{};
+        var lst_samples: std.ArrayListUnmanaged(i32) = .empty;
+        var lst_counters: std.ArrayListUnmanaged(u64) = .empty;
+        var lst_tags: std.ArrayListUnmanaged([]const u8) = .empty;
+        var lst_items: std.ArrayListUnmanaged(BumpResponse) = .empty;
+        var lst_states: std.ArrayListUnmanaged(Status) = .empty;
         var r = pb.Reader{ .data = bytes };
         while (r.next()) |f| switch (f.number) {
             1 => self.note = f.asBytes(),
             2 => self.status = f.asEnum(Status),
             3 => self.last = try BumpResponse.decode(f.asBytes(), a),
-            4 => {
-                const vals = try f.packedVarints(a);
-                var tmp: std.ArrayListUnmanaged(i32) = .empty;
-                for (vals) |v| try tmp.append(a, @truncate(@as(i64, @bitCast(v))));
-                self.samples = tmp.items;
+            4 => if (f.wire == .len) {
+                for (try f.packedVarints(a)) |v| try lst_samples.append(a, @truncate(@as(i64, @bitCast(v))));
+            } else {
+                const v = f.value;
+                try lst_samples.append(a, @truncate(@as(i64, @bitCast(v))));
             },
-            5 => {
-                const vals = try f.packedVarints(a);
-                var tmp: std.ArrayListUnmanaged(u64) = .empty;
-                for (vals) |v| try tmp.append(a, v);
-                self.counters = tmp.items;
+            5 => if (f.wire == .len) {
+                for (try f.packedVarints(a)) |v| try lst_counters.append(a, v);
+            } else {
+                const v = f.value;
+                try lst_counters.append(a, v);
             },
             6 => self.done = f.asBool(),
             7 => self.ratio = f.asDouble(),
+            8 => try lst_tags.append(a, f.asBytes()),
+            9 => try lst_items.append(a, try BumpResponse.decode(f.asBytes(), a)),
+            10 => if (f.asEnum(Status)) |v| try lst_states.append(a, v),
             else => {},
         };
+        self.samples = lst_samples.items;
+        self.counters = lst_counters.items;
+        self.tags = lst_tags.items;
+        self.items = lst_items.items;
+        self.states = lst_states.items;
         return self;
     }
 };

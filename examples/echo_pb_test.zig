@@ -54,3 +54,43 @@ test "proto_gen：service 路由常量" {
     try std.testing.expectEqualStrings("/echo.Echo/Say", echo.Echo.Say);
     try std.testing.expectEqualStrings("/echo.Echo/Chat", echo.Echo.Chat);
 }
+
+test "proto_gen：repeated string / message / enum 往返" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const s = echo.Summary{
+        .tags = &.{ "a", "中文" },
+        .items = &.{ .{ .value = 1 }, .{ .value = 2, .tag = "x" } },
+        .states = &.{ .OK, .FAILED },
+    };
+    const bytes = try s.encode(a);
+    const back = try echo.Summary.decode(bytes, a);
+
+    try std.testing.expectEqual(@as(usize, 2), back.tags.len);
+    try std.testing.expectEqualStrings("a", back.tags[0]);
+    try std.testing.expectEqualStrings("中文", back.tags[1]);
+
+    try std.testing.expectEqual(@as(usize, 2), back.items.len);
+    try std.testing.expectEqual(@as(i32, 1), back.items[0].value);
+    try std.testing.expectEqual(@as(i32, 2), back.items[1].value);
+    try std.testing.expectEqualStrings("x", back.items[1].tag);
+
+    try std.testing.expectEqualSlices(echo.Status, &.{ .OK, .FAILED }, back.states);
+}
+
+test "proto_gen：repeated 数字兼容非 packed 编码（对端 [packed=false]）" {
+    const pb = @import("zgrpc").pb;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 手工拼出「同一字段号出现两次、各一个 varint」的非 packed 形态
+    var w = pb.Writer.init(a);
+    try w.int32(4, 7);
+    try w.int32(4, 9);
+
+    const back = try echo.Summary.decode(w.bytes(), a);
+    try std.testing.expectEqualSlices(i32, &.{ 7, 9 }, back.samples);
+}

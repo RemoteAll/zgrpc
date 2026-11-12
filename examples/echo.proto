@@ -32,6 +32,10 @@ message Summary {
   repeated uint64 counters = 5;
   bool done = 6;
   double ratio = 7;
+  // repeated 非标量：string / message（生成 []const []const u8 / []const T）
+  repeated string tags = 8;
+  repeated BumpResponse items = 9;
+  repeated Status states = 10;
 }
 
 service Echo {

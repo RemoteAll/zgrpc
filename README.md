@@ -84,11 +84,12 @@ zig build codegen        # 从 examples/echo.proto 生成 examples/echo.pb.zig
 zig run tools/proto_gen.zig -- my.proto my.pb.zig
 ```
 
-支持：`syntax = "proto3"`、`package`、`message`（标量 / `string` / `bytes` / 枚举 / 嵌套 message / `repeated` 标量）、
+支持：`syntax = "proto3"`、`package`、`message`（标量 / `string` / `bytes` / 枚举 / 嵌套 message 字段 /
+**`repeated` 任意元素**：标量、`string`、`bytes`、enum、message）、
 `enum`、`service`（含 `stream` 标记，生成路由常量）。
 
 **不支持**（遇到会报错并给行号，不静默忽略）：`import`、`map`、`oneof`、`optional`、`reserved`、
-`extend`、`option`、嵌套定义、`repeated` message/string。
+`extend`、`option`、嵌套 message/enum **定义**。
 
 ## 服务反射（`grpcurl` 无需 `.proto`）
 

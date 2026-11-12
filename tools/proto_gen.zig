@@ -37,24 +37,8 @@ const lastSegment = zproto.lastSegment;
 // 代码生成
 // ---------------------------------------------------------------------------
 
-/// 生成字段的 Zig 类型写法（named 类型需要拼接，故用分配器）。
-fn zigType(a: std.mem.Allocator, proto: Proto, f: Field) ![]const u8 {
-    _ = proto; // named 类型只取末段名字，不需要查表
-    if (f.repeated) {
-        return switch (f.ftype) {
-            .scalar => |s| switch (s) {
-                .double => "[]const f64",
-                .float => "[]const f32",
-                .int32, .sint32, .sfixed32 => "[]const i32",
-                .int64, .sint64, .sfixed64 => "[]const i64",
-                .uint32, .fixed32 => "[]const u32",
-                .uint64, .fixed64 => "[]const u64",
-                .bool => "[]const bool",
-                .string, .bytes => "[]const []const u8",
-            },
-            .named => "[]const []const u8",
-        };
-    }
+/// 单个元素（非 repeated）的 Zig 类型写法。
+fn elemType(a: std.mem.Allocator, f: Field) ![]const u8 {
     return switch (f.ftype) {
         .scalar => |s| switch (s) {
             .double => "f64",
@@ -66,7 +50,40 @@ fn zigType(a: std.mem.Allocator, proto: Proto, f: Field) ![]const u8 {
             .bool => "bool",
             .string, .bytes => "[]const u8",
         },
+        // 元素是**值**类型（不是 `?T`）
+        .named => |n| try std.fmt.allocPrint(a, "{s}", .{lastSegment(n)}),
+    };
+}
+
+/// 生成字段的 Zig 类型写法（named 类型需要拼接，故用分配器）。
+fn zigType(a: std.mem.Allocator, proto: Proto, f: Field) ![]const u8 {
+    _ = proto; // named 类型只取末段名字，不需要查表
+    if (f.repeated) return std.fmt.allocPrint(a, "[]const {s}", .{try elemType(a, f)});
+    return switch (f.ftype) {
+        .scalar => elemType(a, f),
         .named => |n| try std.fmt.allocPrint(a, "?{s}", .{lastSegment(n)}),
+    };
+}
+
+/// repeated 数字/bool 的 packed 编码函数名。
+/// 注意 wire 类型不同：float/fixed32/sfixed32 是 4 字节定长，double/fixed64/sfixed64 是 8 字节定长，
+/// sint32/sint64 用 zigzag，其余是普通 varint。
+fn packedFn(s: Scalar) []const u8 {
+    return switch (s) {
+        .sint32, .sint64 => "packedSint",
+        .float, .fixed32, .sfixed32 => "packedFixed32",
+        .double, .fixed64, .sfixed64 => "packedFixed64",
+        else => "packedVarint",
+    };
+}
+
+/// repeated 数字/bool 解码 packed 载荷时用的 `Field` 方法名。
+fn packedReadFn(s: Scalar) []const u8 {
+    return switch (s) {
+        .sint32, .sint64 => "packedSints",
+        .float, .fixed32, .sfixed32 => "packedFixed32s",
+        .double, .fixed64, .sfixed64 => "packedFixed64s",
+        else => "packedVarints",
     };
 }
 
@@ -103,14 +120,24 @@ fn defaultValue(proto: Proto, f: Field) []const u8 {
 fn writeEncodeField(w: anytype, proto: Proto, f: Field, pad: []const u8) !void {
     const fnum = f.number;
     if (f.repeated) {
-        const s = f.ftype.scalar;
-        try w.print("{s}if (self.{s}.len > 0) {{\n", .{ pad, f.name });
-        switch (s) {
-            .int32, .sint32, .sfixed32 => try w.print("{s}    try w.packedInt32({d}, self.{s});\n", .{ pad, fnum, f.name }),
-            .uint32, .fixed32 => try w.print("{s}    var tmp: [16]u32 = undefined;\n", .{pad}),
-            else => try w.print("{s}    try w.packedUint64({d}, self.{s});\n", .{ pad, fnum, f.name }),
+        switch (f.ftype) {
+            .scalar => |s| {
+                if (s == .string or s == .bytes) {
+                    // 非 packed：每条一个 tag + 长度
+                    try w.print("{s}for (self.{s}) |v| try w.bytesField({d}, v);\n", .{ pad, f.name, fnum });
+                } else {
+                    // packed 数值：一次写完整片（空则不写）
+                    try w.print("{s}try w.{s}({d}, self.{s});\n", .{ pad, packedFn(s), fnum, f.name });
+                }
+            },
+            .named => |n| {
+                if (isEnum(proto, n)) {
+                    try w.print("{s}for (self.{s}) |v| try w.enumField({d}, v);\n", .{ pad, f.name, fnum });
+                } else {
+                    try w.print("{s}for (self.{s}) |v| try w.message({d}, try v.encode(a));\n", .{ pad, f.name, fnum });
+                }
+            },
         }
-        try w.print("{s}}}\n", .{pad});
         return;
     }
     switch (f.ftype) {
@@ -165,15 +192,33 @@ fn enumIndexOf(proto: Proto, name: []const u8) usize {
 }
 
 fn writeDecodeField(a: std.mem.Allocator, w: anytype, proto: Proto, f: Field, pad: []const u8) !void {
+    _ = a; // 类型字符串已在结构体字段声明处算好，这里只写分支
     const fnum = f.number;
     if (f.repeated) {
-        const s = f.ftype.scalar;
-        try w.print("{s}{d} => {{\n", .{ pad, fnum });
-        try w.print("{s}    const vals = try f.packedVarints(a);\n", .{pad});
-        try w.print("{s}    var tmp: std.ArrayListUnmanaged({s}) = .empty;\n", .{ pad, try zigType(a, proto, .{ .name = f.name, .number = fnum, .ftype = .{ .scalar = s }, .repeated = false }) });
-        try w.print("{s}    for (vals) |v| try tmp.append(a, {s});\n", .{ pad, castExpr(s) });
-        try w.print("{s}    self.{s} = tmp.items;\n", .{ pad, f.name });
-        try w.print("{s}}},\n", .{pad});
+        // 反复出现的同号字段（以及 packed / 非 packed 混用）都累积到局部 list
+        switch (f.ftype) {
+            .scalar => |s| {
+                if (s == .string or s == .bytes) {
+                    try w.print("{s}{d} => try lst_{s}.append(a, f.asBytes()),\n", .{ pad, fnum, f.name });
+                } else {
+                    try w.print("{s}{d} => if (f.wire == .len) {{\n", .{ pad, fnum });
+                    try w.print("{s}    for (try f.{s}(a)) |v| try lst_{s}.append(a, {s});\n", .{ pad, packedReadFn(s), f.name, castExpr(s) });
+                    // 非 packed：单条 varint/fixed 值
+                    try w.print("{s}}} else {{\n", .{pad});
+                    try w.print("{s}    const v = f.value;\n", .{pad});
+                    try w.print("{s}    try lst_{s}.append(a, {s});\n", .{ pad, f.name, castExpr(s) });
+                    try w.print("{s}}},\n", .{pad});
+                }
+            },
+            .named => |n| {
+                const t = lastSegment(n);
+                if (isEnum(proto, n)) {
+                    try w.print("{s}{d} => if (f.asEnum({s})) |v| try lst_{s}.append(a, v),\n", .{ pad, fnum, t, f.name });
+                } else {
+                    try w.print("{s}{d} => try lst_{s}.append(a, try {s}.decode(f.asBytes(), a)),\n", .{ pad, fnum, f.name, t });
+                }
+            },
+        }
         return;
     }
     switch (f.ftype) {
@@ -275,11 +320,20 @@ fn generate(a: std.mem.Allocator, proto: Proto, src_path: []const u8) ![]const u
             try w.writeAll("        _ = a; // 该 message 的字段不需要分配\n");
         }
         try w.writeAll("        var self: @This() = .{};\n");
+        // repeated 字段用局部 list 累积：同号字段可重复出现，packed 与非 packed 也能混用
+        for (m.fields) |f| {
+            if (!f.repeated) continue;
+            try w.print("        var lst_{s}: std.ArrayListUnmanaged({s}) = .empty;\n", .{ f.name, try elemType(a, f) });
+        }
         try w.writeAll("        var r = pb.Reader{ .data = bytes };\n");
         try w.writeAll("        while (r.next()) |f| switch (f.number) {\n");
         for (m.fields) |f| try writeDecodeField(a, w, proto, f, "            ");
         try w.writeAll("            else => {},\n");
         try w.writeAll("        };\n");
+        for (m.fields) |f| {
+            if (!f.repeated) continue;
+            try w.print("        self.{s} = lst_{s}.items;\n", .{ f.name, f.name });
+        }
         try w.writeAll("        return self;\n    }\n};\n\n");
     }
 
