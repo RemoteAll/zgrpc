@@ -84,6 +84,13 @@ pub const Call = struct {
     sent_any: bool = false,
     finished: bool = false,
 
+    // --- 流式模式状态（由 `Server.streamHooks` 驱动）---
+    /// 跨 DATA 帧的累积缓冲（整请求路由存原始帧，流式路由存待切分帧）
+    accum: std.ArrayListUnmanaged(u8) = .empty,
+    stream_route: ?*const StreamRoute = null,
+    unary_route: ?Route = null,
+    route_ctx: *anyopaque = undefined,
+
     /// unary 调用取第一条消息。
     pub fn firstMessage(self: *Call) ?Message {
         var it = MessageIterator{ .data = self.req.body };
@@ -147,13 +154,29 @@ pub const Route = struct {
     ctx: ?*anyopaque = null,
 };
 
+/// 流式方法（客户端流 / bidi）：消息逐条回调，可在回调里随时 `call.sendMessage`。
+pub const StreamRoute = struct {
+    path: []const u8,
+    /// 收到一条**完整** gRPC 消息（跨 DATA 帧的重组由本层负责）
+    on_message: *const fn (ctx: *anyopaque, call: *Call, msg: []const u8) anyerror!void,
+    /// 请求流结束（收到 END_STREAM）
+    on_end: ?*const fn (ctx: *anyopaque, call: *Call) anyerror!void = null,
+    ctx: ?*anyopaque = null,
+};
+
+/// 单条消息上限（流式重组时防炸）。
+const max_stream_message: usize = 4 * 1024 * 1024;
+
 /// gRPC 路由表；把它作为 `h2.Connection.serve` 的 handler 使用：
 /// ```zig
 /// var server = zgrpc.grpc.Server{ .routes = &routes };
 /// try conn.serve(server.context(), server.handler());
 /// ```
 pub const Server = struct {
-    routes: []const Route,
+    /// 整请求路由（unary / 服务端流式）
+    routes: []const Route = &.{},
+    /// 流式路由（客户端流 / bidi）
+    stream_routes: []const StreamRoute = &.{},
     /// 路由未指定 `ctx` 时使用
     outer_ctx: *anyopaque,
 
@@ -161,9 +184,27 @@ pub const Server = struct {
         return @ptrCast(self);
     }
 
+    /// 整请求模式（也是 `serve` 的旧入口）。
     pub fn handler(self: *Server) h2.HandlerFn {
         _ = self;
         return handle;
+    }
+
+    /// 流式模式：DATA 到达即回调，支持客户端流 / bidi；同时兼容整请求路由。
+    pub fn streamHooks(self: *Server) h2.StreamHooks {
+        return .{
+            .ctx = @ptrCast(self),
+            .onHeaders = streamOnHeaders,
+            .onData = streamOnData,
+            .onReset = streamOnReset,
+        };
+    }
+
+    fn findStreamRoute(self: *Server, path: []const u8) ?*const StreamRoute {
+        for (self.stream_routes) |*r| {
+            if (std.mem.eql(u8, r.path, path)) return r;
+        }
+        return null;
     }
 
     fn find(self: *Server, path: []const u8) ?Route {
@@ -200,6 +241,106 @@ pub const Server = struct {
             std.debug.print("[zgrpc.grpc] 处理 {s} 失败：{s}\n", .{ req.path, @errorName(e) });
         };
         return call.finish();
+    }
+
+    // -----------------------------------------------------------------------
+    // 流式模式（客户端流 / bidi）：DATA 到达即回调
+    // -----------------------------------------------------------------------
+
+    fn streamOnHeaders(server_ctx: *anyopaque, req: h2.Request, rsp: *h2.Responder) anyerror!void {
+        const self: *Server = @ptrCast(@alignCast(server_ctx));
+        const a = rsp.stream.allocator();
+        const call = try a.create(Call);
+        call.* = .{ .req = req, .rsp = rsp, .alloc = a };
+        rsp.stream.user_data = call;
+
+        if (!std.mem.eql(u8, req.method, "POST")) {
+            call.setStatus(.unimplemented, "gRPC 只支持 POST");
+            return call.finish();
+        }
+        const ct = req.header("content-type") orelse "";
+        if (!std.mem.startsWith(u8, ct, "application/grpc")) {
+            call.setStatus(.invalid_argument, "content-type 必须是 application/grpc");
+            return call.finish();
+        }
+
+        if (self.findStreamRoute(req.path)) |sr| {
+            call.stream_route = sr;
+            call.route_ctx = sr.ctx orelse self.outer_ctx;
+            return;
+        }
+        if (self.find(req.path)) |r| {
+            // 整请求路由也走流式驱动：先攒满 body，END_STREAM 时调用
+            call.unary_route = r;
+            call.route_ctx = r.ctx orelse self.outer_ctx;
+            return;
+        }
+
+        std.debug.print("[zgrpc.grpc] 未注册的方法：{s}\n", .{req.path});
+        call.setStatus(.unimplemented, "未注册的方法");
+        return call.finish();
+    }
+
+    fn streamOnData(server_ctx: *anyopaque, rsp: *h2.Responder, data: []const u8, end_stream: bool) anyerror!void {
+        _ = server_ctx;
+        const p = rsp.stream.user_data orelse return;
+        const call: *Call = @ptrCast(@alignCast(p));
+        if (call.finished) return;
+
+        // ① 整请求路由：原样累积（含 gRPC 长度前缀），END_STREAM 时一次交付
+        if (call.unary_route) |route| {
+            try call.accum.appendSlice(call.alloc, data);
+            if (call.accum.items.len > max_stream_message) return error.BodyTooLarge;
+            if (end_stream) {
+                call.req.body = call.accum.items;
+                route.handler(call.route_ctx, call, call.alloc) catch |e| {
+                    if (call.status == .ok) call.setStatus(.internal, @errorName(e));
+                    std.debug.print("[zgrpc.grpc] 处理 {s} 失败：{s}\n", .{ call.req.path, @errorName(e) });
+                };
+                return call.finish();
+            }
+            return;
+        }
+
+        // ② 流式路由：跨 DATA 帧重组，逐条完整消息回调
+        const sr = call.stream_route orelse return;
+        try call.accum.appendSlice(call.alloc, data);
+        if (call.accum.items.len > max_stream_message) return error.BodyTooLarge;
+
+        var pos: usize = 0;
+        while (true) {
+            const avail = call.accum.items.len - pos;
+            if (avail < 5) break;
+            const len = std.mem.readInt(u32, call.accum.items[pos + 1 ..][0..4], .big);
+            if (avail - 5 < len) break;
+            const msg = call.accum.items[pos + 5 .. pos + 5 + len];
+            sr.on_message(call.route_ctx, call, msg) catch |e| {
+                if (call.status == .ok) call.setStatus(.internal, @errorName(e));
+                std.debug.print("[zgrpc.grpc] 流式处理 {s} 失败：{s}\n", .{ call.req.path, @errorName(e) });
+                return call.finish();
+            };
+            pos += 5 + len;
+        }
+        if (pos > 0) {
+            const rest = call.accum.items.len - pos;
+            std.mem.copyForwards(u8, call.accum.items[0..rest], call.accum.items[pos..]);
+            call.accum.shrinkRetainingCapacity(rest);
+        }
+
+        if (end_stream) {
+            if (sr.on_end) |f| {
+                f(call.route_ctx, call) catch |e| {
+                    if (call.status == .ok) call.setStatus(.internal, @errorName(e));
+                    std.debug.print("[zgrpc.grpc] 流式 on_end 失败：{s}\n", .{@errorName(e)});
+                };
+            }
+            return call.finish();
+        }
+    }
+
+    fn streamOnReset(ctx: *anyopaque, stream_id: u32) void {
+        _ = ctx;
+        std.debug.print("[zgrpc.grpc] 客户端取消了流 {d}\n", .{stream_id});
     }
 };
 
@@ -371,4 +512,151 @@ test "grpc：未注册方法返回 UNIMPLEMENTED(12)" {
         }
     }
     try testing.expectEqualStrings("12", grpc_status);
+}
+// ---------------------------------------------------------------------------
+// 端到端：流式（bidi / 客户端流）—— DATA 到达即回调，消息跨帧重组
+// ---------------------------------------------------------------------------
+
+fn chatOnMessage(ctx: *anyopaque, call: *Call, msg: []const u8) anyerror!void {
+    _ = ctx;
+    var buf: [512]u8 = undefined;
+    const out = try std.fmt.bufPrint(&buf, "echo:{s}", .{msg});
+    try call.sendMessage(out);
+}
+
+test "grpc：bidi 流式（每条消息即时响应 + 跨 DATA 帧重组）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, h2.client_preface);
+    try h2.appendFrame(&input, a, .settings, 0, 0, &.{});
+
+    var block: std.ArrayListUnmanaged(u8) = .empty;
+    try hpack.encode(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/test.Stream/Chat" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = "content-type", .value = "application/grpc" },
+    }, &block, a);
+    // 注意：HEADERS 不带 END_STREAM —— 客户端流
+    try h2.appendFrame(&input, a, .headers, h2.Flags.end_headers, 1, block.items);
+
+    var msg1: std.ArrayListUnmanaged(u8) = .empty;
+    try encodeMessage(&msg1, a, "hello");
+    var msg2: std.ArrayListUnmanaged(u8) = .empty;
+    try encodeMessage(&msg2, a, "world");
+
+    // 第 1 条完整；第 2 条被切成两帧（验证跨帧重组）
+    try h2.appendFrame(&input, a, .data, 0, 1, msg1.items);
+    const cut = msg2.items.len / 2;
+    try h2.appendFrame(&input, a, .data, 0, 1, msg2.items[0..cut]);
+    try h2.appendFrame(&input, a, .data, h2.Flags.end_stream, 1, msg2.items[cut..]);
+
+    var routes = [_]Route{};
+    var stream_routes = [_]StreamRoute{
+        .{ .path = "/test.Stream/Chat", .on_message = chatOnMessage },
+    };
+    var dummy: u8 = 0;
+    var server = Server{ .routes = &routes, .stream_routes = &stream_routes, .outer_ctx = &dummy };
+
+    var r = std.Io.Reader.fixed(input.items);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var conn = h2.Connection.init(testing.allocator, &r, &aw.writer, .{});
+    defer conn.deinit();
+    conn.serveStreaming(server.streamHooks()) catch |e| {
+        if (e != error.ConnectionClosed) return e;
+    };
+
+    // 汇总响应：DATA 拼接 + trailers
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    var pos: usize = 0;
+    var grpc_status: []const u8 = "";
+    while (h2.nextFrame(aw.written(), &pos)) |f| {
+        switch (f.ftype) {
+            .data => try resp.appendSlice(a, f.payload),
+            .headers => {
+                var dec = hpack.Decoder.init(testing.allocator);
+                defer dec.deinit();
+                var hs: std.ArrayListUnmanaged(hpack.Header) = .empty;
+                try dec.decode(f.payload, &hs, a);
+                for (hs.items) |h| {
+                    if (std.mem.eql(u8, h.name, "grpc-status")) grpc_status = h.value;
+                }
+            },
+            else => {},
+        }
+    }
+
+    var it = MessageIterator{ .data = resp.items };
+    try testing.expectEqualStrings("echo:hello", it.next().?.payload);
+    try testing.expectEqualStrings("echo:world", it.next().?.payload);
+    try testing.expect(it.next() == null);
+    try testing.expectEqualStrings("0", grpc_status);
+}
+
+test "grpc：流式模式下整请求路由仍可用（累积到 END_STREAM）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, h2.client_preface);
+    try h2.appendFrame(&input, a, .settings, 0, 0, &.{});
+
+    var block: std.ArrayListUnmanaged(u8) = .empty;
+    try hpack.encode(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/test.Echo/Ping" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = "content-type", .value = "application/grpc" },
+    }, &block, a);
+    try h2.appendFrame(&input, a, .headers, h2.Flags.end_headers, 1, block.items);
+
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    try encodeMessage(&body, a, "ping");
+    try h2.appendFrame(&input, a, .data, h2.Flags.end_stream, 1, body.items);
+
+    var routes = [_]Route{.{ .path = "/test.Echo/Ping", .handler = pingHandler }};
+    var stream_routes = [_]StreamRoute{};
+    var dummy: u8 = 0;
+    var server = Server{ .routes = &routes, .stream_routes = &stream_routes, .outer_ctx = &dummy };
+
+    var r = std.Io.Reader.fixed(input.items);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var conn = h2.Connection.init(testing.allocator, &r, &aw.writer, .{});
+    defer conn.deinit();
+    conn.serveStreaming(server.streamHooks()) catch |e| {
+        if (e != error.ConnectionClosed) return e;
+    };
+
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    var pos: usize = 0;
+    var grpc_status: []const u8 = "";
+    while (h2.nextFrame(aw.written(), &pos)) |f| {
+        switch (f.ftype) {
+            .data => try resp.appendSlice(a, f.payload),
+            .headers => {
+                var dec = hpack.Decoder.init(testing.allocator);
+                defer dec.deinit();
+                var hs: std.ArrayListUnmanaged(hpack.Header) = .empty;
+                try dec.decode(f.payload, &hs, a);
+                for (hs.items) |h| {
+                    if (std.mem.eql(u8, h.name, "grpc-status")) grpc_status = h.value;
+                }
+            },
+            else => {},
+        }
+    }
+
+    var it = MessageIterator{ .data = resp.items };
+    try testing.expectEqualStrings("pong", it.next().?.payload);
+    try testing.expectEqualStrings("0", grpc_status);
 }

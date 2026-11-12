@@ -61,4 +61,17 @@ pub fn main() !void {
         return error.GrpcStatusNotOk;
     }
     std.debug.print("[zgrpc] 两条并发流均成功（同一条 TCP 连接）\n", .{});
+
+    // ---- 客户端流 / bidi：一次发 3 条消息，服务端每条即时回一条 ----
+    const chat = try client.clientStream("/echo.Echo/Chat", &.{ "a", "b", "c" }, a);
+    var n: usize = 0;
+    for (chat.messages) |m| {
+        std.debug.print("[zgrpc] bidi 响应[{d}]={s}\n", .{ n, m });
+        n += 1;
+    }
+    if (!chat.ok() or chat.messages.len != 3) {
+        std.debug.print("[zgrpc] bidi 调用失败：status={d} 消息数={d}\n", .{ chat.status, chat.messages.len });
+        return error.GrpcStatusNotOk;
+    }
+    std.debug.print("[zgrpc] bidi 流成功：3 条请求 → 3 条响应\n", .{});
 }

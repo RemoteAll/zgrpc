@@ -15,7 +15,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # 测试数下限：只能抬高，不能降低（降低必须在 docs/决策记录.md 写明依据）
-$minTests = 17
+$minTests = 19
 
 $reportDir = Join-Path $root 'artifacts\regression'
 New-Item -ItemType Directory -Force -Path $reportDir | Out-Null

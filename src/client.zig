@@ -195,8 +195,96 @@ pub const Client = struct {
         return results;
     }
 
-    fn writeHeaders(self: *Client, stream_id: u32, method: []const u8, arena: std.mem.Allocator) !void {
-        var block: std.ArrayListUnmanaged(u8) = .empty;
+    /// 客户端流 / bidi（批量形式）：把多条请求消息一次性发完，收全部响应消息。
+    ///
+    /// 服务端若在每条消息到达时就回一条（bidi），这里能一次拿回多条 —— 这正是
+    /// `grpc.Server.streamHooks()` 的配套验证场景。
+    pub fn clientStream(
+        self: *Client,
+        method: []const u8,
+        messages: []const []const u8,
+        arena: std.mem.Allocator,
+    ) !Result {
+        try self.handshake();
+        const sid = self.next_stream_id;
+        self.next_stream_id += 2;
+
+        try self.writeHeaders(sid, method, arena);
+        if (messages.len == 0) {
+            try writeFrame(self.writer, .data, h2.Flags.end_stream, sid, &.{});
+        } else {
+            for (messages, 0..) |m, i| {
+                var body: std.ArrayListUnmanaged(u8) = .empty;
+                try grpc.encodeMessage(&body, arena, m);
+                const flags: u8 = if (i + 1 == messages.len) h2.Flags.end_stream else 0;
+                try writeFrame(self.writer, .data, flags, sid, body.items);
+            }
+        }
+        try self.writer.flush();
+
+        var result = Result{ .stream_id = sid };
+        var resp: std.ArrayListUnmanaged(u8) = .empty;
+
+        while (true) {
+            const hdr = readFrameHeader(self.reader) catch |e| {
+                std.debug.print("[zgrpc.client] 读响应帧结束（{s}）\n", .{@errorName(e)});
+                return error.ConnectionClosed;
+            };
+            const payload = try arena.alloc(u8, hdr.length);
+            try self.reader.readSliceAll(payload);
+
+            switch (hdr.ftype) {
+                .settings => {
+                    if (hdr.flags & h2.Flags.ack == 0) {
+                        try writeFrame(self.writer, .settings, h2.Flags.ack, 0, &.{});
+                        try self.writer.flush();
+                    }
+                },
+                .ping => {
+                    if (hdr.flags & h2.Flags.ack == 0) {
+                        try writeFrame(self.writer, .ping, h2.Flags.ack, 0, payload);
+                        try self.writer.flush();
+                    }
+                },
+                .data => {
+                    if (hdr.stream_id == sid) {
+                        if (resp.items.len + payload.len > self.opts.max_body) return error.BodyTooLarge;
+                        try resp.appendSlice(arena, payload);
+                        try self.refundWindow(sid, payload.len);
+                    }
+                },
+                .headers => {
+                    if (hdr.stream_id != sid) continue;
+                    var hs: std.ArrayListUnmanaged(hpack.Header) = .empty;
+                    try self.decoder.decode(payload, &hs, arena);
+                    for (hs.items) |h| {
+                        if (std.mem.eql(u8, h.name, "grpc-status")) {
+                            result.status = std.fmt.parseInt(u32, h.value, 10) catch 2;
+                        } else if (std.mem.eql(u8, h.name, "grpc-message")) {
+                            result.message = h.value;
+                        }
+                    }
+                    if (hdr.flags & h2.Flags.end_stream != 0) break;
+                },
+                .rst_stream => {
+                    if (hdr.stream_id == sid) {
+                        result.aborted = true;
+                        break;
+                    }
+                },
+                .goaway => return error.ConnectionClosed,
+                else => {},
+            }
+        }
+
+        var list: std.ArrayListUnmanaged([]const u8) = .empty;
+        var it = grpc.MessageIterator{ .data = resp.items };
+        while (it.next()) |m| try list.append(arena, m.payload);
+        result.messages = list.items;
+        return result;
+    }
+
+    fn writeHeaders(self: *Client, stream_id: u32, method: []const u8, arena: std.mem.Allocator) !void {        var block: std.ArrayListUnmanaged(u8) = .empty;
         try hpack.encode(&.{
             .{ .name = ":method", .value = "POST" },
             .{ .name = ":path", .value = method },

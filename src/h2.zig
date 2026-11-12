@@ -177,6 +177,16 @@ pub const HandlerFn = *const fn (
     arena: std.mem.Allocator,
 ) anyerror!void;
 
+/// 流式处理钩子（对应 gRPC 的客户端流 / bidi）：
+/// `onHeaders` 在请求头就绪时调一次，`onData` 在**每个 DATA 帧到达时**立即调（不等 END_STREAM）。
+pub const StreamHooks = struct {
+    ctx: *anyopaque,
+    onHeaders: *const fn (ctx: *anyopaque, req: Request, rsp: *Responder) anyerror!void,
+    onData: *const fn (ctx: *anyopaque, rsp: *Responder, data: []const u8, end_stream: bool) anyerror!void,
+    /// 流被对端 `RST_STREAM` 重置（可选）
+    onReset: ?*const fn (ctx: *anyopaque, stream_id: u32) void = null,
+};
+
 /// 一条流的全部请求状态。**自带 arena**：流结束时整体释放，
 /// 因此多流并存时不会互相污染（不用连接级 arena 的 reset 时机去赌）。
 pub const StreamState = struct {
@@ -192,6 +202,10 @@ pub const StreamState = struct {
     authority: []const u8 = "",
     /// 该流剩余发送窗口
     send_window: i64 = default_window_size,
+    /// 流式模式下的响应器（**必须活到流结束**，不能在栈上建：handler 会跨回调持有它）
+    rsp: ?*Responder = null,
+    /// 业务挂载点（流式模式：gRPC 的 Call）
+    user_data: ?*anyopaque = null,
 
     pub fn allocator(self: *StreamState) std.mem.Allocator {
         return self.arena.allocator();
@@ -225,6 +239,8 @@ pub const Connection = struct {
 
     serve_ctx: ?*anyopaque = null,
     serve_handler: ?HandlerFn = null,
+    /// 非空时进入**流式模式**：DATA 到达即回调，不攒到 END_STREAM
+    stream_hooks: ?StreamHooks = null,
     dispatch_depth: u8 = 0,
     /// 已收到对端 SETTINGS（收到前不能算连接就绪）
     got_peer_settings: bool = false,
@@ -297,10 +313,24 @@ pub const Connection = struct {
     pub fn serve(self: *Connection, ctx: *anyopaque, handler: HandlerFn) !void {
         self.serve_ctx = ctx;
         self.serve_handler = handler;
+        self.stream_hooks = null;
         defer {
             self.serve_ctx = null;
             self.serve_handler = null;
         }
+        return self.runLoop();
+    }
+
+    /// 流式服务： `hooks.onData` 在 DATA 到达时立即回调（支持客户端流 / bidi）。
+    pub fn serveStreaming(self: *Connection, hooks: StreamHooks) !void {
+        self.stream_hooks = hooks;
+        self.serve_ctx = null;
+        self.serve_handler = null;
+        defer self.stream_hooks = null;
+        return self.runLoop();
+    }
+
+    fn runLoop(self: *Connection) !void {
 
         var pf: [client_preface.len]u8 = undefined;
         self.reader.readSliceAll(&pf) catch |e| {
@@ -481,6 +511,9 @@ pub const Connection = struct {
         _ = payload;
         if (self.findStream(hdr.stream_id)) |s| {
             std.debug.print("[zgrpc.h2] 对端重置流 {d}，丢弃其状态\n", .{hdr.stream_id});
+            if (self.stream_hooks) |hooks| {
+                if (hooks.onReset) |cb| cb(hooks.ctx, hdr.stream_id);
+            }
             self.destroyStream(s);
         }
     }
@@ -559,8 +592,7 @@ pub const Connection = struct {
         }
 
         if (hdr.flags & Flags.end_headers != 0) {
-            try self.finishHeaders(s);
-            if (hdr.flags & Flags.end_stream != 0) try self.dispatch(s);
+            try self.afterHeaders(s, hdr.flags & Flags.end_stream != 0);
         }
     }
 
@@ -582,13 +614,73 @@ pub const Connection = struct {
             return;
         }
         if (hdr.flags & Flags.end_headers != 0) {
-            try self.finishHeaders(s);
-            if (hdr.flags & Flags.end_stream != 0) try self.dispatch(s);
+            try self.afterHeaders(s, hdr.flags & Flags.end_stream != 0);
         }
     }
 
     fn skipContinuation(self: *Connection) !void {
         _ = self;
+    }
+
+    fn makeRequest(s: *StreamState) Request {
+        return .{
+            .stream_id = s.id,
+            .method = s.method,
+            .path = s.path,
+            .scheme = s.scheme,
+            .authority = s.authority,
+            .headers = s.headers.items,
+            .body = s.body.items,
+        };
+    }
+
+    /// 请求头就绪：整请求模式攒到 END_STREAM 再派发；流式模式立刻回调 `onHeaders`。
+    fn afterHeaders(self: *Connection, s: *StreamState, end_stream: bool) !void {
+        try self.finishHeaders(s);
+
+        if (self.stream_hooks) |hooks| {
+            // Responder 必须长期存活（业务会跨多次回调持有它）→ 放在流的 arena 里
+            const rsp = try s.allocator().create(Responder);
+            rsp.* = .{ .conn = self, .stream = s };
+            s.rsp = rsp;
+
+            hooks.onHeaders(hooks.ctx, makeRequest(s), rsp) catch |e| {
+                std.debug.print("[zgrpc.h2] 流式 onHeaders 失败（流 {d}）：{s}\n", .{ s.id, @errorName(e) });
+                if (!rsp.begun) rsp.begin("500", &.{}) catch {};
+                if (!rsp.ended) rsp.end(&.{}) catch {};
+            };
+
+            // 无请求体的流：立刻通知"结束"
+            if (end_stream) try self.deliverData(s, &.{}, true);
+            return;
+        }
+
+        if (end_stream) try self.dispatch(s);
+    }
+
+    /// 流式模式：把一段请求数据交给业务；`end_stream` 为真时收尾并销毁流。
+    fn deliverData(self: *Connection, s: *StreamState, data: []const u8, end_stream: bool) !void {
+        const hooks = self.stream_hooks orelse return;
+        const rsp = s.rsp orelse blk: {
+            const r = try s.allocator().create(Responder);
+            r.* = .{ .conn = self, .stream = s };
+            s.rsp = r;
+            break :blk r;
+        };
+
+        hooks.onData(hooks.ctx, rsp, data, end_stream) catch |e| {
+            std.debug.print("[zgrpc.h2] 流式 onData 失败（流 {d}，{d} 字节）：{s}\n", .{
+                s.id, data.len, @errorName(e),
+            });
+            if (!rsp.begun) rsp.begin("500", &.{}) catch {};
+            if (!rsp.ended) rsp.end(&.{}) catch {};
+        };
+
+        if (end_stream) {
+            // 业务未显式收尾时补上，保证每个流都有 END_STREAM
+            if (!rsp.ended) rsp.end(&.{}) catch {};
+            self.destroyStream(s);
+        }
     }
 
     fn finishHeaders(self: *Connection, s: *StreamState) !void {
@@ -624,6 +716,12 @@ pub const Connection = struct {
 
         // 无论是否超限都要回补窗口，否则对端会卡住
         try self.refundWindow(hdr.stream_id, payload.len, true);
+
+        // 流式模式：不累积 body（业务自己维护重组缓冲），DATA 到达即回调
+        if (self.stream_hooks != null) {
+            try self.deliverData(s, data, hdr.flags & Flags.end_stream != 0);
+            return;
+        }
 
         const a = s.allocator();
         if (s.body.items.len + data.len > self.opts.max_body) {

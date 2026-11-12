@@ -24,6 +24,15 @@ fn sayHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator)
     try call.sendMessage(msg.payload);
 }
 
+/// 方法 `/echo.Echo/Chat`：**bidi** —— 每收到一条消息就即时回一条（带前缀）。
+fn chatHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, msg: []const u8) anyerror!void {
+    _ = ctx;
+    var buf: [512]u8 = undefined;
+    const out = try std.fmt.bufPrint(&buf, "chat:{s}", .{msg});
+    std.debug.print("[zgrpc] 流式收到 {d} 字节：{s}\n", .{ msg.len, msg });
+    try call.sendMessage(out);
+}
+
 pub fn main() !void {
     // 多线程服务端：Io 必须用线程安全分配器构造（page_allocator）
     const allocator = std.heap.page_allocator;
@@ -34,14 +43,21 @@ pub fn main() !void {
     var routes = [_]zgrpc.grpc.Route{
         .{ .path = "/echo.Echo/Say", .handler = sayHandler },
     };
+    var stream_routes = [_]zgrpc.grpc.StreamRoute{
+        .{ .path = "/echo.Echo/Chat", .on_message = chatHandler },
+    };
     var dummy: u8 = 0;
-    var server = zgrpc.grpc.Server{ .routes = &routes, .outer_ctx = &dummy };
+    var server = zgrpc.grpc.Server{
+        .routes = &routes,
+        .stream_routes = &stream_routes,
+        .outer_ctx = &dummy,
+    };
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
-    std.debug.print("[zgrpc] gRPC(h2c) 监听 127.0.0.1:{d}，方法 /echo.Echo/Say\n", .{port});
+    std.debug.print("[zgrpc] gRPC(h2c) 监听 127.0.0.1:{d}，方法 /echo.Echo/Say（unary）、/echo.Echo/Chat（bidi）\n", .{port});
 
     while (true) {
         const stream = listener.accept(io) catch |e| {
@@ -72,7 +88,8 @@ fn handleConn(
     var conn = zgrpc.h2.Connection.init(allocator, &sr.interface, &sw.interface, .{});
     defer conn.deinit();
 
-    conn.serve(server.context(), server.handler()) catch |e| {
+    // 流式模式：同时兼容整请求路由（unary）与流式路由（bidi/客户端流）
+    conn.serveStreaming(server.streamHooks()) catch |e| {
         if (e != error.ConnectionClosed) {
             std.debug.print("[zgrpc] 连接异常结束：{s}\n", .{@errorName(e)});
         }
