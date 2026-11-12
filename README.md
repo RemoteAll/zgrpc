@@ -11,15 +11,15 @@
 |---|---|---|
 | `hpack` | 头部压缩（RFC 7541） | **解码完整**（静态表 + 动态表 + Huffman）；编码简化（静态命中走索引，其余明文 literal） |
 | `h2` | HTTP/2 明文 h2c（prior-knowledge）服务端 | SETTINGS/ACK、HEADERS/CONTINUATION（含 PADDED/PRIORITY）、DATA（含 PADDED + 流控回补）、WINDOW_UPDATE（连接级 + 每流）、PING、RST_STREAM、GOAWAY；**多路复用**（多流并存、发送阻塞时帧入 pending 队列） |
-| `grpc` | gRPC 语义层 | 消息分帧、状态码、路由、unary / 服务端流式 / **客户端流与 bidi**（`server.stream_routes` + `streamHooks`）、**gRPC-Web**、**gzip 消息压缩**、**`grpc-timeout` 截止时间**、`grpc-message` 的 percent-encoding、非 POST→**405** / content-type 不符→**415**、**Custom-Metadata（含 `-bin` base64）** |
+| `grpc` | gRPC 语义层 | 消息分帧、状态码、路由、unary / 服务端流式 / **客户端流与 bidi**（`server.stream_routes` + `streamHooks`）、**gRPC-Web**、**gzip 消息压缩**、**`grpc-timeout` 截止时间**、`grpc-message` 的 percent-encoding、非 POST→**405** / content-type 不符→**415**、**Custom-Metadata（含 `-bin` base64）**、**gRPC-Web 文本模式（`grpc-web-text`，base64）** |
 | `client` | gRPC 客户端（h2c） | 握手、`unary`、**`callMany`（同一连接并发多条流）**、`clientStream`（客户端流/bidi），按 stream_id 归位、回补窗口；发 `grpc-timeout` / `user-agent` / 自定义 metadata，按规范**合成** Status 并解 percent-encoding |
 | `health` | 标准 `grpc.health.v1.Health` | `Check`（unary）/ `Watch`（流式，同步模型下默认推一次）；最简 protobuf 手写编解码，零依赖 |
 | `gzip` / `clock` | 压缩与单调时钟 | `gzip` 走 `std.compress.flate`；`clock` 直问 OS（`QueryPerformanceCounter` / `CLOCK_MONOTONIC`），服务 `grpc-timeout` |
 
 **未做**（明确列出，避免误解为完整实现）：TLS/ALPN、服务端推送、优先级调度、
 handler 并行执行（业务仍同步串行，串行只是执行顺序，**不会因此拒绝并发流**）、
-客户端流/bidi 背压、`grpc-timeout` 的**强制中断**（本层只判超时并回 `DEADLINE_EXCEEDED`，
-不会打断已阻塞在业务里的调用）、`application/grpc-web-text`（base64 文本流）、
+客户端流/bidi 背压（gRPC-Web 规范本身也不支持 bidi）、`grpc-timeout` 的**强制中断**（本层只判超时并回 `DEADLINE_EXCEEDED`，
+不会打断已阻塞在业务里的调用）、
 protobuf 编解码（业务自带）。
 
 ### 对照官方规范的符合性
@@ -40,6 +40,7 @@ protobuf 编解码（业务自带）。
 | 客户端遇非 200 / 缺 status 必须**合成** | ✅ 合成 `UNAVAILABLE(14)` / `UNKNOWN(2)` 并附可读 message |
 | gRPC-Web：trailers 走 body 尾帧（MSB=1、键名小写） | ✅ 尾帧 `0x80` + 4B 长度 + `grpc-status: …` |
 | gRPC-Web：缺省格式按 `+proto` | ✅ 响应 `application/grpc-web+proto` |
+| gRPC-Web：文本流（`application/grpc-web-text`，默认 base64，不得假设 padding 只在帧边界） | ✅ 请求整体解码、响应逐帧 base64（带 padding，解码端忽略 `=`） |
 | 建议 `user-agent` 用 `grpc-<lang>/<ver>` | ✅ 默认 `grpc-zgrpc/0.1.0` |
 | Custom-Metadata：`-bin` 用 base64（MUST 接受带/不带 padding，应发无 padding）；重复名可逗号合并 | ✅ `requestBinaryMetadata(All)` / `setBinaryHeader` / `setBinaryTrailer`；`grpc-status-details-bin` 可直接用 `setBinaryTrailer` |
 | `grpc.health.v1.Health` | ✅ `Check` / `Watch`（`zgrpc.health`） |
@@ -72,14 +73,14 @@ try conn.serve(server.context(), server.handler());
 ## 构建与验证
 
 ```bash
-zig build test           # 34 个单元/端到端测试
+zig build test           # 36 个单元/端到端测试
 zig build echo-server    # 监听 127.0.0.1:18051
-zig build echo-client    # 并发双流 + bidi + 健康检查 + grpc-timeout 超时 + -bin metadata
+zig build echo-client    # 并发双流 + bidi + 健康检查 + grpc-timeout 超时 + -bin metadata + grpc-web-text
 ```
 
 实测（2026-11-12，Windows，Zig 0.17.1）：
 
-- `tools\regression.ps1` → 构建 PASS / tests 34（下限 34）/ 冒烟 PASS / **三向 Rust 对拍 PASS**，exit 0；
+- `tools\regression.ps1` → 构建 PASS / tests 36（下限 36）/ 冒烟 PASS / **四向 Rust 对拍 PASS**，exit 0；
 - 真实 socket：unary **并发双流**均 `grpc-status=0`；**bidi** 3 条请求 → 3 条响应（`chat:a/b/c`）；
   **健康检查** `grpc-status=0` + `ServingStatus=1`；**grpc-timeout 生效**：80ms 调睡 300ms 的方法 → `grpc-status=4`；
   **`-bin` metadata 往返**：`x-token-bin` → 响应头 `x-echo-bin` + trailer `x-note`。

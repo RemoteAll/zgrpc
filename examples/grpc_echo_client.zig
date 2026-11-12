@@ -156,4 +156,31 @@ pub fn main(init: std.process.Init) !void {
         return error.MetadataMismatch;
     }
     std.debug.print("[zgrpc] -bin metadata 往返成功：x-echo-bin={s} / x-note={s}\n", .{ echoed, note });
+
+    // ---- gRPC-Web 文本模式（base64，浏览器 XHR 回退用）：另开一条连接 ----
+    var stream2 = addr.connect(io, .{ .mode = .stream }) catch |e| {
+        std.debug.print("[zgrpc] web-text 连接失败：{s}\n", .{@errorName(e)});
+        return e;
+    };
+    defer stream2.close(io);
+    var recv_buf2: [16 * 1024]u8 = undefined;
+    var send_buf2: [16 * 1024]u8 = undefined;
+    var sr2 = stream2.reader(io, &recv_buf2);
+    var sw2 = stream2.writer(io, &send_buf2);
+    var text_client = zgrpc.client.Client.init(allocator, &sr2.interface, &sw2.interface, .{
+        .authority = "127.0.0.1",
+        .content_type = .grpc_web_text,
+    });
+    defer text_client.deinit();
+
+    const wt = try text_client.unary(method, "web-text-hello", a);
+    if (!wt.ok() or wt.messages.len != 1 or !std.mem.eql(u8, wt.messages[0], "web-text-hello")) {
+        std.debug.print("[zgrpc] grpc-web-text 往返失败：status={d} message={s} 消息数={d}\n", .{
+            wt.status, wt.message, wt.messages.len,
+        });
+        return error.GrpcStatusNotOk;
+    }
+    std.debug.print("[zgrpc] grpc-web-text 往返成功：{s}（content-type={s}）\n", .{
+        wt.messages[0], wt.header("content-type") orelse "?",
+    });
 }

@@ -104,7 +104,13 @@ fn b64_decode_loose(s: &str) -> Option<Vec<u8>> {
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
     for c in s.bytes() {
-        if matches!(c, b'=' | b'\r' | b'\n' | b' ' | b'\t') {
+        if c == b'=' {
+            // padding = 当前分组结束，丢弃不满 8 位的残余位（否则多帧拼接会错位）
+            acc = 0;
+            bits = 0;
+            continue;
+        }
+        if matches!(c, b'\r' | b'\n' | b' ' | b'\t') {
             continue;
         }
         let v = B64.iter().position(|x| *x == c)? as u32;
@@ -224,7 +230,8 @@ async fn handle(req: Request<Incoming>) -> Result<Response<GrpcBody>, Infallible
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let is_web = ct.starts_with("application/grpc-web");
+    let is_web_text = ct.starts_with("application/grpc-web-text");
+    let is_web = is_web_text || ct.starts_with("application/grpc-web");
     let path = req.uri().path().to_string();
     let timeout_hdr = req
         .headers()
@@ -243,6 +250,18 @@ async fn handle(req: Request<Incoming>) -> Result<Response<GrpcBody>, Infallible
             eprintln!("[interop] 读请求体失败：{e}");
             return Ok(empty_response());
         }
+    };
+    // 文本模式：请求体整体是 base64，先解码
+    let whole = if is_web_text {
+        match b64_decode_loose(&String::from_utf8_lossy(&whole)) {
+            Some(v) => Bytes::from(v),
+            None => {
+                eprintln!("[interop] web-text 请求体不是合法 base64");
+                return Ok(empty_response());
+            }
+        }
+    } else {
+        whole
     };
     let msgs = parse_messages(&whole);
     eprintln!(
@@ -318,12 +337,23 @@ async fn handle(req: Request<Incoming>) -> Result<Response<GrpcBody>, Infallible
             grpc_message.as_deref(),
             &extra_trailers,
         ));
-        resp = resp.header(hyper::header::CONTENT_TYPE, GRPC_WEB_CT);
+        // 文本模式：整段（消息帧 + 尾帧）base64 后发出
+        let payload: Vec<u8> = if is_web_text {
+            b64_encode_nopad(&out).into_bytes()
+        } else {
+            out
+        };
+        let ct_out = if is_web_text {
+            "application/grpc-web-text+proto"
+        } else {
+            GRPC_WEB_CT
+        };
+        resp = resp.header(hyper::header::CONTENT_TYPE, ct_out);
         for (k, v) in &extra_headers {
             resp = resp.header(k.as_str(), v.as_str());
         }
         let body = GrpcBody {
-            data: Some(Bytes::from(out)),
+            data: Some(Bytes::from(payload)),
             trailers: None,
         };
         return Ok(resp.body(body).unwrap());
@@ -374,6 +404,25 @@ fn web_trailer_status(data: &[u8]) -> Option<String> {
     None
 }
 
+/// 文本模式：gRPC 帧整体 base64 后发出（服务端会先解码）。
+fn request_body(msg: &[u8], web_text: bool) -> Vec<u8> {
+    let frame = grpc_frame(msg);
+    if web_text {
+        b64_encode_nopad(&frame).into_bytes()
+    } else {
+        frame
+    }
+}
+
+/// 文本模式响应：整个 body 是 base64（含尾帧），先解成二进制帧。
+fn untangle_body(data: Vec<u8>, web_text: bool) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if !web_text {
+        return Ok(data);
+    }
+    let text = String::from_utf8_lossy(&data).to_string();
+    b64_decode_loose(&text).ok_or_else(|| "web-text 响应不是合法 base64".into())
+}
+
 fn empty_response() -> Response<GrpcBody> {
     Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -405,7 +454,7 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn run_client(port: u16, web: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_client(port: u16, web: bool, web_text: bool) -> Result<(), Box<dyn std::error::Error>> {
     let stream = TcpStream::connect(("127.0.0.1", port)).await?;
     let (mut sender, conn) =
         hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream)).await?;
@@ -413,7 +462,11 @@ async fn run_client(port: u16, web: bool) -> Result<(), Box<dyn std::error::Erro
         let _ = conn.await;
     });
 
-    let (ct, mode) = if web {
+    // 尾帧解析对 web 系列同样适用
+    let is_web = web || web_text;
+    let (ct, mode) = if web_text {
+        ("application/grpc-web-text+proto", "gRPC-Web-text")
+    } else if web {
         (GRPC_WEB_CT, "gRPC-Web")
     } else {
         (GRPC_CT, "gRPC")
@@ -426,7 +479,7 @@ async fn run_client(port: u16, web: bool) -> Result<(), Box<dyn std::error::Erro
         .uri(format!("http://127.0.0.1:{port}/echo.Echo/Say"))
         .header(hyper::header::CONTENT_TYPE, ct)
         .header("te", "trailers")
-        .body(Full::new(Bytes::from(grpc_frame(b"hello-from-rust"))))?;
+        .body(Full::new(Bytes::from(request_body(b"hello-from-rust", web_text))))?;
     let resp = sender.send_request(req).await?;
     let status = resp.status();
     let mut body = resp.into_body();
@@ -444,8 +497,9 @@ async fn run_client(port: u16, web: bool) -> Result<(), Box<dyn std::error::Erro
         }
     }
 
+    let data = untangle_body(data, web_text)?;
     // web 模式：trailers 在 body 尾帧里
-    if web {
+    if is_web {
         let msgs = parse_messages(&data);
         let mut pos = 0usize;
         for m in &msgs {
@@ -486,33 +540,38 @@ async fn run_client(port: u16, web: bool) -> Result<(), Box<dyn std::error::Erro
         }
     }
 
-    // ② bidi（多条消息同一流）
-    let mut payload: Vec<u8> = Vec::new();
-    for m in ["a", "b", "c"] {
-        payload.extend_from_slice(&grpc_frame(m.as_bytes()));
-    }
-    let req = Request::builder()
-        .method("POST")
-        .uri(format!("http://127.0.0.1:{port}/echo.Echo/Chat"))
-        .header(hyper::header::CONTENT_TYPE, ct)
-        .header("te", "trailers")
-        .body(Full::new(Bytes::from(payload)))?;
-    let resp = sender.send_request(req).await?;
-    let mut body = resp.into_body();
-    let mut data: Vec<u8> = Vec::new();
-    while let Some(frame) = body.frame().await {
-        let frame = frame?;
-        if let Some(d) = frame.data_ref() {
-            data.extend_from_slice(d);
+    // ② bidi（多条消息同一流）—— 规范：gRPC-Web 不支持 bidi，文本模式跳过
+    if web_text {
+        println!("  bidi：web-text 模式跳过（规范不支持 bidi）");
+    } else {
+        let mut payload: Vec<u8> = Vec::new();
+        for m in ["a", "b", "c"] {
+            payload.extend_from_slice(&grpc_frame(m.as_bytes()));
         }
-    }
-    let msgs = parse_messages(&data);
-    println!("  bidi：收到 {} 条响应", msgs.len());
-    for (i, m) in msgs.iter().enumerate() {
-        println!("    [{i}] {}", String::from_utf8_lossy(m));
-    }
-    if msgs.len() != 3 {
-        return Err(format!("bidi 期望 3 条响应，实际 {}", msgs.len()).into());
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("http://127.0.0.1:{port}/echo.Echo/Chat"))
+            .header(hyper::header::CONTENT_TYPE, ct)
+            .header("te", "trailers")
+            .body(Full::new(Bytes::from(payload)))?;
+        let resp = sender.send_request(req).await?;
+        let mut body = resp.into_body();
+        let mut data: Vec<u8> = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame?;
+            if let Some(d) = frame.data_ref() {
+                data.extend_from_slice(d);
+            }
+        }
+        let data = untangle_body(data, web_text)?;
+        let msgs = parse_messages(&data);
+        println!("  bidi：收到 {} 条响应", msgs.len());
+        for (i, m) in msgs.iter().enumerate() {
+            println!("    [{i}] {}", String::from_utf8_lossy(m));
+        }
+        if msgs.len() != 3 {
+            return Err(format!("bidi 期望 3 条响应，实际 {}", msgs.len()).into());
+        }
     }
 
     // ③ 标准健康检查：grpc.health.v1.Health/Check（空 service = 整体健康）
@@ -521,7 +580,7 @@ async fn run_client(port: u16, web: bool) -> Result<(), Box<dyn std::error::Erro
         .uri(format!("http://127.0.0.1:{port}/grpc.health.v1.Health/Check"))
         .header(hyper::header::CONTENT_TYPE, ct)
         .header("te", "trailers")
-        .body(Full::new(Bytes::from(grpc_frame(b""))))?;
+        .body(Full::new(Bytes::from(request_body(b"", web_text))))?;
     let resp = sender.send_request(req).await?;
     let mut body = resp.into_body();
     let mut data: Vec<u8> = Vec::new();
@@ -537,7 +596,8 @@ async fn run_client(port: u16, web: bool) -> Result<(), Box<dyn std::error::Erro
             }
         }
     }
-    if web {
+    let data = untangle_body(data, web_text)?;
+    if is_web {
         if let Some(s) = web_trailer_status(&data) {
             gs = Some(s);
         }
@@ -558,7 +618,7 @@ async fn run_client(port: u16, web: bool) -> Result<(), Box<dyn std::error::Erro
         .header(hyper::header::CONTENT_TYPE, ct)
         .header("te", "trailers")
         .header("grpc-timeout", "80m")
-        .body(Full::new(Bytes::from(grpc_frame(b""))))?;
+        .body(Full::new(Bytes::from(request_body(b"", web_text))))?;
     let resp = sender.send_request(req).await?;
     let mut body = resp.into_body();
     let mut data: Vec<u8> = Vec::new();
@@ -574,12 +634,14 @@ async fn run_client(port: u16, web: bool) -> Result<(), Box<dyn std::error::Erro
             }
         }
     }
-    if web {
+    let data = untangle_body(data, web_text)?;
+    if is_web {
         if let Some(s) = web_trailer_status(&data) {
             gs = Some(s);
         }
     }
     println!("  grpc-timeout：grpc-status={gs:?}（期望 4）");
+    let _ = &data;
     if gs.as_deref() != Some("4") {
         return Err(format!("grpc-timeout 期望 grpc-status=4，实际 {gs:?}").into());
     }
@@ -592,7 +654,7 @@ async fn run_client(port: u16, web: bool) -> Result<(), Box<dyn std::error::Erro
         .header(hyper::header::CONTENT_TYPE, ct)
         .header("te", "trailers")
         .header("x-token-bin", &token)
-        .body(Full::new(Bytes::from(grpc_frame(b"md"))))?;
+        .body(Full::new(Bytes::from(request_body(b"md", web_text))))?;
     let resp = sender.send_request(req).await?;
     let echoed = resp
         .headers()
@@ -613,7 +675,8 @@ async fn run_client(port: u16, web: bool) -> Result<(), Box<dyn std::error::Erro
             }
         }
     }
-    if web && note.is_none() {
+    let data = untangle_body(data, web_text)?;
+    if is_web && note.is_none() {
         // gRPC-Web：trailer 在 body 尾帧里
         let msgs = parse_messages(&data);
         let pos: usize = msgs.iter().map(|m| 5 + m.len()).sum();
@@ -649,6 +712,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sub = args.get(1).map(|s| s.as_str()).unwrap_or("");
     let mut port: u16 = if sub == "server" { 18061 } else { 18051 };
     let mut web = false;
+    let mut web_text = false;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -657,6 +721,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 port = args.get(i).ok_or("--port 缺参数")?.parse()?;
             }
             "--web" => web = true,
+            "--web-text" => web_text = true,
             other => {
                 eprintln!("未知参数：{other}");
                 std::process::exit(2);
@@ -667,11 +732,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match sub {
         "server" => run_server(port).await,
-        "client" => run_client(port, web).await,
+        "client" => run_client(port, web, web_text).await,
         _ => {
             eprintln!("用法：");
             eprintln!("  zgrpc-interop server --port 18061");
-            eprintln!("  zgrpc-interop client --port 18051 [--web]");
+            eprintln!("  zgrpc-interop client --port 18051 [--web | --web-text]");
             std::process::exit(2);
         }
     }

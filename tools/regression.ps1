@@ -16,7 +16,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # 测试数下限：只能抬高，不能降低（降低必须在 docs/决策记录.md 写明依据）
-$minTests = 34
+$minTests = 36
 
 $reportDir = Join-Path $root 'artifacts\regression'
 New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
@@ -108,7 +108,7 @@ if ($SkipSmoke) {
                 $clientCode = $LASTEXITCODE
                 Add-Content -Path $report -Value "[回归] 客户端输出：$clientOut" -Encoding UTF8
                 if ($clientCode -eq 0) {
-                    Write-Report "[回归] PASS：冒烟（并发双流 + bidi 3/3 + 健康检查 SERVING + grpc-timeout→DEADLINE_EXCEEDED + -bin metadata 往返）"
+                    Write-Report "[回归] PASS：冒烟（并发双流 + bidi 3/3 + 健康检查 SERVING + grpc-timeout→DEADLINE_EXCEEDED + -bin metadata 往返 + grpc-web-text 往返）"
                 } else {
                     Write-Report "[回归] FAIL：冒烟 exit=$clientCode（详见 $report）"
                     $failed += 'smoke'
@@ -180,6 +180,16 @@ if ($SkipInterop) {
                 } else {
                     Write-Report "[回归] FAIL：对拍 Rust client(gRPC-Web) exit=$rwc"
                     $failed += 'interop-rust-web'
+                }
+
+                $rto = & $interopExe client --port 18051 --web-text 2>&1 | Out-String
+                $rtc = $LASTEXITCODE
+                Add-Content -Path $report -Value "[回归] Rust client(gRPC-Web-text) -> zgrpc server：$rto" -Encoding UTF8
+                if ($rtc -eq 0) {
+                    Write-Report "[回归] PASS：对拍 Rust client(gRPC-Web-text) -> zgrpc server"
+                } else {
+                    Write-Report "[回归] FAIL：对拍 Rust client(gRPC-Web-text) exit=$rtc"
+                    $failed += 'interop-rust-webtext'
                 }
             } finally {
                 if ($zs -and -not $zs.HasExited) { Stop-Process -Id $zs.Id -Force -ErrorAction SilentlyContinue }

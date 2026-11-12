@@ -156,9 +156,21 @@ pub fn percentDecode(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
 // 规范：实现 MUST 接受带与不带 padding 的值，并**应当发不带 padding 的值**。
 // ---------------------------------------------------------------------------
 
-/// 编码：**不带 padding**。
+/// 编码：**不带 padding**（`-bin` metadata 用；规范要求发无 padding）。
 pub fn encodeBase64NoPad(alloc: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     const enc = std.base64.standard_no_pad.Encoder;
+    if (bytes.len == 0) return "";
+    const buf = try alloc.alloc(u8, enc.calcSize(bytes.len));
+    return enc.encode(buf, bytes);
+}
+
+/// 编码：**带 padding**（gRPC-Web 文本模式用）。
+///
+/// 为什么不能无 padding：多帧 base64 拼接时，无 padding 会让位流边界错位
+/// （5 字节 → 7 字符留 2 bit），下一帧直接接上就解不回来了。规范允许服务端
+/// 「随时 flush 并带 padding」，所以每帧独立 padding、客户端解码时忽略 `=` 即可。
+pub fn encodeBase64Padded(alloc: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    const enc = std.base64.standard.Encoder;
     if (bytes.len == 0) return "";
     const buf = try alloc.alloc(u8, enc.calcSize(bytes.len));
     return enc.encode(buf, bytes);
@@ -190,19 +202,64 @@ fn firstCommaSegment(raw: []const u8) []const u8 {
     return raw;
 }
 
+/// base64 **流式宽松解码**：忽略 `=`（in-stream padding）与空白。
+///
+/// 为什么需要它：gRPC-Web 文本模式下服务端可能「随时 flush 并带 padding」，
+/// 所以 `=` 会出现在流中间（规范明确客户端不得假设 padding 只在消息边界），
+/// 标准的 `std.base64` 解码器遇到中间 padding 会直接结束。
+pub fn decodeBase64Stream(alloc: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var acc: u32 = 0;
+    var bits: u5 = 0;
+    for (text) |c| {
+        if (c == '=') {
+            // padding = 当前 base64 分组结束，丢弃不满 8 位的残余位
+            acc = 0;
+            bits = 0;
+            continue;
+        }
+        if (c == '\r' or c == '\n' or c == ' ' or c == '\t') continue;
+        const v: u32 = switch (c) {
+            'A'...'Z' => c - 'A',
+            'a'...'z' => c - 'a' + 26,
+            '0'...'9' => c - '0' + 52,
+            '+' => 62,
+            '/' => 63,
+            else => return error.InvalidBase64,
+        };
+        acc = (acc << 6) | v;
+        if (bits + 6 >= 8) {
+            const shift: u5 = @intCast(bits + 6 - 8);
+            try out.append(alloc, @truncate((acc >> shift) & 0xff));
+            bits = @intCast((bits + 6) % 8);
+            acc &= (@as(u32, 1) << @intCast(bits)) - 1;
+        } else {
+            bits += 6;
+        }
+    }
+    return out.items;
+}
+
 const grpc_content_type = [_]hpack.Header{
     .{ .name = "content-type", .value = "application/grpc" },
 };
 
-/// 识别 content-type：原生 gRPC 或 gRPC-Web（浏览器可达）。返回 false 表示不是 gRPC 流量。
+/// 识别 content-type：原生 gRPC / gRPC-Web / gRPC-Web-text（浏览器可达）。返回 false 表示不是 gRPC 流量。
 fn describeContentType(req: h2.Request, call: *Call) bool {
     const ct = req.header("content-type") orelse return false;
     // 必须先判 web：`application/grpc-web` 也以 `application/grpc` 开头
-    if (std.mem.startsWith(u8, ct, "application/grpc-web")) {
+    if (std.mem.startsWith(u8, ct, "application/grpc-web-text")) {
+        // 文本模式（浏览器 XHR 回退）：整个 body 是 base64，响应也要 base64
         call.web = true;
+        call.web_text = true;
+        call.resp_content_type = "application/grpc-web-text+proto";
+    } else if (std.mem.startsWith(u8, ct, "application/grpc-web")) {
+        call.web = true;
+        call.web_text = false;
         call.resp_content_type = "application/grpc-web+proto";
     } else if (std.mem.startsWith(u8, ct, "application/grpc")) {
         call.web = false;
+        call.web_text = false;
         call.resp_content_type = "application/grpc";
     } else {
         return false;
@@ -257,6 +314,9 @@ pub const Call = struct {
     /// gRPC-Web（浏览器可达）：响应 `content-type: application/grpc-web+proto`，
     /// **trailers 走 body 尾帧**而不是 HTTP trailers。
     web: bool = false,
+    /// gRPC-Web **文本模式**（`application/grpc-web-text`）：请求与响应都是 base64，
+    /// 响应 `content-type: application/grpc-web-text+proto`。
+    web_text: bool = false,
     /// 响应 content-type（web / 原生）
     resp_content_type: []const u8 = "application/grpc",
     /// 客户端声明接受 gzip（`grpc-accept-encoding`）→ 响应消息压缩
@@ -404,6 +464,11 @@ pub const Call = struct {
         } else {
             try encodeMessage(&buf, self.alloc, payload);
         }
+        if (self.web_text) {
+            // 文本模式：每帧单独 base64（**带 padding**）后拼接，客户端解码时忽略 `=`
+            const enc = try encodeBase64Padded(self.alloc, buf.items);
+            return self.rsp.sendData(enc);
+        }
         try self.rsp.sendData(buf.items);
     }
 
@@ -454,6 +519,10 @@ pub const Call = struct {
                 try hs.appendSlice(a, self.resp_headers.items);
                 try self.rsp.begin("200", hs.items);
                 self.sent_any = true;
+            }
+            if (self.web_text) {
+                const enc = try encodeBase64Padded(a, block.items);
+                return self.rsp.endData(enc);
             }
             return self.rsp.endData(block.items);
         }
@@ -578,6 +647,14 @@ pub const Server = struct {
             return httpError(rsp, "415", "content-type must be application/grpc[+proto] or application/grpc-web[+proto]");
         }
 
+        // gRPC-Web 文本模式：整个请求体是 base64，先解码再交给业务
+        if (call.web_text) {
+            call.req.body = decodeBase64Stream(arena, call.req.body) catch {
+                call.setStatus(.invalid_argument, "grpc-web-text 请求体不是合法 base64");
+                return call.finish();
+            };
+        }
+
         const route = self.find(req.path) orelse {
             std.debug.print("[zgrpc.grpc] 未注册的方法：{s}\n", .{req.path});
             call.setStatus(.unimplemented, "未注册的方法");
@@ -626,6 +703,11 @@ pub const Server = struct {
         }
 
         if (self.findStreamRoute(req.path)) |sr| {
+            if (call.web_text) {
+                // 规范：gRPC-Web 不支持 bidi / 客户端流；文本模式更不可能逐帧解码
+                call.setStatus(.unimplemented, "grpc-web-text 不支持客户端流/bidi");
+                return call.finish();
+            }
             call.stream_route = sr;
             call.route_ctx = sr.ctx orelse self.outer_ctx;
             return;
@@ -659,7 +741,15 @@ pub const Server = struct {
             try call.accum.appendSlice(call.alloc, data);
             if (call.accum.items.len > max_stream_message) return error.BodyTooLarge;
             if (end_stream) {
-                call.req.body = call.accum.items;
+                // 文本模式：累积的是 base64 文本，到这里整体解码
+                if (call.web_text) {
+                    call.req.body = decodeBase64Stream(call.alloc, call.accum.items) catch {
+                        call.setStatus(.invalid_argument, "grpc-web-text 请求体不是合法 base64");
+                        return call.finish();
+                    };
+                } else {
+                    call.req.body = call.accum.items;
+                }
                 route.handler(call.route_ctx, call, call.alloc) catch |e| {
                     if (call.expired()) {
                         call.setStatus(.deadline_exceeded, "超过 grpc-timeout");
@@ -1491,4 +1581,16 @@ test "metadata：逗号合并的多段 -bin 逐段解码" {
     }, metadataHandler);
     // requestBinaryMetadata 取第一段
     try testing.expectEqualStrings("aGVsbG8", trip.headerValue("x-echo-bin").?);
+}
+test "base64：流式宽松解码（容忍 in-stream padding，对应 grpc-web-text）" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("hello", try decodeBase64Stream(a, "aGVsbG8"));
+    // 中间出现 padding（服务端分块 flush 的典型形态）
+    try testing.expectEqualStrings("hellohello", try decodeBase64Stream(a, "aGVsbG8=aGVsbG8="));
+    // 空白与换行也忽略
+    try testing.expectEqualStrings("hello", try decodeBase64Stream(a, "aGVs\r\nbG8="));
+    try testing.expectError(error.InvalidBase64, decodeBase64Stream(a, "aGVsbG8!"));
 }

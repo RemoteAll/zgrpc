@@ -66,6 +66,24 @@ pub const Result = struct {
     }
 };
 
+/// 请求/响应的 content-type 形态。
+pub const ContentType = enum {
+    /// 原生 gRPC over HTTP/2
+    grpc,
+    /// gRPC-Web（二进制帧，trailers 走 body 尾帧）
+    grpc_web,
+    /// gRPC-Web 文本模式（base64，浏览器 XHR 回退用）
+    grpc_web_text,
+
+    pub fn header(self: ContentType) []const u8 {
+        return switch (self) {
+            .grpc => "application/grpc",
+            .grpc_web => "application/grpc-web+proto",
+            .grpc_web_text => "application/grpc-web-text+proto",
+        };
+    }
+};
+
 pub const Options = struct {
     authority: []const u8 = "localhost",
     scheme: []const u8 = "http",
@@ -75,6 +93,8 @@ pub const Options = struct {
     timeout_ms: ?u32 = null,
     /// 规范建议的 UA 格式：`grpc-<lang>/<ver>`
     user_agent: []const u8 = "grpc-zgrpc/0.1.0",
+    /// 用哪种 content-type 形态（web 系列会自动做尾帧与 base64 处理）
+    content_type: ContentType = .grpc,
 };
 
 pub const Client = struct {
@@ -161,7 +181,11 @@ pub const Client = struct {
         for (reqs, results) |req, r| {
             var body: std.ArrayListUnmanaged(u8) = .empty;
             try grpc.encodeMessage(&body, arena, req.payload);
-            try writeFrame(self.writer, .data, h2.Flags.end_stream, r.stream_id, body.items);
+            const data = if (self.opts.content_type == .grpc_web_text)
+                try grpc.encodeBase64Padded(arena, body.items)
+            else
+                body.items;
+            try writeFrame(self.writer, .data, h2.Flags.end_stream, r.stream_id, data);
         }
         try self.writer.flush();
 
@@ -195,6 +219,11 @@ pub const Client = struct {
                     }
                     try bodies[idx].appendSlice(arena, payload);
                     try self.refundWindow(hdr.stream_id, payload.len);
+                    // gRPC-Web：流结束靠 DATA 的 END_STREAM（原生 gRPC 靠 trailers HEADERS）
+                    if (hdr.flags & h2.Flags.end_stream != 0) {
+                        done[idx] = true;
+                        remaining -= 1;
+                    }
                 },
                 .headers => {
                     const idx = indexOf(results, hdr.stream_id) orelse continue;
@@ -214,8 +243,6 @@ pub const Client = struct {
                     );
                     if (hdr.flags & h2.Flags.end_stream != 0) {
                         if (!done[idx]) {
-                            // 规范：缺 grpc-status / 非 200 时必须合成状态，不能静默认成功
-                            if (!saw_status[idx]) try synthesizeStatus(&results[idx], arena);
                             done[idx] = true;
                             remaining -= 1;
                         }
@@ -232,6 +259,27 @@ pub const Client = struct {
                 .goaway => return error.ConnectionClosed,
                 else => {},
             }
+        }
+
+        // 文本模式：整段 base64 → 二进制帧（忽略 in-stream padding）
+        if (self.opts.content_type == .grpc_web_text) {
+            for (bodies) |*b| {
+                if (b.items.len == 0) continue;
+                const decoded = try grpc.decodeBase64Stream(arena, b.items);
+                // 旧 items 也在 arena 上，不需要单独释放
+                b.* = std.ArrayListUnmanaged(u8).empty;
+                try b.appendSlice(arena, decoded);
+            }
+        }
+        // gRPC-Web：状态与自定义 metadata 在 body 尾帧里（不是 HTTP trailers）
+        if (self.opts.content_type != .grpc) {
+            for (results, bodies, 0..) |*r, b, i| {
+                try parseWebTrailers(r, b.items, &saw_status[i], arena);
+            }
+        }
+        // 仍未拿到状态（原生缺 trailers / web 缺尾帧）→ 规范要求合成，不能静默认成功
+        for (results, 0..) |*r, i| {
+            if (!saw_status[i]) try synthesizeStatus(r, arena);
         }
 
         // 去掉 gRPC 长度前缀，解出消息（压缩消息自动解压）
@@ -265,7 +313,11 @@ pub const Client = struct {
                 var body: std.ArrayListUnmanaged(u8) = .empty;
                 try grpc.encodeMessage(&body, arena, m);
                 const flags: u8 = if (i + 1 == messages.len) h2.Flags.end_stream else 0;
-                try writeFrame(self.writer, .data, flags, sid, body.items);
+                const data = if (self.opts.content_type == .grpc_web_text)
+                    try grpc.encodeBase64Padded(arena, body.items)
+                else
+                    body.items;
+                try writeFrame(self.writer, .data, flags, sid, data);
             }
         }
         try self.writer.flush();
@@ -323,8 +375,17 @@ pub const Client = struct {
             }
         }
 
+        var raw: []const u8 = resp.items;
+        if (self.opts.content_type == .grpc_web_text and resp.items.len > 0) {
+            raw = try grpc.decodeBase64Stream(arena, resp.items);
+        }
+        if (self.opts.content_type != .grpc) {
+            try parseWebTrailers(&result, raw, &saw_status, arena);
+        }
+        if (!saw_status) try synthesizeStatus(&result, arena);
+
         var list: std.ArrayListUnmanaged([]const u8) = .empty;
-        var it = grpc.MessageIterator{ .data = resp.items, .alloc = arena };
+        var it = grpc.MessageIterator{ .data = raw, .alloc = arena };
         while (it.next()) |m| try list.append(arena, m.payload);
         result.messages = list.items;
         return result;
@@ -352,7 +413,7 @@ pub const Client = struct {
             try hs.append(arena, .{ .name = "grpc-timeout", .value = v });
         }
         try hs.appendSlice(arena, &.{
-            .{ .name = "content-type", .value = "application/grpc" },
+            .{ .name = "content-type", .value = self.opts.content_type.header() },
             .{ .name = "te", .value = "trailers" },
             .{ .name = "user-agent", .value = self.opts.user_agent },
             // 声明可接受 gzip：否则服务端永远不会压缩响应（大消息白耗带宽）
@@ -405,6 +466,41 @@ fn applyHeaders(
         } else {
             try r.headers.append(arena, h);
         }
+    }
+}
+
+/// gRPC-Web：`grpc-status` 与自定义 metadata 在 body 的**最后一个尾帧**里（首字节 MSB=1，
+/// 后面是 4B 大端长度 + `k: v\r\n` 文本）。
+fn parseWebTrailers(
+    r: *Result,
+    data: []const u8,
+    saw_status: *bool,
+    arena: std.mem.Allocator,
+) !void {
+    var pos: usize = 0;
+    while (pos + 5 <= data.len) {
+        const flag = data[pos];
+        const len = std.mem.readInt(u32, data[pos + 1 ..][0..4], .big);
+        if (flag & 0x80 != 0) {
+            const end = @min(data.len, pos + 5 + len);
+            const text = data[pos + 5 .. end];
+            var it = std.mem.splitSequence(u8, text, "\r\n");
+            while (it.next()) |line| {
+                const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+                const name = std.mem.trim(u8, line[0..colon], " ");
+                const value = std.mem.trim(u8, line[colon + 1 ..], " ");
+                if (std.mem.eql(u8, name, "grpc-status")) {
+                    r.status = std.fmt.parseInt(u32, value, 10) catch 2;
+                    saw_status.* = true;
+                } else if (std.mem.eql(u8, name, "grpc-message")) {
+                    r.message = try grpc.percentDecode(arena, value);
+                } else if (name.len > 0) {
+                    try r.trailers.append(arena, .{ .name = name, .value = value });
+                }
+            }
+            return;
+        }
+        pos += 5 + @as(usize, len);
     }
 }
 
@@ -562,4 +658,69 @@ test "client：非 0 状态码不算 ok" {
     const res = try c.unary("/t.T/Call", "", a);
     try testing.expect(!res.ok());
     try testing.expectEqual(@as(u32, 12), res.status);
+}
+
+/// 构造 gRPC-Web **文本模式**的服务端响应：整个 body 是 base64（消息帧 + 尾帧）。
+fn buildWebTextResponse(
+    a: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    stream_id: u32,
+    payload: []const u8,
+    status: []const u8,
+) !void {
+    try h2.appendFrame(out, a, .settings, 0, 0, &.{});
+
+    var h1: std.ArrayListUnmanaged(u8) = .empty;
+    try hpack.encode(&.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "application/grpc-web-text+proto" },
+    }, &h1, a);
+    try h2.appendFrame(out, a, .headers, h2.Flags.end_headers, stream_id, h1.items);
+
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    try grpc.encodeMessage(&body, a, payload);
+    // 尾帧：0x80 + 4B 长度 + "grpc-status: N\r\n"
+    try body.append(a, 0x80);
+    const text = try std.fmt.allocPrint(a, "grpc-status: {s}\r\n", .{status});
+    var len: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len, @intCast(text.len), .big);
+    try body.appendSlice(a, &len);
+    try body.appendSlice(a, text);
+
+    const enc = try grpc.encodeBase64Padded(a, body.items);
+    try h2.appendFrame(out, a, .data, h2.Flags.end_stream, stream_id, enc);
+}
+
+test "client：grpc-web-text 往返（请求 base64 发出、状态取自 body 尾帧）" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try buildWebTextResponse(a, &input, 1, "pong", "0");
+
+    var r = std.Io.Reader.fixed(input.items);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var c = Client.init(testing.allocator, &r, &aw.writer, .{ .content_type = .grpc_web_text });
+    defer c.deinit();
+
+    const res = try c.unary("/t.T/Call", "ping", a);
+    try testing.expect(res.ok());
+    try testing.expectEqualStrings("pong", res.messages[0]);
+    try testing.expectEqualStrings("application/grpc-web-text+proto", res.header("content-type").?);
+
+    // 请求体也必须是 base64：解出来应是 [压缩位=0][长度=4]["ping"]
+    var pos: usize = h2.client_preface.len; // 跳过连接前言再看帧
+    var found = false;
+    while (h2.nextFrame(aw.written(), &pos)) |f| {
+        if (f.ftype != .data) continue;
+        found = true;
+        const raw = try grpc.decodeBase64Stream(a, f.payload);
+        try testing.expectEqual(@as(u8, 0), raw[0]);
+        try testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, raw[1..5], .big));
+        try testing.expectEqualStrings("ping", raw[5..]);
+    }
+    try testing.expect(found);
 }
