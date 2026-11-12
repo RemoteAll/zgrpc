@@ -13,7 +13,12 @@
     漏了它会被当成 message 编码，protoreflect 直接报错。
   - `describe shop.Order` 实测渲染出 `.common.Money` / `.common.Region`，且 `describe common.Money`
     （依赖文件里的类型）也能查；无 `.proto` 调用可正确往返 enum 与嵌套 message。
-  - 示例：`zig build import-server`（`examples/proto_import/`）；**codegen 仍只支持单文件**（遇 `import` 会报错）。
+  - 示例：`zig build import-server`（`examples/proto_import/`）；
+- **codegen 支持 `import`（protoc 风格）**：每个 `.proto` 生成自己的 `.pb.zig`，跨文件引用走
+  `const common_types = @import("common/types.pb.zig");` + `common_types.Money`；
+  **单文件场景的生成结果完全不变**（不为了 import 给所有类型加包名前缀）。
+  跑一次 `proto_gen` 会顺带生成全部依赖（`examples/proto_import/` 下即有 root + 依赖两份产物）。
+  约定：输出文件放在 root `.proto` 同一目录。
 - **嵌套 `message` / `enum` 定义**：生成 Zig 嵌套声明（引用写 `Outer.Inner`），反射侧递归收集符号
   并用相对全名解析 `type_name`；`grpcurl describe echo.Container.Nested` 可直接查。
 - **`optional`（proto3 显式 presence）**：生成 `?T`，**设为默认值也会写盘**（否则无法区分「设成 0」与「未设置」）。

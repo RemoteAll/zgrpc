@@ -39,6 +39,15 @@ pub fn build(b: *std.Build) void {
     pb_gen_mod.addImport("zgrpc", zgrpc);
     const pb_gen_tests = b.addTest(.{ .root_module = pb_gen_mod });
     test_step.dependOn(&b.addRunArtifact(pb_gen_tests).step);
+    // 带 import 的生成代码测试（`shop.pb.zig` 通过 @import 引用 `common/types.pb.zig`）
+    const shop_mod = b.createModule(.{
+        .root_source_file = b.path("examples/shop_pb_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    shop_mod.addImport("zgrpc", zgrpc);
+    const shop_tests = b.addTest(.{ .root_module = shop_mod });
+    test_step.dependOn(&b.addRunArtifact(shop_tests).step);
 
     // 代码生成：`zig build codegen`（重新生成 examples/echo.pb.zig）
     const gen_mod = b.createModule(.{
@@ -61,7 +70,12 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(bench_exe);
     // 透传命令行参数（Zig 0.17：用 b.args() 取）`n    if (comptime @hasDecl(std.Build, "args")) {}
     b.step("bench", "编译 unary 基准（跑 zig-out\\bin\\bench.exe，可加 --iterations N）").dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
-b.step("codegen", "从 examples/echo.proto 重新生成 examples/echo.pb.zig").dependOn(&gen_run.step);
+    // 带 import 的示例：一次生成 root + 它的依赖（各自一个 .pb.zig）
+    const gen_run2 = b.addRunArtifact(gen_exe);
+    gen_run2.addArgs(&.{ "examples/proto_import/shop.proto", "examples/proto_import/shop.pb.zig" });
+    const codegen_step = b.step("codegen", "从 examples/echo.proto 与 examples/proto_import/shop.proto 重新生成 .pb.zig");
+    codegen_step.dependOn(&gen_run.step);
+    codegen_step.dependOn(&gen_run2.step);
 
     // 示例：gRPC echo 服务端 / 客户端（`zig build echo-server` / `zig build echo-client`）
     addExample(b, zgrpc, target, optimize, "echo-server", "grpc_echo_server.zig", "运行 gRPC echo 服务端示例");

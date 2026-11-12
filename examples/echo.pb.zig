@@ -1,5 +1,5 @@
 //! 由 zgrpc tools/proto_gen.zig 生成，**请勿手改**。
-//! 来源：examples/echo.proto
+//! 来源：echo.proto
 //! package：echo
 
 const std = @import("std");

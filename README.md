@@ -93,6 +93,19 @@ zig run tools/proto_gen.zig -- my.proto my.pb.zig
 `map` 生成的形式是 `[]const XxxEntry`（`XxxEntry = struct { key: K, value: V }`）+ `get<Field>(k)`
 线性查找辅助 —— **零依赖、不引入 hash 容器**，小 map 足够快；条目类型名与描述符里的嵌套类型同名，便于双向对照。
 
+`import` 也能生成（**protoc 风格**）：每个 `.proto` 产出自己的 `.pb.zig`，跨文件引用走
+`const common_types = @import("common/types.pb.zig");` + `common_types.Money`。
+跑一次 `proto_gen` 会**顺带生成全部依赖**，不用逐个执行：
+
+```bash
+zig run tools/proto_gen.zig -- examples/proto_import/shop.proto examples/proto_import/shop.pb.zig
+# → examples/proto_import/shop.pb.zig（root）
+# → examples/proto_import/common/types.pb.zig（依赖）
+```
+
+约定：**输出文件放在 root `.proto` 同一目录**（`@import` 的相对路径按此推导），
+import 路径按 **root 所在目录**解析（等价 protoc 的单一 `-I`）。
+
 **不支持**（遇到会报错并给行号，不静默忽略）：`import public` / `import weak`、`reserved`、`extend`、`option`。
 
 ## 服务反射（`grpcurl` 无需 `.proto`）
