@@ -27,9 +27,11 @@ pub const gzip = @import("gzip.zig");
 pub const health = @import("health.zig");
 pub const clock = @import("clock.zig");
 pub const pb = @import("pb.zig");
+pub const socket_timeout = @import("socket_timeout.zig");
+pub const afd_reader = @import("afd_reader.zig");
 
 /// 库版本（语义化）。
-pub const version = "0.2.0";
+pub const version = "0.2.1";
 
 test {
     std.testing.refAllDecls(@This());

@@ -88,7 +88,7 @@ zig run tools/proto_gen.zig -- my.proto my.pb.zig
 **不支持**（遇到会报错并给行号，不静默忽略）：`import`、`map`、`oneof`、`optional`、`reserved`、
 `extend`、`option`、嵌套定义、`repeated` message/string。
 
-## 客户端本地读超时（含 Windows）
+## 客户端本地读超时（内核层，含 Windows）
 
 `Client.Options.timeout_ms` 是**整次调用**的本地超时：等响应头、逐帧读响应体都受它约束。
 
@@ -101,13 +101,22 @@ defer client.deinit();
 client.enableTimeout(stream, io);     // 启用本地读超时
 ```
 
-**原理**：常驻一个读线程把 socket 数据读进缓冲区，主线程用 `io.waitTimeout`（futex / `WaitOnAddress`）带时限等待。
+**实现（零线程、零额外内存）**
 
-之所以不用 `poll` / `SO_RCVTIMEO` / `CancelIoEx` / `shutdown`：Zig 0.17 在 Windows 上用 **AFD 句柄 + overlapped IO**（不是 Winsock SOCKET），这些手段要么编译期不可用，要么对 AFD 读**完全无效**；`CancelIoEx` 还会因 std 把 `STATUS_CANCELLED` 映射为 `unreachable` 而**直接崩进程**。六种方案逐一实测失败的过程见 [`docs/决策记录.md`](docs/决策记录.md)「增补十六 / 十七」。
+| 平台 | 方式 |
+|---|---|
+| Windows | 在 AFD 句柄上自己发起 overlapped `IOCTL_AFD_RECEIVE`，再用 `NtWaitForSingleObject(句柄)` 带时限等待；到点 `NtCancelIoFileEx` 取消并等 IRP 收尾 |
+| POSIX | `setsockopt(SO_RCVTIMEO)`，到点 `read` 返回 `EAGAIN` |
 
-**使用约定（重要）**：启用本地超时的连接，**退出时不要 `stream.close(io)`**——读线程可能仍阻塞在底层读上，关掉 socket 会让它拿到 `CONNECTION_ABORTED` 触发 std panic。`Client.deinit()` 在读线程已自行结束时完整回收，否则只标记退出并留下一个有界结构（随进程退出归还）。超时后的连接**不要复用**（协议状态已不完整），重新建连即可。
+实测：服务端接受连接但永不应答时，`timeout_ms = 200` 的调用在 **201~211ms** 返回 `error.Timeout`（`zig build afd-probe` / `timeout-probe`）。
 
-实测：服务端接受连接但永不应答时，`timeout_ms = 200` 的调用在 **206~210ms** 返回 `error.Timeout`。
+**为什么不是「std 没提供就只能自己起线程」** —— 读 Zig 0.17.1 源码可以看到：`netReadWindows` 发起读时**已经是 AFD overlapped 模式**（`.AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true }`），只是它把 **event 传成 `null`**、改用 APC 例程等待，所以在 std 内部无法给这次读设时限；而它的状态映射里早就写了 `.IO_TIMEOUT => error.ConnectionTimedOut`。把同一件事换成「自己发起 + 等句柄 signaling」就能拿到原生超时。
+
+顺带记录两个源码事实，避免再走弯路：
+- `IpAddress.ConnectOptions.timeout` 字段存在，但 Windows 实现是 `@panic("TODO implement netConnectIpWindows with timeout")`；
+- AFD 层**不认** `SO_RCVTIMEO`（`IOCTL_AFD_SOCKOPT` 返回 `STATUS_NOT_SUPPORTED`）—— 那是 Winsock 层的概念，而 Zig 用的是 AFD 句柄。
+
+**使用提示**：超时后连接**不要复用**（协议状态已不完整），重新建连即可；现在 socket 可以安全 `close`（取消后 IRP 已收尾）。
 ## 构建与验证
 
 ```bash

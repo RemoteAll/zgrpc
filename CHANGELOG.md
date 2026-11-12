@@ -10,13 +10,18 @@
 - **CHANGELOG 编码损坏**：同一次发版把本文件写成了乱码，本版重建。
 
 ### 新增
-- **客户端本地读超时（全平台，含 Windows）**：`Client.Options.timeout_ms` 从「只管建连」升级为**整次调用**的时限，用 `client.enableTimeout(stream, io)` 启用。
-  - 实现为「常驻读线程 + `io.waitTimeout`（futex / `WaitOnAddress`）」：读线程持续把 socket 数据读入缓冲，主线程带时限等待数据到达或调用结束。
-  - 实测：服务端接受连接但永不应答时，`timeout_ms = 200` 的调用在 **206~210ms** 返回 `error.Timeout`。
-  - 之所以另起读线程：Zig 0.17 的 Windows socket 是 **AFD 句柄 + overlapped IO**（不是 Winsock SOCKET），`poll` / `WSAPoll` / `setsockopt(SO_RCVTIMEO)` / `CancelIoEx` / `stream.shutdown` 五种手段逐一实测均无效或不可用（`CancelIoEx` 还会因 std 把 `STATUS_CANCELLED` 映射为 `unreachable` 而崩进程）。失败过程与原因见 `docs/决策记录.md`「增补十六 / 十七」。
-  - 使用约定：启用本地超时的连接**退出时不要 `stream.close(io)`**（读线程可能仍阻塞在底层读上，关闭会让它拿到 `CONNECTION_ABORTED` 触发 std panic）；超时后的连接不要复用，重建即可。`Client.deinit()` 在读线程已自行结束时完整回收，否则只标记退出并留下一个有界结构（随进程退出归还）。
-- 新增 `examples/client_timeout_probe.zig`（`zig build timeout-probe`）与回归项「客户端本地读超时」，防止将来退化。
+- **客户端本地读超时（内核层，全平台含 Windows）**：`Client.Options.timeout_ms` 从「只管建连」升级为**整次调用**的时限，`client.enableTimeout(stream, io)` 启用。
+  - **Windows**：在 AFD 句柄上自己发起 overlapped `IOCTL_AFD_RECEIVE`，用 `NtWaitForSingleObject(句柄)` 带时限等待，到点 `NtCancelIoFileEx` 取消并等 IRP 收尾（`src/afd_reader.zig`）。
+  - **POSIX**：`setsockopt(SO_RCVTIMEO)`（`src/socket_timeout.zig`）。
+  - **零线程、零额外内存**：不需要读线程，也就不存在线程滞留问题。
+  - 实测：`timeout_ms = 200` → **201~211ms** 返回 `error.Timeout`。
+  - 此前用「读线程 + `io.waitTimeout`」的方案已删除（`src/async_reader.zig`）。
+- 新增探针 `examples/afd_timeout_probe.zig`（`zig build afd-probe`），逐步验证「Zig 原生读可用 → 我方 IOCTL 超时生效 → 耗时在区间内」。
 
+### 修复
+- **README 内容丢失**：0.2.0 发版提交误把 `README.md` 截成两行（6364 → 197 字节），本版按上一完整版本恢复，并清掉正文里残留的字面 `\n`。
+- **CHANGELOG 编码损坏**：同一次发版把本文件写成了乱码，本版重建。
+- **`user_agent` 版本号**：`grpc-zgrpc/0.2.0` 未随版本更新，本版一并修正。
 ### 测试
 - 单元 / 端到端测试 **51** 个（原 50，新增超时相关断言）；回归脚本新增 timeout-probe 段。
 

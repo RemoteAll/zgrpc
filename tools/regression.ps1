@@ -16,7 +16,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # 测试数下限：只能抬高，不能降低（降低必须在 docs/决策记录.md 写明依据）
-$minTests = 51
+$minTests = 52
 
 $reportDir = Join-Path $root 'artifacts\regression'
 New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
@@ -132,6 +132,26 @@ if ($SkipSmoke) {
         } else {
             Write-Report "[回归] FAIL：客户端本地读超时 exit=$pc（详见 $report）"
             $failed += 'timeout-probe'
+        }
+    }
+}
+
+# ---------- 2.7 Windows AFD 原生读超时（overlapped + NtWaitForSingleObject） ----------
+if ($SkipSmoke) {
+    Write-Report "[回归] SKIP：AFD 原生超时探针（-SkipSmoke）"
+} else {
+    $afdExe = Join-Path $root 'zig-out\bin\afd-probe.exe'
+    if (-not (Test-Path $afdExe)) {
+        Write-Report "[回归] SKIP：AFD 原生超时探针（缺 afd-probe.exe，先跑一次不带 -SkipBuild 的回归）"
+    } else {
+        $ao = & $afdExe 2>&1 | Out-String
+        $ac = $LASTEXITCODE
+        Add-Content -Path $report -Value "[回归] afd-probe：$ao" -Encoding UTF8
+        if ($ac -eq 0) {
+            Write-Report "[回归] PASS：AFD 原生读超时（内核层产生 Timeout，零线程）"
+        } else {
+            Write-Report "[回归] FAIL：AFD 原生读超时 exit=$ac（详见 $report）"
+            $failed += 'afd-probe'
         }
     }
 }

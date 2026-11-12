@@ -7,11 +7,13 @@
 //! 交互式双向流（bidi）需要自己基于 `h2` 层构建，见 README「未做」。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const h2 = @import("h2.zig");
 const hpack = @import("hpack.zig");
 const grpc = @import("grpc.zig");
 
-const AsyncReader = @import("async_reader.zig").AsyncReader;
+const afd_reader = @import("afd_reader.zig");
+const socket_timeout = @import("socket_timeout.zig");
 const clock = @import("clock.zig");
 
 pub const Request = struct {
@@ -95,7 +97,7 @@ pub const Options = struct {
     /// 默认超时（毫秒）；空 = 不设（同规范：缺省视为无限超时）
     timeout_ms: ?u32 = null,
     /// 规范建议的 UA 格式：`grpc-<lang>/<ver>`
-    user_agent: []const u8 = "grpc-zgrpc/0.2.0",
+    user_agent: []const u8 = "grpc-zgrpc/0.2.1",
     /// 用哪种 content-type 形态（web 系列会自动做尾帧与 base64 处理）
     content_type: ContentType = .grpc,
 };
@@ -109,11 +111,11 @@ pub const Client = struct {
     /// 下一个可用流 id（客户端发起的流必须是奇数）
     next_stream_id: u32 = 1,
     started: bool = false,
-    /// 本地超时所需（`enableTimeout` 提供）
+    /// 本地超时所需的 socket（`enableTimeout` 提供）
     timeout_stream: ?std.Io.net.Stream = null,
     timeout_io: ?std.Io = null,
-    /// 带超时的读源（启用后读都走它）
-    async_reader: ?*AsyncReader = null,
+    /// 是否已启用**原生读超时**（Windows：AFD overlapped；POSIX：`SO_RCVTIMEO`）
+    native_timeout: bool = false,
     /// 本次调用的绝对截止时刻（单调时钟纳秒）；null = 不限
     deadline_ns: ?i128 = null,
 
@@ -134,38 +136,78 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         self.stopGuard();
-        if (self.async_reader) |ar| {
-            // 读线程可能仍阻塞在底层 socket 读上（Windows 无法打断），这里只让它尽快退出，
-            // 不 join 也不释放——泄漏一个有界结构，换取「绝不 hang 住、绝不 use-after-free」。
-            ar.stop.store(true, .release);
-            self.async_reader = null;
-        }
+        // 本地超时走的是**内核层**（AFD overlapped / `SO_RCVTIMEO`）：
+        // 不启线程、不占额外内存，因此这里没有任何需要 join / 回收的东西。
         self.decoder.deinit();
     }
 
-    /// 启用**本地读超时**：起一条常驻读线程，读在条件变量上带超时等待（见 `async_reader.zig`）。
+    /// 启用**本地读超时**（内核层，零线程）。
     ///
-    /// 为什么需要它：`grpc-timeout` 头只管服务端；服务端卡住（或对端根本不是 gRPC）时，
-    /// 客户端必须能自己退出。Windows 上 Zig 的底层读无法被打断，只能用户态做超时。
+    /// - **Windows**：在 AFD 句柄上自己发起 overlapped `IOCTL_AFD_RECEIVE`，
+    ///   再用 `NtWaitForSingleObject(句柄)` 带时限等待（见 `afd_reader.zig`，实测 201ms 生效）。
+    /// - **POSIX**：`setsockopt(SO_RCVTIMEO)`，到点 `read` 返回 `EAGAIN`。
     pub fn enableTimeout(self: *Client, stream: std.Io.net.Stream, io: std.Io) void {
-        if (self.async_reader != null) return;
+        if (self.native_timeout) return;
         self.timeout_stream = stream;
         self.timeout_io = io;
-        self.async_reader = AsyncReader.start(self.alloc, io, stream) catch |e| blk: {
-            std.debug.print("[zgrpc.client] 启动读线程失败（本地超时不可用）：{s}\\n", .{@errorName(e)});
-            break :blk null;
-        };
+        // Windows 无需预先设置：时限在每次读时作为参数传入。
+        if (builtin.os.tag != .windows) {
+            socket_timeout.setRecvTimeout(io, stream, 0) catch |e| {
+                std.debug.print("[zgrpc.client] 设置 SO_RCVTIMEO 失败，本地超时不可用：{s}\n", .{@errorName(e)});
+                return;
+            };
+        }
+        self.native_timeout = true;
+    }
+    /// 读满 `dest`；启用本地超时后按**剩余时间**喂超时，到点返回 `error.Timeout`。
+    fn readExact(self: *Client, dest: []u8) !void {
+        if (!self.native_timeout) return self.reader.readSliceAll(dest);
+        const stream = self.timeout_stream orelse return self.reader.readSliceAll(dest);
+        const io = self.timeout_io orelse return self.reader.readSliceAll(dest);
+
+        var off: usize = 0;
+        while (off < dest.len) {
+            if (self.isExpired()) return error.Timeout;
+            const remain = self.remainingTimeoutMs();
+            const slice = dest[off..];
+            var got: usize = 0;
+            if (builtin.os.tag == .windows) {
+                got = afd_reader.read(stream.socket.handle, slice, remain) catch |e| switch (e) {
+                    error.Timeout => return error.Timeout,
+                    error.ConnectionResetByPeer, error.SocketUnconnected => return error.ConnectionClosed,
+                    else => |other| return other,
+                };
+            } else {
+                if (remain) |ms| socket_timeout.setRecvTimeout(io, stream, ms) catch {};
+                var datas = [1][]u8{slice};
+                got = stream.read(io, &datas) catch |e| {
+                    if (socket_timeout.isReadTimeout(e)) return error.Timeout;
+                    return e;
+                };
+            }
+            if (got == 0) return error.ConnectionClosed; // 对端已关闭
+            off += got;
+        }
     }
 
-    fn readExact(self: *Client, dest: []u8) !void {
-        if (self.async_reader) |ar| return ar.readExact(dest, self.deadline_ns);
-        return self.reader.readSliceAll(dest);
+    /// 距离截止时刻还剩多少毫秒（向上取整，至少 1）；未设截止时返回 null。
+    fn remainingTimeoutMs(self: *Client) ?u32 {
+        const deadline = self.deadline_ns orelse return null;
+        const remain = deadline - clock.monotonicNs();
+        if (remain <= 0) return 1;
+        const ms = @divTrunc(remain + std.time.ns_per_ms - 1, std.time.ns_per_ms);
+        return @intCast(@min(ms, @as(i128, std.math.maxInt(u32))));
+    }
+
+    fn isExpired(self: *Client) bool {
+        const deadline = self.deadline_ns orelse return false;
+        return clock.monotonicNs() >= deadline;
     }
 
     /// 按本次调用计算绝对 deadline（多流共用一条 socket，取**最短**的超时）。
     fn startGuard(self: *Client, reqs: []const Request) void {
         self.deadline_ns = null;
-        if (self.async_reader == null) return;
+        if (!self.native_timeout) return;
         var ms: ?u32 = self.opts.timeout_ms;
         for (reqs) |r| {
             if (r.timeout_ms) |t| ms = if (ms) |m| @min(m, t) else t;
