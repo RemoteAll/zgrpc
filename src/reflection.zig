@@ -177,7 +177,7 @@ fn collectSymbols(alloc: std.mem.Allocator, p: proto.Proto) ![]const []const u8 
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
     const prefix = if (p.package.len > 0) try std.fmt.allocPrint(alloc, "{s}.", .{p.package}) else "";
 
-    for (p.messages) |m| try collectNestedSymbols(alloc, &list, prefix[0 .. prefix.len -| 1], m);
+    for (p.messages) |m| try collectNestedSymbols(alloc, &list, prefix[0..prefix.len -| 1], m);
     for (p.enums) |e| try list.append(alloc, try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, e.name }));
     for (p.services) |s| {
         try list.append(alloc, try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, s.name }));
@@ -291,7 +291,7 @@ fn writeFileDescriptorResponse(w: *pb.Writer, a: std.mem.Allocator, files: []con
 fn writeError(w: *pb.Writer, a: std.mem.Allocator, code: grpc.Status, msg: []const u8) !void {
     var inner = pb.Writer.init(a);
     defer inner.deinit();
-    try inner.int32(1, @intCast(@intFromEnum(code)));
+    try inner.int32(1, @intCast(@backingInt(code)));
     try inner.string(2, msg);
     try w.message(7, inner.bytes()); // error_response
 }

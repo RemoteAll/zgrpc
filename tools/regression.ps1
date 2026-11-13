@@ -37,6 +37,21 @@ $reportDir = Join-Path $root 'artifacts\regression'
 New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
 $report = Join-Path $reportDir ('report-{0}.txt' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 
+# 跑一个探针程序并把 stdout+stderr 合成一段文本（不污染 $LASTEXITCODE）。
+# PowerShell 5.1 会把原生 exe 的 stderr 当成 NativeCommandError，`2>&1 |` 会让
+# $LASTEXITCODE 变成不可靠的值 —— 探针恰恰都往 stderr 打诊断，所以必须落文件再读。
+function Invoke-Probe([string]$Exe, [string]$Tag) {
+    $o = Join-Path $reportDir "$Tag.out.txt"
+    $e = Join-Path $reportDir "$Tag.err.txt"
+    & $Exe > $o 2> $e
+    $code = $LASTEXITCODE
+    $text = ''
+    if (Test-Path $o) { $text += (Get-Content $o -Raw -Encoding UTF8) }
+    if (Test-Path $e) { $text += (Get-Content $e -Raw -Encoding UTF8) }
+    $global:LASTEXITCODE = $code
+    return $text
+}
+
 function Write-Report([string]$msg) {
     Write-Host $msg
     Add-Content -Path $report -Value $msg -Encoding UTF8
@@ -139,7 +154,7 @@ if ($SkipSmoke) {
     if (-not (Test-Path $probeExe)) {
         Write-Report "[回归] SKIP：客户端超时探针（缺 timeout-probe.exe，先跑一次不带 -SkipBuild 的回归）"
     } else {
-        $po = & $probeExe 2>&1 | Out-String
+        $po = Invoke-Probe -Exe $probeExe -Tag 'timeout-probe'
         $pc = $LASTEXITCODE
         Add-Content -Path $report -Value "[回归] timeout-probe：$po" -Encoding UTF8
         if ($pc -eq 0) {
@@ -159,7 +174,7 @@ if ($SkipSmoke) {
     if (-not (Test-Path $afdExe)) {
         Write-Report "[回归] SKIP：AFD 原生超时探针（缺 afd-probe.exe，先跑一次不带 -SkipBuild 的回归）"
     } else {
-        $ao = & $afdExe 2>&1 | Out-String
+        $ao = Invoke-Probe -Exe $afdExe -Tag 'afd-probe'
         $ac = $LASTEXITCODE
         Add-Content -Path $report -Value "[回归] afd-probe：$ao" -Encoding UTF8
         if ($ac -eq 0) {
@@ -277,6 +292,20 @@ if ($SkipSmoke) {
     } finally {
         if ($srv2 -and -not $srv2.HasExited) { Stop-Process -Id $srv2.Id -Force -ErrorAction SilentlyContinue }
     }
+}
+
+# ---------- 3.7 keepalive：服务端必须主动发 PING ----------
+$kaExe = Join-Path $root 'zig-out\bin\keepalive-probe.exe'
+if ($SkipSmoke) {
+    Write-Report "[回归] SKIP：keepalive（-SkipSmoke）"
+} elseif (-not (Test-Path $kaExe)) {
+    Write-Report "[回归] SKIP：keepalive（缺少 keepalive-probe 产物）"
+} else {
+    $kaOut = Invoke-Probe -Exe $kaExe -Tag 'keepalive-probe'
+    $kaCode = $LASTEXITCODE
+    Add-Content -Path $report -Value "[回归] keepalive-probe：$kaOut" -Encoding UTF8
+    if ($kaCode -eq 0) { Write-Report "[回归] PASS：keepalive（服务端主动 PING）" }
+    else { Write-Report "[回归] FAIL：keepalive exit=$kaCode（详见 $report）"; $failed += 'keepalive' }
 }
 
 # ---------- 4. 互操作对拍（Rust hyper 当裁判，双向）----------

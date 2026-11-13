@@ -15,7 +15,7 @@ test "import codegen：跨文件 message / enum / repeated / map 往返" {
         .total = .{ .cents = 100, .currency = "CNY" },
         .region = .CN,
         .lines = &.{ .{ .cents = 5 }, .{ .cents = 6, .currency = "USD" } },
-        .by_sku = &.{ .{ .key = "s1", .value = .{ .cents = 9 } } },
+        .by_sku = &.{.{ .key = "s1", .value = .{ .cents = 9 } }},
     };
     const bytes = try o.encode(a);
     const back = try shop.Order.decode(bytes, a);

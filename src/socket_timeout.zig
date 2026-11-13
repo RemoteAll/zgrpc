@@ -3,7 +3,7 @@
 //! ## 为什么这条路能成（读 Zig 0.17.1 源码得出的结论）
 //!
 //! 之前用 `ws2_32.setsockopt(SO_RCVTIMEO)` 实测「设置成功但读照旧阻塞」，原因是
-//! **Zig 0.17 的 socket 是 AFD 句柄（`\Device\Afd`），不是 Winsock SOCKET**，
+//! **Zig 0.17.1 的 socket 是 AFD 句柄（`\Device\Afd`），不是 Winsock SOCKET**，
 //! Winsock 的 `setsockopt` 根本没落到这个句柄上。
 //!
 //! 而 `std/Io/Threaded.zig` 里 Zig 自己是这么干的：

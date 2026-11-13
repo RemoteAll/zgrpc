@@ -6,6 +6,12 @@
 ## 未发布
 
 ### 新增
+- **keepalive（服务端主动 PING）**：长连接穿过 NAT / 四层 LB 时避免被当成「空闲」掐掉。
+  - `h2.Connection.write_mutex`（自旋锁）+ `sendPing()` + PING ACK 计数；`writeFrame` 的头+体+flush 全程持锁。
+  - `grpc.Server.keepalive_interval_ms` + `spawnKeepalive()` / `pingAll()` / `connCount()`；
+    **一个后台线程服务所有连接**（不是每连接一线程）。
+  - 实测：100ms 间隔在 1500ms 内发 14 个 PING（理论值 15）。
+  - **不主动断开无响应连接**（属传输层策略）；`pingAcks()` 已暴露计数供调用方自行判定。
 - **`import` 跨文件引用（加载 + 反射）**：新增 `zgrpc.proto_loader`（递归加载、拓扑排序、循环依赖报错）
   与 `zgrpc.reflection.Service.fromLoaded`（每个文件一份 `FileDescriptorProto`，带 `dependency`）。
   路径按 **root 文件所在目录**解析（等价单一 `-I`，与 protoc 一致）。
@@ -128,7 +134,7 @@
   超范围语法（`import` / `map` / `oneof` / `optional` / 嵌套定义等）**报错带行号**
 
 **基础设施**
-- `clock`：单调时钟与睡眠（Zig 0.17 已移除 `std.time.nanoTimestamp` / `std.Thread.sleep`）
+- `clock`：单调时钟与睡眠（Zig 0.17.1 已移除 `std.time.nanoTimestamp` / `std.Thread.sleep`）
 - `gzip`：消息压缩
 
 ### 健壮性 / 安全
@@ -153,7 +159,7 @@
 
 | 项 | 原因 |
 |---|---|
-| 内置 TLS | Zig 0.17 标准库只有 tls **client** 且无 ALPN；服务端 TLS 应交给反代（见 `docs/部署.md`） |
+| 内置 TLS | Zig 0.17.1 标准库只有 tls **client** 且无 ALPN；服务端 TLS 应交给反代（见 `docs/部署.md`） |
 | `grpc-timeout` 强制中断 | Zig 无抢占式取消，同步 handler 无法被外部打断；改为业务侧 `checkDeadline()` |
 | well-known types / 服务反射 | 需要完整 protobuf descriptor 体系，超出传输层定位 |
 | 完整的 `.proto` 支持 | 同上；当前覆盖服务间自控两端的常见写法 |

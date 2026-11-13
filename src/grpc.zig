@@ -493,7 +493,7 @@ pub const Call = struct {
 
         const a = self.alloc;
         var code_buf: [8]u8 = undefined;
-        const code = try std.fmt.bufPrint(&code_buf, "{d}", .{@intFromEnum(self.status)});
+        const code = try std.fmt.bufPrint(&code_buf, "{d}", .{@backingInt(self.status)});
 
         // gRPC-Web：trailers 做成 body 尾帧（0x80 | 4B 长度 | "k: v\r\n"...）
         if (self.web) {
@@ -609,8 +609,90 @@ pub const Server = struct {
     /// 路由未指定 `ctx` 时使用
     outer_ctx: *anyopaque,
 
+    /// keepalive 间隔（毫秒）。`null` = 不发 PING（默认，避免无意义周期劳作）。
+    ///
+    /// 只配它**不会自动发**：还需要 `spawnKeepalive()` 或由调用方周期调 `pingAll()`。
+    /// 典型场景：长连接要穿过 NAT / 四层 LB（它们会掐掉「空闲」连接，通常 5~60 分钟）。
+    keepalive_interval_ms: ?u32 = null,
+
+    /// 活跃连接（keepalive 线程遍历用）；由 `serveConn` 自动登记/注销。
+    conns: std.ArrayListUnmanaged(*h2.Connection) = .empty,
+    conns_lock: h2.SpinLock = .{},
+    /// keepalive 线程的停止标志（`spawnKeepalive` 用）
+    keepalive_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    /// 登记连接/线程用的分配器（`spawnKeepalive` 设置；未设置时退回 page_allocator）
+    outer_ctx_alloc: ?std.mem.Allocator = null,
+
     pub fn context(self: *Server) *anyopaque {
         return @ptrCast(self);
+    }
+
+    /// 当前活跃连接数（可观测）。
+    pub fn connCount(self: *Server) usize {
+        self.conns_lock.lock();
+        defer self.conns_lock.unlock();
+        return self.conns.items.len;
+    }
+
+    fn registerConn(self: *Server, c: *h2.Connection) void {
+        self.conns_lock.lock();
+        defer self.conns_lock.unlock();
+        self.conns.append(self.outer_ctx_alloc orelse std.heap.page_allocator, c) catch |e| {
+            std.debug.print("[zgrpc.server] 登记连接失败（keepalive 对该连接不可用）：{s}\n", .{@errorName(e)});
+        };
+    }
+
+    fn unregisterConn(self: *Server, c: *h2.Connection) void {
+        self.conns_lock.lock();
+        defer self.conns_lock.unlock();
+        for (self.conns.items, 0..) |item, i| {
+            if (item == c) {
+                _ = self.conns.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// 向所有活跃连接发一次 PING（keepalive 的核心动作）。
+    ///
+    /// 不主动断开无响应的连接 —— 那属于传输层/上层策略，这里只保证「链路上有流量」。
+    pub fn pingAll(self: *Server) usize {
+        self.conns_lock.lock();
+        defer self.conns_lock.unlock();
+        var sent: usize = 0;
+        for (self.conns.items) |c| {
+            c.sendPing(null) catch |e| {
+                std.debug.print("[zgrpc.server] keepalive PING 发送失败（连接可能刚关闭）：{s}\n", .{@errorName(e)});
+                continue;
+            };
+            sent += 1;
+        }
+        return sent;
+    }
+
+    /// 起一个后台线程，每 `keepalive_interval_ms` 调一次 `pingAll()`。
+    ///
+    /// **生命周期要求**：`Server` 必须比该线程活得久（`deinitKeepalive()` 会置停止标志并 join）。
+    pub fn spawnKeepalive(self: *Server, allocator: std.mem.Allocator) !std.Thread {
+        const interval_ms = self.keepalive_interval_ms orelse return error.KeepaliveDisabled;
+        self.outer_ctx_alloc = allocator;
+        self.keepalive_stop.store(false, .release);
+        return std.Thread.spawn(.{ .stack_size = conn_stack_size }, keepaliveLoop, .{ self, interval_ms });
+    }
+
+    /// 让 keepalive 线程退出并等待它结束（join 由调用方用返回的句柄完成）。
+    pub fn stopKeepalive(self: *Server) void {
+        self.keepalive_stop.store(true, .release);
+    }
+
+    fn keepaliveLoop(self: *Server, interval_ms: u32) void {
+        const interval_ns: u64 = @as(u64, interval_ms) *| std.time.ns_per_ms;
+        while (!self.keepalive_stop.load(.acquire)) {
+            // Zig 0.17.1 移除了 `std.Thread.sleep`；`clock.sleepNs` 是跨平台实现
+            @import("clock.zig").sleepNs(interval_ns);
+            if (self.keepalive_stop.load(.acquire)) break;
+            _ = self.pingAll();
+        }
     }
 
     /// 整请求模式（也是 `serve` 的旧入口）。
@@ -666,6 +748,10 @@ pub const Server = struct {
 
         var conn = h2.Connection.init(allocator, &sr.interface, &sw.interface, .{});
         defer conn.deinit();
+
+        // keepalive 需要能从其它线程发帧 → 把连接登记进服务端
+        self.registerConn(&conn);
+        defer self.unregisterConn(&conn);
 
         conn.serveStreaming(self.streamHooks()) catch |e| {
             if (e != error.ConnectionClosed) {

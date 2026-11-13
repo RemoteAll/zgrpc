@@ -1,7 +1,7 @@
 //! 单调时钟 + 睡眠（零依赖）：给 `grpc-timeout` 的截止时间用。
 //!
 //! 为什么不用实时钟：deadline 必须「只向前、不被系统时间跳变影响」，否则
-//! 校时（NTP）或手工改表会让超时判定忽早忽晚。Zig 0.17 已移除
+//! 校时（NTP）或手工改表会让超时判定忽早忽晚。Zig 0.17.1 已移除
 //! `std.time.nanoTimestamp`，而 `std.Io.Clock` 需要一个 `std.Io` 实例
 //! （本库是纯同步 IO，不调用点拿不到 io），因此这里直接走 **std 已声明的原生入口**：
 //!
@@ -58,7 +58,7 @@ pub fn realtimeNs() i128 {
     }
 }
 
-/// 睡眠（跨平台；Zig 0.17 已移除 `std.Thread.sleep`）。
+/// 睡眠（跨平台；Zig 0.17.1 已移除 `std.Thread.sleep`）。
 pub fn sleepNs(ns: u64) void {
     if (ns == 0) return;
     switch (builtin.os.tag) {

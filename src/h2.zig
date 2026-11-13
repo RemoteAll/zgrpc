@@ -251,11 +251,31 @@ const PendingFrame = struct {
     payload: []u8,
 };
 
+/// 极简自旋锁：临界区只有「写一帧 + flush」（微秒级）。
+/// Zig 0.17.1 的 `std.Io.Mutex` 需要 `io` 参数且可取消，而 `writeFrame` 没有 io 上下文 ——
+/// 为一把只用几微秒的锁引入 io 依赖不值得。
+pub const SpinLock = struct {
+    locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    pub fn lock(self: *SpinLock) void {
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn unlock(self: *SpinLock) void {
+        self.locked.store(false, .release);
+    }
+};
+
 pub const Connection = struct {
     /// 连接级长期分配（HPACK 动态表、流对象与延后帧）
     alloc: std.mem.Allocator,
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
+    /// 帧写入互斥：keepalive 线程可能与业务线程同时发帧，
+    /// 一帧的「头 + 体 + flush」必须原子，否则会交错出非法帧。
+    write_mutex: SpinLock = .{},
     opts: Options = .{},
     decoder: hpack.Decoder,
 
@@ -278,6 +298,11 @@ pub const Connection = struct {
     dispatch_depth: u8 = 0,
     /// 已收到对端 SETTINGS（收到前不能算连接就绪）
     got_peer_settings: bool = false,
+    /// 收到对端 PING ACK 的单调时刻（0 = 从未收到）
+    last_ping_ack_ns: i128 = 0,
+    /// 已发 / 已确认的 PING 计数
+    pings_sent: u64 = 0,
+    pings_acked: u64 = 0,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -365,7 +390,6 @@ pub const Connection = struct {
     }
 
     fn runLoop(self: *Connection) !void {
-
         var pf: [client_preface.len]u8 = undefined;
         self.reader.readSliceAll(&pf) catch |e| {
             std.debug.print("[zgrpc.h2] 读连接前言失败：{s}\n", .{@errorName(e)});
@@ -433,7 +457,7 @@ pub const Connection = struct {
         const len = (@as(usize, b[0]) << 16) | (@as(usize, b[1]) << 8) | @as(usize, b[2]);
         return .{
             .length = len,
-            .ftype = @enumFromInt(b[3]),
+            .ftype = @fromBackingInt(@intCast(b[3])),
             .flags = b[4],
             .stream_id = std.mem.readInt(u32, b[5..9], .big) & 0x7fff_ffff,
         };
@@ -447,11 +471,15 @@ pub const Connection = struct {
         payload: []const u8,
     ) !void {
         if (payload.len > 0x00ff_ffff) return error.FrameTooLarge;
+        // 头 + 体 + flush 必须原子（keepalive 线程可能并发发 PING）
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+
         var hdr: [9]u8 = undefined;
         hdr[0] = @intCast((payload.len >> 16) & 0xff);
         hdr[1] = @intCast((payload.len >> 8) & 0xff);
         hdr[2] = @intCast(payload.len & 0xff);
-        hdr[3] = @intFromEnum(ftype);
+        hdr[3] = @backingInt(ftype);
         hdr[4] = flags;
         std.mem.writeInt(u32, hdr[5..9], stream_id & 0x7fff_ffff, .big);
 
@@ -473,7 +501,7 @@ pub const Connection = struct {
 
     fn errBytes(code: ErrorCode) [4]u8 {
         var b: [4]u8 = undefined;
-        std.mem.writeInt(u32, &b, @intFromEnum(code), .big);
+        std.mem.writeInt(u32, &b, @backingInt(code), .big);
         return b;
     }
 
@@ -486,7 +514,7 @@ pub const Connection = struct {
     fn sendGoAway(self: *Connection, code: ErrorCode) !void {
         var payload: [8]u8 = undefined;
         std.mem.writeInt(u32, payload[0..4], 0, .big); // last_stream_id
-        std.mem.writeInt(u32, payload[4..8], @intFromEnum(code), .big);
+        std.mem.writeInt(u32, payload[4..8], @backingInt(code), .big);
         self.writeFrame(.goaway, 0, 0, &payload) catch {};
     }
 
@@ -527,8 +555,31 @@ pub const Connection = struct {
 
     fn onPing(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
         if (payload.len != 8) return error.FrameSizeError;
-        if (hdr.flags & Flags.ack != 0) return;
+        if (hdr.flags & Flags.ack != 0) {
+            // 对端回了我们的 PING：记下时间与计数，供调用方判活
+            self.last_ping_ack_ns = @import("clock.zig").monotonicNs();
+            self.pings_acked +|= 1;
+            return;
+        }
         try self.writeFrame(.ping, Flags.ack, 0, payload);
+    }
+
+    /// 主动发一个 PING（`payload` 为空则自动填时间戳字节）。
+    ///
+    /// 发送与业务帧共用写锁，因此可以从 keepalive 线程调用。
+    pub fn sendPing(self: *Connection, payload: ?[8]u8) !void {
+        var buf: [8]u8 = payload orelse blk: {
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, @bitCast(@as(i64, @truncate(@import("clock.zig").monotonicNs()))), .big);
+            break :blk b;
+        };
+        self.pings_sent +|= 1;
+        try self.writeFrame(.ping, 0, 0, &buf);
+    }
+
+    /// 收到过多少个 PING ACK（调用方可据此判活；0 表示对端从未回应）。
+    pub fn pingAcks(self: *const Connection) u64 {
+        return self.pings_acked;
     }
 
     fn onWindowUpdate(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
@@ -871,7 +922,7 @@ pub fn appendFrame(
     try buf.append(alloc, @intCast((payload.len >> 16) & 0xff));
     try buf.append(alloc, @intCast((payload.len >> 8) & 0xff));
     try buf.append(alloc, @intCast(payload.len & 0xff));
-    try buf.append(alloc, @intFromEnum(ftype));
+    try buf.append(alloc, @backingInt(ftype));
     try buf.append(alloc, flags);
     var sidb: [4]u8 = undefined;
     std.mem.writeInt(u32, &sidb, sid, .big);
@@ -892,7 +943,7 @@ pub fn nextFrame(data: []const u8, pos: *usize) ?ParsedFrame {
     const len = (@as(usize, b[0]) << 16) | (@as(usize, b[1]) << 8) | @as(usize, b[2]);
     if (pos.* + 9 + len > data.len) return null;
     const f = ParsedFrame{
-        .ftype = @enumFromInt(b[3]),
+        .ftype = @fromBackingInt(@intCast(b[3])),
         .flags = b[4],
         .stream_id = std.mem.readInt(u32, b[5..9], .big) & 0x7fff_ffff,
         .payload = b[9 .. 9 + len],
@@ -1236,7 +1287,7 @@ test "h2健壮性：帧声明长度大于实际字节 → 干净收尾（不 pan
     try input.appendSlice(a, client_preface);
     try appendFrame(&input, a, .settings, 0, 0, &.{});
     // 头部声明 1024 字节，但只给 3 字节
-    try input.appendSlice(a, &.{ 0x00, 0x04, 0x00, @intFromEnum(FrameType.data), 0, 0, 0, 0, 1 });
+    try input.appendSlice(a, &.{ 0x00, 0x04, 0x00, @backingInt(FrameType.data), 0, 0, 0, 0, 1 });
     try input.appendSlice(a, "abc");
 
     _ = try driveConn(a, input.items, .{});

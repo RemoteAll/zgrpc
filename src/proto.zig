@@ -525,10 +525,10 @@ pub fn parse(a: std.mem.Allocator, src: []const u8) ParseError!Proto {
 }
 
 pub fn scalarFromName(n: []const u8) ?Scalar {
-    // Zig 0.17 的 Enum TypeInfo 是 field_names + field_values（不再是 fields）
+    // Zig 0.17.1 的 Enum TypeInfo 是 field_names + field_values（不再是 fields）
     const names = @typeInfo(Scalar).@"enum".field_names;
     inline for (names, 0..) |name, i| {
-        if (std.mem.eql(u8, n, name)) return @enumFromInt(i);
+        if (std.mem.eql(u8, n, name)) return @fromBackingInt(@intCast(i));
     }
     return null;
 }

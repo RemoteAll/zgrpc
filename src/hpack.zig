@@ -1,6 +1,6 @@
 //! HPACK —— HTTP/2 头部压缩（RFC 7541）。
 //!
-//! 为什么自己实现：Zig 0.17 标准库只有 HTTP/1.1（`std.http` 下无 h2、无 hpack），
+//! 为什么自己实现：Zig 0.17.1 标准库只有 HTTP/1.1（`std.http` 下无 h2、无 hpack），
 //! gRPC 又强依赖 HTTP/2，所以这一层只能自建。
 //!
 //! 口径：

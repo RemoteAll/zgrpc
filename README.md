@@ -25,6 +25,24 @@ handler 并行执行（业务仍同步串行，串行只是执行顺序，**不�
 不会打断已阻塞在业务里的调用）、
 well-known types / `Any`（`.proto` 子集代码生成与**服务反射**已支持，见下）。
 
+### keepalive（服务端主动 PING）
+
+长连接穿过 NAT / 四层 LB 时会被当成「空闲」掐掉（常见阈值 5~60 分钟）。启用方式：
+
+```zig
+var server = zgrpc.grpc.Server{
+    .routes = &routes,
+    .stream_routes = &stream_routes,
+    .outer_ctx = &dummy,
+    .keepalive_interval_ms = 30_000,   // 30s 一次
+};
+const ka = try server.spawnKeepalive(allocator);   // 一个线程服务所有连接
+defer { server.stopKeepalive(); ka.join(); }
+```
+
+只配 `keepalive_interval_ms` **不会自动发** —— 还需要 `spawnKeepalive()`，或由调用方周期调 `pingAll()`
+（适合已有事件循环的场景）。不主动断开无响应的连接：`h2.Connection.pingAcks()` 暴露计数，策略留给调用方。
+
 ### 对照官方规范的符合性
 
 以 `doc/PROTOCOL-HTTP2.md` 与 `doc/PROTOCOL-WEB.md` 逐条比对（2026-11-12）：

@@ -50,7 +50,7 @@ test "gzip：压缩后可解压回原文" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    // `**` 数组重复运算符在 Zig 0.17 已移除，手写重复
+    // `**` 数组重复运算符在 Zig 0.17.1 已移除，手写重复
     const base = "the quick brown fox jumps over the lazy dog";
     var buf: [base.len * 8]u8 = undefined;
     for (0..8) |i| @memcpy(buf[i * base.len ..][0..base.len], base);

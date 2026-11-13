@@ -264,7 +264,7 @@ fn scalarZero(s: Scalar) []const u8 {
 
 fn namedZero(ctx: *const Ctx, n: []const u8) []const u8 {
     // enum 用第一个枚举值；message 用空字面量（`.{}`）
-    return if (ctx.isEnum( n)) "undefined" else ".{}";
+    return if (ctx.isEnum(n)) "undefined" else ".{}";
 }
 
 /// `scalarReadExpr` 的表达式里写死了接收者 `f.`；map 条目内部遍历用的是 `ef`，
@@ -334,11 +334,9 @@ fn packedReadFn(s: Scalar) []const u8 {
     };
 }
 
-
 fn isMessage(ctx: *const Ctx, name: []const u8) bool {
     return ctx.isKnown(name);
 }
-
 
 fn defaultValue(ctx: *const Ctx, f: Field) []const u8 {
     if (f.repeated) return "&.{}";
@@ -350,7 +348,7 @@ fn defaultValue(ctx: *const Ctx, f: Field) []const u8 {
             .double, .float => "0",
             else => "0",
         },
-        .named => |n| if (ctx.isEnum( n)) "null" else "null",
+        .named => |n| if (ctx.isEnum(n)) "null" else "null",
         .map => mapDefault(),
     };
 }
@@ -366,7 +364,7 @@ fn writeEncodeField(w: anytype, ctx: *const Ctx, f: Field, pad: []const u8) !voi
                 try w.print("{s}    try ew.{s}(1, e.key);\n", .{ pad, scalarWriteFn(mt.key) });
                 switch (mt.value.*) {
                     .scalar => |s| try w.print("{s}    try ew.{s}(2, e.value);\n", .{ pad, scalarWriteFn(s) }),
-                    .named => |n| if (ctx.isEnum( n))
+                    .named => |n| if (ctx.isEnum(n))
                         try w.print("{s}    try ew.enumField(2, e.value);\n", .{pad})
                     else
                         try w.print("{s}    try ew.message(2, try e.value.encode(a));\n", .{pad}),
@@ -385,7 +383,7 @@ fn writeEncodeField(w: anytype, ctx: *const Ctx, f: Field, pad: []const u8) !voi
                 }
             },
             .named => |n| {
-                if (ctx.isEnum( n)) {
+                if (ctx.isEnum(n)) {
                     try w.print("{s}for (self.{s}) |v| try w.enumField({d}, v);\n", .{ pad, f.name, fnum });
                 } else {
                     try w.print("{s}for (self.{s}) |v| try w.message({d}, try v.encode(a));\n", .{ pad, f.name, fnum });
@@ -415,7 +413,7 @@ fn writeEncodeField(w: anytype, ctx: *const Ctx, f: Field, pad: []const u8) !voi
             else => try w.print("{s}if (self.{s} != 0) try w.{s}({d}, self.{s});\n", .{ pad, f.name, scalarWriteFn(s), fnum, f.name }),
         },
         .named => |n| {
-            if (ctx.isEnum( n)) {
+            if (ctx.isEnum(n)) {
                 // proto3：默认值（0）不序列化；`null` 表示跟随默认值，同样不写。
                 // oneof 成员不走这里（见 `writeValueStmt`）——它们显式设置就必须写。
                 try w.print("{s}if (self.{s}) |v| {{ if (@intFromEnum(v) != 0) try w.enumField({d}, v); }}\n", .{ pad, f.name, fnum });
@@ -459,7 +457,7 @@ fn writeValueStmt(w: anytype, ctx: *const Ctx, f: Field, val: []const u8, pad: [
             .float => try w.print("{s}try w.floatField({d}, {s});\n", .{ pad, fnum, val }),
             else => try w.print("{s}try w.{s}({d}, {s});\n", .{ pad, scalarWriteFn(s), fnum, val }),
         },
-        .named => |n| if (ctx.isEnum( n))
+        .named => |n| if (ctx.isEnum(n))
             try w.print("{s}try w.enumField({d}, {s});\n", .{ pad, fnum, val })
         else
             try w.print("{s}try w.message({d}, try {s}.encode(a));\n", .{ pad, fnum, val }),
@@ -487,7 +485,7 @@ fn writeDecodeField(a: std.mem.Allocator, w: anytype, ctx: *const Ctx, m: Messag
             },
             .named => |n| {
                 const t = (ctx.lookup(n) orelse return error.UnknownType).zig;
-                if (ctx.isEnum( n)) {
+                if (ctx.isEnum(n)) {
                     try w.print("{s}{d} => if (f.asEnum({s})) |v| try lst_{s}.append(a, v),\n", .{ pad, fnum, t, f.name });
                 } else {
                     try w.print("{s}{d} => try lst_{s}.append(a, try {s}.decode(f.asBytes(), a)),\n", .{ pad, fnum, f.name, t });
@@ -591,7 +589,7 @@ fn decodeNeedsAlloc(ctx: *const Ctx, m: Message) bool {
     for (m.fields) |f| {
         if (f.repeated) return true;
         switch (f.ftype) {
-            .named => |n| if (!ctx.isEnum( n)) return true,
+            .named => |n| if (!ctx.isEnum(n)) return true,
             .scalar => {},
             .map => return true,
         }
