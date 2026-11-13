@@ -232,6 +232,8 @@ pub const StreamState = struct {
     authority: []const u8 = "",
     /// 该流剩余发送窗口
     send_window: i64 = default_window_size,
+    /// 该流待回补的接收窗口字节数（同连接级，累积到阈值再发）
+    pending_stream_refund: usize = 0,
     /// 流式模式下的响应器（**必须活到流结束**，不能在栈上建：handler 会跨回调持有它）
     rsp: ?*Responder = null,
     /// 业务挂载点（流式模式：gRPC 的 Call）
@@ -287,6 +289,14 @@ pub const Connection = struct {
     peer_max_frame_size: usize = default_max_frame_size,
     /// 对端 `SETTINGS_INITIAL_WINDOW_SIZE`（新流的发送窗口初值）
     peer_initial_window: i64 = default_window_size,
+    /// 连接级待回补的接收窗口字节数（**累积到阈值再发**，见 `refundWindow`）
+    pending_conn_refund: usize = 0,
+    /// 窗口回补的累积阈值。
+    ///
+    /// 对齐 Go `net/http2` 的 `inflowMinRefresh = 4 KiB`：逐帧回补会让每个请求多出
+    /// 2 个 WINDOW_UPDATE 帧（128 字节请求下 18 字节 + 2 帧纯开销）。
+    /// 4 KiB 远小于初始窗口 64 KiB，**不会把对端窗口饿死**。
+    refund_threshold: usize = 4 * 1024,
 
     /// 活跃流（多路复用：同一连接可同时存在多个半开流）
     streams: std.ArrayListUnmanaged(*StreamState) = .empty,
@@ -918,13 +928,38 @@ pub const Connection = struct {
     }
 
     /// 收到 DATA 后把窗口补回去（连接级 + 流级）。
+    ///
+    /// **累积到 `refund_threshold` 才发**（对齐 Go `net/http2` 的 `inflowMinRefresh = 4 KiB`）。
+    /// 逐帧回补会让每个请求多出 2 个 WINDOW_UPDATE 帧；128 字节请求下这是 18 字节 + 2 帧的纯开销。
+    /// 阈值 4 KiB 远小于初始窗口 64 KiB，因此不会让对端窗口饿死。
     fn refundWindow(self: *Connection, stream_id: u32, amount: usize, with_stream: bool) !void {
         if (amount == 0) return;
+        self.pending_conn_refund += amount;
+        if (with_stream) {
+            if (self.findStream(stream_id)) |s| s.pending_stream_refund += amount;
+        }
+
+        if (self.pending_conn_refund >= self.refund_threshold) {
+            const n = self.pending_conn_refund;
+            self.pending_conn_refund = 0;
+            try self.sendWindowUpdate(0, n);
+        }
+        if (with_stream) {
+            if (self.findStream(stream_id)) |s| {
+                if (s.pending_stream_refund >= self.refund_threshold) {
+                    const n = s.pending_stream_refund;
+                    s.pending_stream_refund = 0;
+                    try self.sendWindowUpdate(stream_id, n);
+                }
+            }
+        }
+    }
+
+    fn sendWindowUpdate(self: *Connection, stream_id: u32, amount: usize) !void {
         const inc: u32 = @intCast(@min(amount, 0x7fff_ffff));
         var buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &buf, inc, .big);
-        try self.writeFrame(.window_update, 0, 0, &buf);
-        if (with_stream) try self.writeFrame(.window_update, 0, stream_id, &buf);
+        try self.writeFrame(.window_update, 0, stream_id, &buf);
     }
 
     fn dispatch(self: *Connection, s: *StreamState) !void {
@@ -1158,40 +1193,79 @@ test "h2：PING 必须回 ACK（同 payload）" {
     try testing.expectEqualStrings("12345678", ack_payload);
 }
 
-test "h2：收到 DATA 必须回补窗口（连接级 + 流级）" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
+test "h2：WINDOW_UPDATE 累积到阈值才发（对齐 Go inflowMinRefresh=4KiB）" {
+    // 场景一：小 DATA（10 字节 < 4 KiB 阈值）→ **不应**发送 WINDOW_UPDATE，
+    // 否则每个 128 字节请求都要多出 2 个帧（纯开销）。
+    {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
 
-    var input: std.ArrayListUnmanaged(u8) = .empty;
-    try input.appendSlice(a, client_preface);
-    try appendFrame(&input, a, .settings, 0, 0, &.{});
-    const block = try encodeReqHeaders(a, "/echo");
-    try appendFrame(&input, a, .headers, Flags.end_headers, 1, block.items);
-    try appendFrame(&input, a, .data, Flags.end_stream, 1, "1234567890"); // 10 字节
+        var input: std.ArrayListUnmanaged(u8) = .empty;
+        try input.appendSlice(a, client_preface);
+        try appendFrame(&input, a, .settings, 0, 0, &.{});
+        const block = try encodeReqHeaders(a, "/echo");
+        try appendFrame(&input, a, .headers, Flags.end_headers, 1, block.items);
+        try appendFrame(&input, a, .data, Flags.end_stream, 1, "1234567890"); // 10 字节
 
-    var r = std.Io.Reader.fixed(input.items);
-    var aw = std.Io.Writer.Allocating.init(testing.allocator);
-    defer aw.deinit();
+        var r = std.Io.Reader.fixed(input.items);
+        var aw = std.Io.Writer.Allocating.init(testing.allocator);
+        defer aw.deinit();
 
-    var conn = Connection.init(testing.allocator, &r, &aw.writer, .{});
-    defer conn.deinit();
-    var dummy: u8 = 0;
-    conn.serve(&dummy, echoHandler) catch |e| {
-        if (e != error.ConnectionClosed) return e;
-    };
+        var conn = Connection.init(testing.allocator, &r, &aw.writer, .{});
+        defer conn.deinit();
+        var dummy: u8 = 0;
+        conn.serve(&dummy, echoHandler) catch |e| {
+            if (e != error.ConnectionClosed) return e;
+        };
 
-    var pos: usize = 0;
-    var conn_inc: u32 = 0;
-    var stream_inc: u32 = 0;
-    while (nextFrame(aw.written(), &pos)) |f| {
-        if (f.ftype == .window_update) {
-            const inc = std.mem.readInt(u32, f.payload[0..4], .big);
-            if (f.stream_id == 0) conn_inc += inc else stream_inc += inc;
+        var pos: usize = 0;
+        var updates: usize = 0;
+        while (nextFrame(aw.written(), &pos)) |f| {
+            if (f.ftype == .window_update) updates += 1;
         }
+        try testing.expectEqual(@as(usize, 0), updates);
     }
-    try testing.expectEqual(@as(u32, 10), conn_inc);
-    try testing.expectEqual(@as(u32, 10), stream_inc);
+
+    // 场景二：DATA 超过阈值 → 连接级与流级**各发一次**，额度等于实际接收量
+    {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+
+        const big = try a.alloc(u8, 5000);
+        @memset(big, 'x');
+
+        var input: std.ArrayListUnmanaged(u8) = .empty;
+        try input.appendSlice(a, client_preface);
+        try appendFrame(&input, a, .settings, 0, 0, &.{});
+        const block = try encodeReqHeaders(a, "/echo");
+        try appendFrame(&input, a, .headers, Flags.end_headers, 1, block.items);
+        try appendFrame(&input, a, .data, Flags.end_stream, 1, big);
+
+        var r = std.Io.Reader.fixed(input.items);
+        var aw = std.Io.Writer.Allocating.init(testing.allocator);
+        defer aw.deinit();
+
+        var conn = Connection.init(testing.allocator, &r, &aw.writer, .{});
+        defer conn.deinit();
+        var dummy: u8 = 0;
+        conn.serve(&dummy, echoHandler) catch |e| {
+            if (e != error.ConnectionClosed) return e;
+        };
+
+        var pos: usize = 0;
+        var conn_inc: u32 = 0;
+        var stream_inc: u32 = 0;
+        while (nextFrame(aw.written(), &pos)) |f| {
+            if (f.ftype == .window_update) {
+                const inc = std.mem.readInt(u32, f.payload[0..4], .big);
+                if (f.stream_id == 0) conn_inc += inc else stream_inc += inc;
+            }
+        }
+        try testing.expectEqual(@as(u32, 5000), conn_inc);
+        try testing.expectEqual(@as(u32, 5000), stream_inc);
+    }
 }
 
 test "h2：多路复用（两个流交错收头/收体，各自独立响应）" {
