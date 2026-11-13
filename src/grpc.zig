@@ -43,6 +43,31 @@ pub const Status = enum(u32) {
     unauthenticated = 16,
 };
 
+/// 状态码名字（访问日志用；避免在日志里出现裸数字导致对不上规范表）。
+///
+/// 返回规范里的大写名（如 `OK` / `DEADLINE_EXCEEDED`），与 `grpc-status` 的语义表一致。
+pub fn statusName(s: Status) []const u8 {
+    return switch (s) {
+        .ok => "OK",
+        .cancelled => "CANCELLED",
+        .unknown_error => "UNKNOWN",
+        .invalid_argument => "INVALID_ARGUMENT",
+        .deadline_exceeded => "DEADLINE_EXCEEDED",
+        .not_found => "NOT_FOUND",
+        .already_exists => "ALREADY_EXISTS",
+        .permission_denied => "PERMISSION_DENIED",
+        .resource_exhausted => "RESOURCE_EXHAUSTED",
+        .failed_precondition => "FAILED_PRECONDITION",
+        .aborted => "ABORTED",
+        .out_of_range => "OUT_OF_RANGE",
+        .unimplemented => "UNIMPLEMENTED",
+        .internal => "INTERNAL",
+        .unavailable => "UNAVAILABLE",
+        .data_loss => "DATA_LOSS",
+        .unauthenticated => "UNAUTHENTICATED",
+    };
+}
+
 pub const Message = struct {
     compressed: bool,
     payload: []const u8,
@@ -313,6 +338,9 @@ pub const Call = struct {
     error_message: []const u8 = "",
     sent_any: bool = false,
     finished: bool = false,
+    /// 调用开始时刻（单调纳秒），仅用于访问日志里的耗时；
+    /// 访问日志关着的时候这个字段一次也不会被读。
+    start_ns: i128 = 0,
 
     /// gRPC-Web（浏览器可达）：响应 `content-type: application/grpc-web+proto`，
     /// **trailers 走 body 尾帧**而不是 HTTP trailers。
@@ -492,10 +520,20 @@ pub const Call = struct {
     pub fn finish(self: *Call) !void {
         if (self.finished) return;
         self.finished = true;
+        // 放在最前面：原生 gRPC / gRPC-Web / 文本模式三条收尾路径都要留访问日志
+        self.logAccess();
 
         const a = self.alloc;
         var code_buf: [8]u8 = undefined;
-        const code = try std.fmt.bufPrint(&code_buf, "{d}", .{@backingInt(self.status)});
+        // 快路径：状态码几乎总是一位数，`std.fmt.bufPrint` 的格式化开销在这里不值得
+        const code: []const u8 = blk: {
+            const v: u32 = @backingInt(self.status);
+            if (v < 10) {
+                code_buf[0] = '0' + @as(u8, @intCast(v));
+                break :blk code_buf[0..1];
+            }
+            break :blk try std.fmt.bufPrint(&code_buf, "{d}", .{v});
+        };
 
         // gRPC-Web：trailers 做成 body 尾帧（0x80 | 4B 长度 | "k: v\r\n"...）
         if (self.web) {
@@ -556,6 +594,32 @@ pub const Call = struct {
             self.sent_any = true;
         }
         try self.rsp.end(trailers.items);
+    }
+
+    /// 访问日志（**只由日志级别控制**：默认 `Info` 不输出，`Debug` 才逐条打印）。
+    ///
+    /// 为什么默认不打：gRPC 的成功路径本该零日志，逐请求打印会把控制台和高并发压测都拖垮。
+    /// 需要看时把级别调到 debug 即可（`ZGRPC_LOG=debug`），不必改代码、不必加配置项：
+    /// 关闭时这里只多一次原子读，热点路径代价可忽略。
+    ///
+    /// 行格式由 zzig 日志组件统一（`时间 ThreadId Kind Name 消息`），与其他模块一致。
+    fn logAccess(self: *Call) void {
+        // 只由**日志级别**控制是否输出（无额外开关）：关着时这里只是两三次原子读
+        if (!log.enabled(.debug)) return;
+        const cost_us: u64 = blk: {
+            if (self.start_ns == 0) break :blk 0;
+            const dt = clock.monotonicNs() - self.start_ns;
+            if (dt <= 0) break :blk 0;
+            break :blk @intCast(@divTrunc(dt, 1000));
+        };
+        log.grpc.debug("{s} {s} → {s} stream={d} body={d}B cost={d}us", .{
+            self.req.method,
+            self.req.path,
+            statusName(self.status),
+            self.req.stream_id,
+            self.req.body.len,
+            cost_us,
+        });
     }
 };
 
@@ -888,13 +952,27 @@ pub const Server = struct {
             log.grpc.warn("关闭 Nagle 失败（延迟可能偏高）：{s}", .{@errorName(e)});
         };
 
-        var recv_buf: [16 * 1024]u8 = undefined;
-        var send_buf: [16 * 1024]u8 = undefined;
-        var sr = stream.reader(io, &recv_buf);
-        var sw = stream.writer(io, &send_buf);
+        // 缓冲大小：**接收侧决定一次系统调用能拿回多少个请求帧**。
+        // 64 路并发 × ~230 字节/请求 ≈ 15 KiB，≥32 KiB 才能一口气读完整批，
+        // 从而让“延迟 flush”真正把 N 个响应合成一次 write。
+        const recv_buf = allocator.alloc(u8, 32 * 1024) catch {
+            log.grpc.err("连接接收缓冲分配失败", .{});
+            return;
+        };
+        defer allocator.free(recv_buf);
+        const send_buf = allocator.alloc(u8, 16 * 1024) catch {
+            log.grpc.err("连接发送缓冲分配失败", .{});
+            return;
+        };
+        defer allocator.free(send_buf);
+        var sr = stream.reader(io, recv_buf);
+        var sw = stream.writer(io, send_buf);
 
         var conn = h2.Connection.init(allocator, &sr.interface, &sw.interface, .{});
         defer conn.deinit();
+        // 兜底：连接异常收尾时，把还留在发送缓冲里的字节尽力刷出去。
+        // 延迟 flush 的正常刷出点在读循环，异常路径（协议错/对端半关）走不到那里。
+        defer conn.flushOut() catch {};
 
         // keepalive 需要能从其它线程发帧 → 把连接登记进服务端
         // （不需要 keepalive 时可 `track_conns = false` 去掉这笔每连接开销）
@@ -925,7 +1003,12 @@ pub const Server = struct {
 
     fn handle(server_ctx: *anyopaque, req: h2.Request, rsp: *h2.Responder, arena: std.mem.Allocator) anyerror!void {
         const self: *Server = @ptrCast(@alignCast(server_ctx));
-        var call = Call{ .req = req, .rsp = rsp, .alloc = arena };
+        var call = Call{
+            .req = req,
+            .rsp = rsp,
+            .alloc = arena,
+            .start_ns = clock.monotonicNs(),
+        };
 
         if (!std.mem.eql(u8, req.method, "POST")) {
             log.grpc.info("非 POST 请求 {s} {s} → 405", .{ req.method, req.path });
@@ -979,7 +1062,12 @@ pub const Server = struct {
         const self: *Server = @ptrCast(@alignCast(server_ctx));
         const a = rsp.stream.allocator();
         const call = try a.create(Call);
-        call.* = .{ .req = req, .rsp = rsp, .alloc = a };
+        call.* = .{
+            .req = req,
+            .rsp = rsp,
+            .alloc = a,
+            .start_ns = clock.monotonicNs(),
+        };
         rsp.stream.user_data = call;
 
         if (!std.mem.eql(u8, req.method, "POST")) {

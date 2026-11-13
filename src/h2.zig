@@ -9,6 +9,18 @@
 //!   在一条连接上并发调用时不会被打回 `REFUSED_STREAM`；
 //! - 发送受流控阻塞时，期间读到的业务帧进 `pending` 队列延后处理（不会丢，也不会误拒）。
 //!
+//! ## 发送侧：**延迟 flush**（对齐 Go `net/http2` 的 loopyWriter 批量写）
+//!
+//! 一个 unary 响应原本要写 3 帧（HEADERS / DATA / trailers HEADERS），如果每帧都 flush，
+//! 就是 **3 次 write 系统调用/请求**。这里改为：帧只写进发送缓冲，**只在即将真正阻塞读 socket 前**
+//! 才 flush 一次，于是同一批到达的 N 个请求共享 1 次 write。单连接 64 并发的实测收益见
+//! `bench_pair/README.md`。
+//!
+//! 安全性由三点保证：
+//! 1. 每次**可能阻塞**的读之前都调 `flushForRead`（否则就是对端等我们、我们等对端的死锁）；
+//! 2. 发送缓冲到高水位（`flush_high_water`）立刻 flush，避免对端持续发帧导致迟迟不刷；
+//! 3. 控制帧与跨线程调用（keepalive PING）走 `writeFrameFlush`，语义不变。
+//!
 //! 已支持：`SETTINGS`(含 ACK/并发流上限)、`HEADERS`/`CONTINUATION`（含 PADDED/PRIORITY）、
 //! `DATA`（含 PADDED、流控回补）、`WINDOW_UPDATE`（连接级 + 每流）、`PING`(ACK)、`RST_STREAM`、`GOAWAY`。
 
@@ -62,6 +74,12 @@ pub const ErrorCode = enum(u32) {
 
 pub const default_max_frame_size: usize = 16384;
 pub const default_window_size: i64 = 65535;
+
+/// 空闲流对象（含 arena 已分配容量）的复用上限。
+///
+/// 每条流原本都要 `create` + `ArenaAllocator.init` + 约 20 次 arena 分配，流结束时再全部释放；
+/// 复用后这些分配退化为「保留容量的 bump 指针」，单请求省下十几次 malloc/free。
+const max_spare_streams: usize = 256;
 
 /// handler 嵌套深度上限（发送阻塞 → 读帧 → 又派发新请求 → 再阻塞…）。
 const max_dispatch_depth: u8 = 4;
@@ -300,8 +318,15 @@ pub const Connection = struct {
 
     /// 活跃流（多路复用：同一连接可同时存在多个半开流）
     streams: std.ArrayListUnmanaged(*StreamState) = .empty,
+    /// 空闲流对象池（含 arena 已分配容量，见 `max_spare_streams`）
+    spare: std.ArrayListUnmanaged(*StreamState) = .empty,
     /// 发送受流控阻塞期间读到的业务帧：延后到主循环处理（不丢、不误拒）
     pending: std.ArrayListUnmanaged(PendingFrame) = .empty,
+    /// 发送缓冲累计到该字节数就强制 flush（延迟 flush 的防饿死阈值）。
+    ///
+    /// 取 4 KiB：远小于默认 16 KiB 发送缓冲，正常一批响应（~210 字节/条）约 20 条刷一次，
+    /// 既拿到批量写，又不会让响应在缓冲里久留。
+    flush_high_water: usize = 4 * 1024,
 
     serve_ctx: ?*anyopaque = null,
     serve_handler: ?HandlerFn = null,
@@ -337,6 +362,11 @@ pub const Connection = struct {
             self.alloc.destroy(s);
         }
         self.streams.deinit(self.alloc);
+        for (self.spare.items) |s| {
+            s.arena.deinit();
+            self.alloc.destroy(s);
+        }
+        self.spare.deinit(self.alloc);
         for (self.pending.items) |pf| self.alloc.free(pf.payload);
         self.pending.deinit(self.alloc);
         self.decoder.deinit();
@@ -354,19 +384,61 @@ pub const Connection = struct {
         return null;
     }
 
-    fn createStream(self: *Connection, id: u32) !*StreamState {
+    /// 取一个可用的流对象：优先复用空闲池，否则新建。
+    /// 返回的对象**逻辑状态已归零**，但 `id` 由调用方设置。
+    fn acquireStream(self: *Connection) !*StreamState {
+        if (self.spare.pop()) |s| {
+            resetStream(s, self.peer_initial_window);
+            return s;
+        }
         const s = try self.alloc.create(StreamState);
         s.* = .{
-            .id = id,
+            .id = 0,
             .arena = std.heap.ArenaAllocator.init(self.alloc),
             .send_window = self.peer_initial_window,
         };
-        errdefer {
-            s.arena.deinit();
-            self.alloc.destroy(s);
-        }
+        return s;
+    }
+
+    /// 把流对象状态归零（保留 arena 已分配容量，供下一个请求复用）。
+    fn resetStream(s: *StreamState, peer_initial_window: i64) void {
+        // `.retain_capacity` 只保留**最近一块**缓冲并复用其容量：
+        // 热路径上的 arena 分配因此退化为 bump 指针，不再触发 malloc。
+        _ = s.arena.reset(.retain_capacity);
+        s.header_block = .empty;
+        s.headers = .empty;
+        s.body = .empty;
+        s.headers_done = false;
+        s.method = "";
+        s.path = "";
+        s.scheme = "";
+        s.authority = "";
+        s.send_window = peer_initial_window;
+        s.pending_stream_refund = 0;
+        s.rsp = null;
+        s.user_data = null;
+    }
+
+    fn createStream(self: *Connection, id: u32) !*StreamState {
+        const s = try self.acquireStream();
+        s.id = id;
+        errdefer self.releaseStream(s);
         try self.streams.append(self.alloc, s);
         return s;
+    }
+
+    /// 归还流对象：进空闲池待复用（超上限才真释放）。
+    fn releaseStream(self: *Connection, s: *StreamState) void {
+        if (self.spare.items.len >= max_spare_streams) {
+            s.arena.deinit();
+            self.alloc.destroy(s);
+            return;
+        }
+        resetStream(s, self.peer_initial_window);
+        self.spare.append(self.alloc, s) catch {
+            s.arena.deinit();
+            self.alloc.destroy(s);
+        };
     }
 
     fn destroyStream(self: *Connection, s: *StreamState) void {
@@ -376,8 +448,7 @@ pub const Connection = struct {
                 break;
             }
         }
-        s.arena.deinit();
-        self.alloc.destroy(s);
+        self.releaseStream(s);
     }
 
     /// 阻塞服务一条连接，直到对端 `GOAWAY`/断开。返回 `error.ConnectionClosed` 属正常收尾。
@@ -421,14 +492,22 @@ pub const Connection = struct {
                 const p = self.pending.orderedRemove(0);
                 defer self.alloc.free(p.payload);
                 try self.handleFrame(p.hdr, p.payload);
+                try self.flushIfFull();
                 continue;
             }
+
+            // 读之前先把挂起的输出刷出去（延迟 flush 的安全性基石）：
+            // 缓冲里没有完整的 9 字节头，接下来这次读很可能真阻塞在 socket 上。
+            try self.flushForRead(9);
 
             const hdr = self.readFrameHeader() catch |e| {
                 // 对端关闭/半包 → 正常收尾；其它读错误也在这里定位
                 log.h2.debug("读帧结束（{s}），连接收尾", .{@errorName(e)});
                 return error.ConnectionClosed;
             };
+
+            // 帧体也可能不在缓冲里：读它之前同样要刷
+            try self.flushForRead(hdr.length);
 
             const payload = try self.alloc.alloc(u8, hdr.length);
             self.reader.readSliceAll(payload) catch |e| {
@@ -441,6 +520,7 @@ pub const Connection = struct {
             defer self.alloc.free(payload);
 
             try self.handleFrame(hdr, payload);
+            try self.flushIfFull();
         }
     }
 
@@ -520,10 +600,49 @@ pub const Connection = struct {
         stream_id: u32,
         payload: []const u8,
     ) !void {
-        // 头 + 体 + flush 必须原子（keepalive 线程可能并发发 PING）
+        // 头 + 体必须原子（keepalive 线程可能并发发 PING）。
+        // **不 flush**：由读循环在阻塞前统一刷出（见 `flushForRead`）。
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
         return self.writeFrameBody(ftype, flags, stream_id, payload);
+    }
+
+    /// 写一帧并**立即 flush**：控制帧、以及可能被其它线程调用的路径用它（语义同旧版）。
+    fn writeFrameFlush(
+        self: *Connection,
+        ftype: FrameType,
+        flags: u8,
+        stream_id: u32,
+        payload: []const u8,
+    ) !void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        try self.writeFrameBody(ftype, flags, stream_id, payload);
+        try self.writer.flush();
+    }
+
+    /// 把挂起的输出真正写出去。持写锁，因此可与 keepalive 线程安全并发。
+    ///
+    /// 空缓冲时 `flush` 是纯空转（`defaultFlush` 的循环条件为假），没有系统调用开销。
+    pub fn flushOut(self: *Connection) !void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        try self.writer.flush();
+    }
+
+    /// 若下一次读**必须真正走 socket**，则先把挂起的输出刷出去。
+    ///
+    /// 这是延迟 flush 的正确性基石：不刷就阻塞读 = 对端等我们、我们等对端。
+    fn flushForRead(self: *Connection, need: usize) !void {
+        if (self.reader.buffered().len >= need) return;
+        try self.flushOut();
+    }
+
+    /// 发送缓冲超过高水位就强制 flush。
+    /// 防止对端持续发帧导致读循环一直命中缓冲、迟迟不刷出响应。
+    fn flushIfFull(self: *Connection) !void {
+        if (self.writer.buffered().len < self.flush_high_water) return;
+        try self.flushOut();
     }
 
     /// 非阻塞写帧：拿不到写锁（连接正忙）就返回 false，不排队。
@@ -537,6 +656,8 @@ pub const Connection = struct {
         if (!self.write_mutex.tryLock()) return false;
         defer self.write_mutex.unlock();
         try self.writeFrameBody(ftype, flags, stream_id, payload);
+        // keepalive 在独立线程上，不能依赖读循环帮忙 flush
+        try self.writer.flush();
         return true;
     }
 
@@ -559,7 +680,7 @@ pub const Connection = struct {
 
         try self.writer.writeAll(&hdr);
         if (payload.len > 0) try self.writer.writeAll(payload);
-        try self.writer.flush();
+        // 不在这里 flush：合用读循环的批量刷出（见文件头「延迟 flush」）
     }
 
     fn sendSettings(self: *Connection) !void {
@@ -570,7 +691,8 @@ pub const Connection = struct {
         // INITIAL_WINDOW_SIZE
         std.mem.writeInt(u16, payload[6..8], 0x0004, .big);
         std.mem.writeInt(u32, payload[8..12], self.opts.initial_window_size, .big);
-        try self.writeFrame(.settings, 0, 0, &payload);
+        // 建连第一帧：必须立即刷出（客户端在等 SETTINGS 才发请求）
+        try self.writeFrameFlush(.settings, 0, 0, &payload);
     }
 
     fn errBytes(code: ErrorCode) [4]u8 {
@@ -591,7 +713,7 @@ pub const Connection = struct {
         std.mem.writeInt(u32, payload[4..8], @backingInt(code), .big);
         // 刻意吞掉：GOAWAY 是「尽力告知」，能走到这里通常已经是对端断了/写不出去，
         // 没有后续动作可做，上层已拿到原始错误，这里再报错只会掩盖真正原因。
-        self.writeFrame(.goaway, 0, 0, &payload) catch {};
+        self.writeFrameFlush(.goaway, 0, 0, &payload) catch {};
     }
 
     // -----------------------------------------------------------------------
@@ -646,7 +768,8 @@ pub const Connection = struct {
     pub fn sendPing(self: *Connection, payload: ?[8]u8) !void {
         const buf = pingPayload(payload);
         self.pings_sent +|= 1;
-        try self.writeFrame(.ping, 0, 0, &buf);
+        // keepalive 可能跑在独立线程上：必须自己把字节推出去，不能等读循环
+        try self.writeFrameFlush(.ping, 0, 0, &buf);
     }
 
     /// 非阻塞版：连接正忙（有业务帧在写）时返回 false ——
@@ -695,11 +818,16 @@ pub const Connection = struct {
 
     /// 发送受阻时推进窗口：只立即处理控制帧；业务帧进 `pending` 延后（不丢）。
     fn pumpForWindow(self: *Connection, stream: *StreamState) !void {
+        // 这里**一定**要先把已写好的字节推出去：我们正在等对端给窗口，
+        // 对端很可能也在等我们的响应 —— 不刷就是互相干等（延迟 flush 的死锁点）。
+        try self.flushOut();
         while (self.send_window <= 0 or stream.send_window <= 0) {
+            try self.flushForRead(9);
             const hdr = self.readFrameHeader() catch |e| {
                 log.h2.debug("等窗口时读帧结束（{s}）", .{@errorName(e)});
                 return error.ConnectionClosed;
             };
+            try self.flushForRead(hdr.length);
             const payload = try self.alloc.alloc(u8, hdr.length);
             self.reader.readSliceAll(payload) catch |e| {
                 self.alloc.free(payload);
@@ -1541,4 +1669,86 @@ test "keepalive：连接正忙时 trySendPing 立刻放弃（不阻塞、不计�
     try testing.expect(!(try conn.trySendPing(null)));
     // 跳过的那次不计数
     try testing.expectEqual(@as(u64, 1), conn.pings_sent);
+}
+
+test "h2：延迟 flush —— 一批请求在一段输入里必须全部得到响应" {
+    // 回归点：`writeFrameBody` 不再自己 flush，改由读循环在阻塞前统一刷。
+    // 所以「一段输入里塞 N 个请求」时，不能因为缓冲没刷而漏发任何一条响应。
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const n_req = 4;
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, client_preface);
+    try appendFrame(&input, a, .settings, 0, 0, &.{});
+
+    const block = try encodeReqHeaders(a, "/echo");
+    for (0..n_req) |i| {
+        const sid: u32 = 1 + @as(u32, @intCast(i)) * 2;
+        try appendFrame(&input, a, .headers, Flags.end_headers, sid, block.items);
+        try appendFrame(&input, a, .data, Flags.end_stream, sid, "batch");
+    }
+
+    var r = std.Io.Reader.fixed(input.items);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var conn = Connection.init(testing.allocator, &r, &aw.writer, .{});
+    defer conn.deinit();
+    var dummy: u8 = 0;
+    conn.serve(&dummy, echoHandler) catch |e| {
+        if (e != error.ConnectionClosed) return e;
+    };
+
+    // 每个流的 DATA 都必须到，且内容正确
+    var got: [n_req]bool = @splat(false);
+    var pos: usize = 0;
+    while (nextFrame(aw.written(), &pos)) |f| {
+        if (f.ftype != .data) continue;
+        if (f.stream_id == 0 or f.stream_id % 2 == 0) continue;
+        const idx = (f.stream_id - 1) / 2;
+        if (idx >= n_req) continue;
+        try testing.expectEqualStrings("batch", f.payload);
+        got[idx] = true;
+    }
+    for (got) |g| try testing.expect(g);
+
+    // 流全部收尾，且对象已归还空闲池（供下一个请求复用，不再走 malloc）
+    try testing.expectEqual(@as(usize, 0), conn.activeStreams());
+    try testing.expect(conn.spare.items.len >= 1);
+}
+
+test "h2：流对象复用 —— 串行 N 个请求不会攒下 N 个流对象" {
+    // 复用判据：串行服务多个请求时，空闲池不会随请求数线性增长
+    // （每个请求用完立刻归还，下一个请求复用同一个对象与同一块 arena 容量）。
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const block = try encodeReqHeaders(a, "/echo");
+
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    try input.appendSlice(a, client_preface);
+    try appendFrame(&input, a, .settings, 0, 0, &.{});
+    for (0..3) |i| {
+        const sid: u32 = 1 + @as(u32, @intCast(i)) * 2;
+        try appendFrame(&input, a, .headers, Flags.end_headers, sid, block.items);
+        try appendFrame(&input, a, .data, Flags.end_stream, sid, "reuse");
+    }
+
+    var r = std.Io.Reader.fixed(input.items);
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var conn = Connection.init(testing.allocator, &r, &aw.writer, .{});
+    defer conn.deinit();
+    var dummy: u8 = 0;
+    conn.serve(&dummy, echoHandler) catch |e| {
+        if (e != error.ConnectionClosed) return e;
+    };
+
+    try testing.expectEqual(@as(usize, 0), conn.activeStreams());
+    // 3 个请求串行完成：池里最多 1 个对象（反复复用），绝不是 3 个
+    try testing.expect(conn.spare.items.len <= 1);
 }

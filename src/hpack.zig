@@ -302,21 +302,63 @@ fn appendString(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: [
 // ---------------------------------------------------------------------------
 // 静态表查询
 // ---------------------------------------------------------------------------
+//
+// 原来 `staticExact` / `staticName` 都是**线性扫描 61 条**，而一个 unary 响应要编码 4 个头部，
+// 等于每次响应做 8 次 61 项 memcmp（解码侧不受影响：`at(idx)` 本来就是 O(1)）。
+// 这里改成编译期构建的字符串哈希：name → 该名字在静态表里**首次出现**的 1 基索引，
+// 再做一次「同名连续段内」的值比较。
+//
+// 前提：同名条目在 RFC 7541 附录 A 里都是相邻的（只有伪头有重复）。用编译期断言锁住这一点，
+// 将来若改表导致前提不成立，会直接编译失败，而不是悄悄查不到。
+
+const StaticKv = struct { []const u8, usize };
+
+/// name → 1 基索引（同名取第一次出现）
+const static_name_kvs = blk: {
+    @setEvalBranchQuota(1_000_000);
+    var out: []const StaticKv = &.{};
+    for (static_table, 0..) |e, i| {
+        var seen = false;
+        for (out) |kv| {
+            if (std.mem.eql(u8, kv[0], e.name)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) out = out ++ .{.{ e.name, i + 1 }};
+    }
+    break :blk out;
+};
+
+const static_name_map = std.StaticStringMap(usize).initComptime(static_name_kvs);
+
+comptime {
+    // 锁住「同名条目相邻」这个前提
+    @setEvalBranchQuota(1_000_000);
+    for (static_table, 0..) |e, i| {
+        var j = i + 1;
+        while (j < static_table.len and std.mem.eql(u8, static_table[j].name, e.name)) j += 1;
+        var k = j;
+        while (k < static_table.len) : (k += 1) {
+            if (std.mem.eql(u8, static_table[k].name, e.name)) @compileError("静态表同名条目不相邻，hpack 查找优化前提被破坏");
+        }
+    }
+}
 
 /// 精确匹配 (name, value)；返回 1 基索引。
 fn staticExact(name: []const u8, value: []const u8) ?usize {
-    for (static_table, 1..) |e, idx| {
-        if (std.mem.eql(u8, e.name, name) and std.mem.eql(u8, e.value, value)) return idx;
+    const first = static_name_map.get(name) orelse return null;
+    var i = first;
+    // 只在同名连续段里比较值（最多 7 条：:status）
+    while (i <= static_table.len and std.mem.eql(u8, static_table[i - 1].name, name)) : (i += 1) {
+        if (std.mem.eql(u8, static_table[i - 1].value, value)) return i;
     }
     return null;
 }
 
 /// 只匹配 name（value 无关）；返回 1 基索引。
 fn staticName(name: []const u8) ?usize {
-    for (static_table, 1..) |e, idx| {
-        if (std.mem.eql(u8, e.name, name)) return idx;
-    }
-    return null;
+    return static_name_map.get(name);
 }
 
 // ---------------------------------------------------------------------------
@@ -617,7 +659,6 @@ test "hpack：Huffman 编解码往返" {
 }
 
 test "hpack：编码后头部能被本库解码（含 H 位）" {
-
     const headers = [_]Header{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = "/echo.Echo/Say" },

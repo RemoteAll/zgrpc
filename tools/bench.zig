@@ -17,7 +17,18 @@ const zgrpc = @import("zgrpc");
 const zzig = @import("zzig");
 
 const port: u16 = 18054;
+
+/// 客户端目标端口（`--port` 可覆盖；`--no-serve` 时用它打外部实现，如 grpc-go）
+var target_port: u16 = port;
 const method = "/bench.Bench/Echo";
+
+/// 统一输出：走 zzig 日志组件（默认控制台 + 文件，级别由 `LogLevel` / `ZGRPC_LOG` 决定）。
+///
+/// 为什么不直接用 `std.debug.print`：它直接往 stderr 写 UTF-8 字节，
+/// 在中文 Windows 控制台（代码页 936）下中文会变成乱码；日志组件会处理编码。
+fn say(comptime fmt: []const u8, args: anytype) void {
+    zgrpc.log.server.info(fmt, args);
+}
 
 const default_iterations: usize = 3000;
 const default_payload: usize = 128;
@@ -66,6 +77,11 @@ const Args = struct {
     track_conns: bool = false,
     /// 客户端走连接池（共享 `zgrpc.Pool`，用于验证连接复用/上限）
     client_pool: bool = false,
+    /// 不起本地服务端，只跑客户端打 `--port`。
+    ///
+    /// 用途：用**同一个客户端**分别打 zgrpc 与 grpc-go，排除压测器本身的瓶颈
+    /// （ghz 在连接数 >8 时自己先到顶，会把两端都压到同一个假上限）。
+    no_serve: bool = false,
 };
 
 fn parseArgs(init: std.process.Init) Args {
@@ -96,6 +112,10 @@ fn parseArgs(init: std.process.Init) Args {
             a.track_conns = true;
         } else if (std.mem.eql(u8, arg, "--client-pool")) {
             a.client_pool = true;
+        } else if (std.mem.eql(u8, arg, "--no-serve")) {
+            a.no_serve = true;
+        } else if (std.mem.eql(u8, arg, "--port")) {
+            if (it.next()) |v| target_port = std.fmt.parseInt(u16, v, 10) catch target_port;
         }
     }
     if (a.iterations == 0) a.iterations = 1;
@@ -105,7 +125,10 @@ fn parseArgs(init: std.process.Init) Args {
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
-    // 日志级别可由环境变量控制（ZGRPC_LOG=debug 看逐条明细；默认 info 安静）
+    // 日志：**控制台 + 文件默认都开**（文件落 `Log/`），级别默认 Info；
+    // 排障要逐请求明细：`$env:ZGRPC_LOG='debug'`（环境变量优先于配置文件）
+    zgrpc.log.init(io, gpa, null) catch {};
+    defer zgrpc.log.deinit();
     _ = zgrpc.log.applyEnv(init.environ_map);
     const cfg = parseArgs(init);
 
@@ -121,7 +144,7 @@ pub fn main(init: std.process.Init) !void {
     // 连接登记默认关闭（每连接一次自旋锁 + append + 线性扫描）；`--track-conns` 强制打开用于对比
     if (cfg.track_conns) {
         server.track_conns = true;
-        std.debug.print("[bench] 服务端连接登记：开启\n", .{});
+        say("[bench] 服务端连接登记：开启\n", .{});
     }
 
     // 服务端连接调度：默认每连接一线程；`--pool` 改为弹性线程池（短任务场景）
@@ -134,30 +157,42 @@ pub fn main(init: std.process.Init) !void {
         });
         server.dispatch = .pool;
         server.pool = pool;
-        std.debug.print("[bench] 服务端调度：弹性线程池（max={d}）\n", .{cfg.pool_max});
+        say("[bench] 服务端调度：弹性线程池（max={d}）\n", .{cfg.pool_max});
     } else {
-        std.debug.print("[bench] 服务端调度：每连接一线程\n", .{});
+        say("[bench] 服务端调度：每连接一线程\n", .{});
     }
     if (cfg.keepalive_ms > 0) {
         server.keepalive_interval_ms = cfg.keepalive_ms;
         const ka = try server.spawnKeepalive();
         ka.detach();
-        std.debug.print("[bench] keepalive 已开启：每 {d}ms PING 所有连接\n", .{cfg.keepalive_ms});
+        say("[bench] keepalive 已开启：每 {d}ms PING 所有连接\n", .{cfg.keepalive_ms});
     }
 
-    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
-    var listener = addr.listen(io, .{ .reuse_address = true }) catch |e| {
-        std.debug.print("[bench] 监听 {d} 失败：{s}\n", .{ port, @errorName(e) });
-        return e;
-    };
-    defer listener.deinit(io);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", target_port);
 
-    const srv_thread = try std.Thread.spawn(.{}, acceptLoop, .{ gpa, io, &listener, &server });
-    srv_thread.detach();
+    // `--no-serve`：不起本地服务端，客户端直接打 `--port` 上的外部实现。
+    // 这样能用**同一个客户端**对比不同语言的实现，排除压测器自身的瓶颈。
+    var listener: std.Io.net.Server = undefined;
+    var have_listener = false;
+    if (!cfg.no_serve) {
+        listener = addr.listen(io, .{ .reuse_address = true }) catch |e| {
+            say("[bench] 监听 {d} 失败：{s}\n", .{ target_port, @errorName(e) });
+            return e;
+        };
+        have_listener = true;
+    }
+    defer if (have_listener) listener.deinit(io);
+
+    if (have_listener) {
+        const srv_thread = try std.Thread.spawn(.{}, acceptLoop, .{ gpa, io, &listener, &server });
+        srv_thread.detach();
+    } else {
+        say("[bench] --no-serve：客户端目标 127.0.0.1:{d}（外部实现）\n", .{target_port});
+    }
 
     // ---------- 只起服务端：给 ghz 等外部压测工具用 ----------
-    if (cfg.serve_only) {
-        std.debug.print("[bench] 仅服务端模式，监听 127.0.0.1:{d}（ghz 可直连）\n", .{port});
+    if (cfg.serve_only and have_listener) {
+        say("[bench] 仅服务端模式，监听 127.0.0.1:{d}（ghz 可直连）\n", .{target_port});
         acceptLoop(gpa, io, &listener, &server);
         return;
     }
@@ -188,7 +223,7 @@ pub fn main(init: std.process.Init) !void {
 
     // ---------- 客户端 ----------
     var stream = addr.connect(io, .{ .mode = .stream }) catch |e| {
-        std.debug.print("[bench] 连接失败：{s}\n", .{@errorName(e)});
+        say("[bench] 连接失败：{s}\n", .{@errorName(e)});
         return e;
     };
     defer stream.close(io);
@@ -200,7 +235,7 @@ pub fn main(init: std.process.Init) !void {
 
     // 关闭 Nagle：gRPC 是小包交互，Nagle + 延迟 ACK 会带来随机 10~200ms 尖峰
     zgrpc.socket_timeout.setNoDelay(io, stream, true) catch |e| {
-        std.debug.print("[bench] 关闭 Nagle 失败（{s}），延迟可能偏高\n", .{@errorName(e)});
+        say("[bench] 关闭 Nagle 失败（{s}），延迟可能偏高\n", .{@errorName(e)});
     };
 
     var client = zgrpc.client.Client.init(gpa, &sr.interface, &sw.interface, .{
@@ -219,11 +254,11 @@ pub fn main(init: std.process.Init) !void {
     for (0..warmup) |_| {
         _ = arena_state.reset(.retain_capacity);
         const res = client.unary(method, payload, arena_state.allocator()) catch |e| {
-            std.debug.print("[bench] 预热失败：{s}\n", .{@errorName(e)});
+            say("[bench] 预热失败：{s}\n", .{@errorName(e)});
             return e;
         };
         if (res.messages.len != 1) {
-            std.debug.print("[bench] 预热响应异常：messages={d}\n", .{res.messages.len});
+            say("[bench] 预热响应异常：messages={d}\n", .{res.messages.len});
             return error.Unexpected;
         }
     }
@@ -237,7 +272,7 @@ pub fn main(init: std.process.Init) !void {
         _ = arena_state.reset(.retain_capacity);
         const t0 = zgrpc.clock.monotonicNs();
         const res = client.unary(method, payload, arena_state.allocator()) catch |e| {
-            std.debug.print("[bench] 第 {d} 次调用失败：{s}\n", .{ i, @errorName(e) });
+            say("[bench] 第 {d} 次调用失败：{s}\n", .{ i, @errorName(e) });
             return e;
         };
         const t1 = zgrpc.clock.monotonicNs();
@@ -263,12 +298,12 @@ pub fn main(init: std.process.Init) !void {
             }
             prev_slow = idx;
             if (shown < 12) {
-                std.debug.print("[bench] 慢调用 idx={d} 耗时={d:.1}us\n", .{ idx, nsToUs(v) });
+                say("[bench] 慢调用 idx={d} 耗时={d:.1}us\n", .{ idx, nsToUs(v) });
                 shown += 1;
             }
         }
         if (slow_n > 0) {
-            std.debug.print(
+            say(
                 "[bench] 慢调用（>5ms）共 {d}/{d} 次，相邻下标间隔 min={d} max={d}\n",
                 .{ slow_n, cfg.iterations, if (min_gap == std.math.maxInt(usize)) 0 else min_gap, max_gap },
             );
@@ -283,7 +318,7 @@ pub fn main(init: std.process.Init) !void {
     const qps = @as(f64, @floatFromInt(cfg.iterations)) * 1e9 / @as(f64, @floatFromInt(@max(total_ns, 1)));
     const avg_us = @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(cfg.iterations)) / 1000.0;
 
-    std.debug.print(
+    say(
         \\
         \\=== zgrpc unary 基准 ===
         \\构建模式     : {s}（ReleaseFast 之外的绝对数字仅供相对比较）
@@ -326,7 +361,7 @@ pub fn main(init: std.process.Init) !void {
         const h = zgrpc.hpack.huffmanEncodedLen(s);
         huffed += @min(h, s.len);
     }
-    std.debug.print(
+    say(
         "=== HPACK 头部字符串 ===\n样本字符总数 : {d} 字节\nHuffman 后   : {d} 字节（省 {d} 字节，{d:.1}%）\n\n",
         .{
             plain,
@@ -379,7 +414,7 @@ fn poolWorkerMain(w: *PoolWorker) void {
 }
 
 fn runClientPool(io: std.Io, gpa: std.mem.Allocator, cfg: Args) !void {
-    const eps = [_]zgrpc.caller.Endpoint{.{ .host = "127.0.0.1", .port = port }};
+    const eps = [_]zgrpc.caller.Endpoint{.{ .host = "127.0.0.1", .port = target_port }};
     var pool = zgrpc.Pool.init(gpa, io, &eps, .{
         .max_total = @max(@as(usize, 1), cfg.conns),
         .max_idle = @max(@as(usize, 1), cfg.conns),
@@ -415,7 +450,7 @@ fn runClientPool(io: std.Io, gpa: std.mem.Allocator, cfg: Args) !void {
     const calls = threads_n * cfg.iterations;
     const qps = @as(f64, @floatFromInt(calls)) * 1e9 / @as(f64, @floatFromInt(@max(total_ns, 1)));
 
-    std.debug.print(
+    say(
         \\
         \\=== 客户端连接池（共享 zgrpc.Pool）===
         \\线程 / 每线程调用 : {d} / {d}
@@ -428,6 +463,19 @@ fn runClientPool(io: std.Io, gpa: std.mem.Allocator, cfg: Args) !void {
         @as(f64, @floatFromInt(total_ns)) / 1e6, qps,            s.created, s.reused,
         s.discarded,                             s.total,        s.idle,    cfg.conns,
     });
+
+    // 机器可读结果（**纯 ASCII，走 stderr**）。
+    //
+    // 上面那份人类可读报告走 zzig 日志组件，而控制台日志是直写 `WriteConsoleW` 的
+    // （这样中文Windows下中文才不乱码），代价是**无法被重定向/管道捕获**。
+    // 所以另打这一行给脚本解析：`[bench-result] port=.. conns=.. ok=.. failed=.. qps=..`
+    std.debug.print(
+        "[bench-result] port={d} conns={d} threads={d} ok={d} failed={d} qps={d:.1} elapsed_ms={d:.2}\n",
+        .{
+            target_port,                 cfg.conns, threads_n, ok, failed,
+            qps,                         @as(f64, @floatFromInt(total_ns)) / 1e6,
+        },
+    );
 }
 
 /// 短连接模式：每次调用都新建连接、用完即关。
@@ -449,7 +497,7 @@ fn runShortConnections(io: std.Io, gpa: std.mem.Allocator, addr: std.Io.net.IpAd
     for (0..cfg.iterations) |i| {
         const dt: u64 = blk: {
             var s = addr.connect(io, .{ .mode = .stream }) catch |e| {
-                std.debug.print("[bench] 第 {d} 次连接失败：{s}\n", .{ i, @errorName(e) });
+                say("[bench] 第 {d} 次连接失败：{s}\n", .{ i, @errorName(e) });
                 return e;
             };
             defer s.close(io);
@@ -465,7 +513,7 @@ fn runShortConnections(io: std.Io, gpa: std.mem.Allocator, addr: std.Io.net.IpAd
             _ = arena_state.reset(.retain_capacity);
             const t0 = zgrpc.clock.monotonicNs();
             const res = c.unary(method, payload, arena_state.allocator()) catch |e| {
-                std.debug.print("[bench] 第 {d} 次调用失败：{s}\n", .{ i, @errorName(e) });
+                say("[bench] 第 {d} 次调用失败：{s}\n", .{ i, @errorName(e) });
                 return e;
             };
             const t1 = zgrpc.clock.monotonicNs();
@@ -481,7 +529,7 @@ fn runShortConnections(io: std.Io, gpa: std.mem.Allocator, addr: std.Io.net.IpAd
     std.mem.sort(u64, lat_ns, {}, std.sort.asc(u64));
 
     const qps = @as(f64, @floatFromInt(cfg.iterations)) * 1e9 / @as(f64, @floatFromInt(@max(total_ns, 1)));
-    std.debug.print(
+    say(
         \\
         \\=== zgrpc unary 基准（短连接：每次新建连接）===
         \\构建模式     : {s}
@@ -529,7 +577,7 @@ fn runThreadCost() !void {
 
     const per_default = @as(f64, @floatFromInt(dt_default)) / @as(f64, @floatFromInt(n)) / 1000.0;
     const per_small = @as(f64, @floatFromInt(dt_small)) / @as(f64, @floatFromInt(n)) / 1000.0;
-    std.debug.print(
+    say(
         \\
         \\=== 线程创建+销毁成本（{d} 次平均）===
         \\默认栈(16 MiB) : {d:.1} us/次
@@ -627,7 +675,7 @@ fn runConcurrent(io: std.Io, gpa: std.mem.Allocator, addr: std.Io.net.IpAddress,
             merged += 1;
         }
     }
-    std.debug.print(
+    say(
         \\
         \\=== zgrpc unary 基准（并发 {d} 连接 × {d} 次）===
         \\完成请求   : {d}

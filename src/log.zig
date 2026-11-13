@@ -34,6 +34,41 @@ pub const enabled = zzig.Logger.enabled;
 pub const setLineFormat = zzig.Logger.setLineFormat;
 pub const getLineFormat = zzig.Logger.getLineFormat;
 
+// ---------------------------------------------------------------------------
+// 初始化：**控制台 + 文件都默认开**，「要不要输出、输出多少」只由 `LogLevel` 决定
+// ---------------------------------------------------------------------------
+
+/// 默认日志配置路径（相对进程工作目录，与 DH 约定一致）。
+pub const default_config_path = "Config/logger.toml";
+
+/// 应用入口调用一次：[`init`] → 业务 → [`deinit`]。
+///
+/// - 控制台与文件日志**默认都开**（文件落 `Log/` 目录），级别默认 `Info`；
+/// - 配置文件缺失会按模板自动生成（带注释），改完无需重启进程即可热加载；
+/// - 想只留控制台：配置里把 `LogPath = ""`；想更详细：`LogLevel = "Debug"`。
+///
+/// ```zig
+/// pub fn main(init: std.process.Init) !void {
+///     try zgrpc.log.init(init.io, init.gpa, zgrpc.log.default_config_path);
+///     defer zgrpc.log.deinit();
+///     ...
+/// }
+/// ```
+pub fn init(io: std.Io, gpa: std.mem.Allocator, config_path: ?[]const u8) !void {
+    // 环境变量优先于配置文件（临时排障常用 `ZGRPC_LOG=debug`）
+    try zzig.Logger.init(io, gpa, config_path);
+}
+
+/// 退出前刷写异步队列并关文件（不调会丢最后一批日志）。
+pub fn deinit() void {
+    zzig.Logger.shutdown();
+}
+
+/// 立刻把队列里的日志写出去（长驻服务想「打到就能看到」时按需调用）。
+pub fn flush() void {
+    zzig.Logger.flush();
+}
+
 /// 解析级别名（不区分大小写，容忍 trace/warning/error/none 等别名）。
 pub const parseLevel = Level.parse;
 
