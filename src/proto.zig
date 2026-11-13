@@ -21,6 +21,7 @@
 //! `import public` / `import weak`、`reserved`、`extend`、`group`。
 
 const std = @import("std");
+const log = @import("log.zig");
 
 // ---------------------------------------------------------------------------
 // 词法
@@ -184,13 +185,13 @@ pub const Parser = struct {
     }
 
     fn fail(self: *Parser, comptime msg: []const u8) ParseError {
-        std.debug.print("[zgrpc.proto] 第 {d} 行：{s}（遇到 `{s}`）\n", .{ self.tok.line, msg, self.tok.text });
+        log.proto.err("第 {d} 行：{s}（遇到 `{s}`）", .{ self.tok.line, msg, self.tok.text });
         return error.Syntax;
     }
 
     fn expectSym(self: *Parser, s: []const u8) !void {
         if (self.tok.kind != .sym or !std.mem.eql(u8, self.tok.text, s)) {
-            std.debug.print("[zgrpc.proto] 第 {d} 行：期望 `{s}`，实际 `{s}`\n", .{ self.tok.line, s, self.tok.text });
+            log.proto.err("第 {d} 行：期望 `{s}`，实际 `{s}`", .{ self.tok.line, s, self.tok.text });
             return error.Syntax;
         }
         try self.advance();
@@ -198,7 +199,7 @@ pub const Parser = struct {
 
     fn expectIdent(self: *Parser) ![]const u8 {
         if (self.tok.kind != .ident) {
-            std.debug.print("[zgrpc.proto] 第 {d} 行：期望标识符，实际 `{s}`\n", .{ self.tok.line, self.tok.text });
+            log.proto.err("第 {d} 行：期望标识符，实际 `{s}`", .{ self.tok.line, self.tok.text });
             return error.Syntax;
         }
         const t = self.tok.text;
@@ -227,7 +228,7 @@ pub const Parser = struct {
                 try self.expectSym("=");
                 if (self.tok.kind != .string) return self.fail("syntax 值必须是字符串");
                 if (!std.mem.eql(u8, self.tok.text, "proto3")) {
-                    std.debug.print("[zgrpc.proto] 第 {d} 行：只支持 proto3\n", .{self.tok.line});
+                    log.proto.err("第 {d} 行：只支持 proto3", .{self.tok.line});
                     return error.Unsupported;
                 }
                 try self.advance();
@@ -252,7 +253,7 @@ pub const Parser = struct {
                 try self.advance();
                 // `import public` / `import weak` 语义不同（传递导出 / 可缺省），静默当普通 import 会出错
                 if (self.atIdent("public") or self.atIdent("weak")) {
-                    std.debug.print("[zgrpc.proto] 第 {d} 行：不支持 `import {s}`\n", .{ self.tok.line, self.tok.text });
+                    log.proto.err("第 {d} 行：不支持 `import {s}`", .{ self.tok.line, self.tok.text });
                     return error.Unsupported;
                 }
                 if (self.tok.kind != .string) return self.fail("import 后面必须是字符串路径");
@@ -262,7 +263,7 @@ pub const Parser = struct {
                 try self.expectSym(";");
                 try imports.append(self.a, .{ .path = path, .line = line });
             } else if (self.atIdent("option")) {
-                std.debug.print("[zgrpc.proto] 第 {d} 行：不支持 `{s}`\n", .{ self.tok.line, self.tok.text });
+                log.proto.err("第 {d} 行：不支持 `{s}`", .{ self.tok.line, self.tok.text });
                 return error.Unsupported;
             } else {
                 return self.fail("顶层只支持 syntax/package/message/enum/service");
@@ -287,7 +288,7 @@ pub const Parser = struct {
             if (self.atIdent("reserved") or self.atIdent("extend") or
                 self.atIdent("required") or self.atIdent("group"))
             {
-                std.debug.print("[zgrpc.proto] 第 {d} 行：不支持 `{s}`\n", .{ self.tok.line, self.tok.text });
+                log.proto.err("第 {d} 行：不支持 `{s}`", .{ self.tok.line, self.tok.text });
                 return error.Unsupported;
             }
             // 嵌套定义（Zig 侧生成在外层 struct 内，引用时用 `Outer.Inner`）
@@ -317,7 +318,7 @@ pub const Parser = struct {
                     if (self.tok.kind == .eof) return self.fail("oneof 未闭合");
                     // oneof 成员不能是 repeated / map（protobuf 规定）
                     if (self.atIdent("repeated") or self.atIdent("map")) {
-                        std.debug.print("[zgrpc.proto] 第 {d} 行：oneof 成员不能是 `{s}`\n", .{ self.tok.line, self.tok.text });
+                        log.proto.err("第 {d} 行：oneof 成员不能是 `{s}`", .{ self.tok.line, self.tok.text });
                         return error.Unsupported;
                     }
                     if (self.atIdent("option")) {
@@ -396,13 +397,13 @@ pub const Parser = struct {
         try self.expectSym("<");
         const kname = try self.expectIdent();
         const key = scalarFromName(kname) orelse {
-            std.debug.print("[zgrpc.proto] 第 {d} 行：map 的 key 必须是标量类型（不能是 `{s}`）\n", .{ self.tok.line, kname });
+            log.proto.err("第 {d} 行：map 的 key 必须是标量类型（不能是 `{s}`）", .{ self.tok.line, kname });
             return error.Unsupported;
         };
         // protobuf 规定：key 不能是 float / double / bytes / message / enum
         switch (key) {
             .double, .float, .bytes => {
-                std.debug.print("[zgrpc.proto] 第 {d} 行：map 的 key 不能是 `{s}`\n", .{ self.tok.line, kname });
+                log.proto.err("第 {d} 行：map 的 key 不能是 `{s}`", .{ self.tok.line, kname });
                 return error.Unsupported;
             },
             else => {},

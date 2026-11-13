@@ -98,6 +98,8 @@ fn parseArgs(init: std.process.Init) Args {
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
+    // 日志级别可由环境变量控制（ZGRPC_LOG=debug 看逐条明细；默认 info 安静）
+    _ = zgrpc.log.applyEnv(init.environ_map);
     const cfg = parseArgs(init);
 
     // ---------- 服务端 ----------

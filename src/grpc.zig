@@ -14,6 +14,7 @@
 //! 不会打断已经阻塞在业务里的调用）、客户端流/bidi 的背压。
 
 const std = @import("std");
+const log = @import("log.zig");
 const h2 = @import("h2.zig");
 const hpack = @import("hpack.zig");
 const gzip = @import("gzip.zig");
@@ -277,7 +278,7 @@ fn describeContentType(req: h2.Request, call: *Call) bool {
             call.timeout_ns = ns;
             call.deadline_ns = clock.monotonicNs() + ns;
         } else {
-            std.debug.print("[zgrpc.grpc] 忽略非法的 grpc-timeout：{s}\n", .{v});
+            log.grpc.warn("忽略非法的 grpc-timeout：{s}", .{v});
         }
     }
 
@@ -285,7 +286,7 @@ fn describeContentType(req: h2.Request, call: *Call) bool {
     // 因为多数能跑到这里的客户端（包括我们的 Rust 对拍工具）都会带。
     const te_ok = if (req.header("te")) |v| containsIgnoreCase(v, "trailers") else false;
     if (!te_ok) {
-        std.debug.print("[zgrpc.grpc] 请求缺少 te: trailers（{s}）\n", .{req.path});
+        log.grpc.debug("请求缺少 te: trailers（{s}）", .{req.path});
     }
     return true;
 }
@@ -647,7 +648,7 @@ pub const Server = struct {
         self.conns_lock.lock();
         defer self.conns_lock.unlock();
         self.conns.append(std.heap.page_allocator, c) catch |e| {
-            std.debug.print("[zgrpc.server] 登记连接失败（keepalive 对该连接不可用）：{s}\n", .{@errorName(e)});
+            log.grpc.warn("登记连接失败（keepalive 对该连接不可用）：{s}", .{@errorName(e)});
         };
     }
 
@@ -677,16 +678,21 @@ pub const Server = struct {
         var skipped: usize = 0;
         var failed: usize = 0;
         for (self.conns.items) |c| {
-            // 写失败通常是「连接刚关闭、还没 unregister」，属于正常竞态：
-            // 这里只计数（见 `pings_failed`），不逐次打印 —— 10ms 心跳下会刷屏。
-            const wrote = c.trySendPing(null) catch {
+            const wrote = c.trySendPing(null) catch |e| {
                 failed += 1;
+                // 明细走 debug：写失败通常是「连接刚关闭、还没 unregister」，属正常竞态，
+                // 默认 info 级别下不刷屏；排查时 `log.setLevel(.debug)` 逐条可见。
+                log.server.debug("keepalive PING 发送失败（连接可能刚关闭）：{s}", .{@errorName(e)});
                 continue;
             };
             if (wrote) sent += 1 else skipped += 1;
         }
         self.pings_failed +|= failed;
-        if (skipped > 0) self.pings_skipped +|= skipped;
+        if (skipped > 0) {
+            self.pings_skipped +|= skipped;
+            // 同上：逐轮明细降到 debug，计数（`pings_skipped`）始终可查。
+            log.server.debug("keepalive：{d} 个连接正忙已跳过（有业务流量时无需 PING）", .{skipped});
+        }
         return sent;
     }
 
@@ -770,7 +776,7 @@ pub const Server = struct {
     ) void {
         defer stream.close(io);
         @import("socket_timeout.zig").setNoDelay(io, stream, true) catch |e| {
-            std.debug.print("[zgrpc.server] 关闭 Nagle 失败（延迟可能偏高）：{s}\n", .{@errorName(e)});
+            log.grpc.warn("关闭 Nagle 失败（延迟可能偏高）：{s}", .{@errorName(e)});
         };
 
         var recv_buf: [16 * 1024]u8 = undefined;
@@ -787,7 +793,7 @@ pub const Server = struct {
 
         conn.serveStreaming(self.streamHooks()) catch |e| {
             if (e != error.ConnectionClosed) {
-                std.debug.print("[zgrpc.server] 连接异常结束：{s}\n", .{@errorName(e)});
+                log.grpc.warn("连接异常结束：{s}", .{@errorName(e)});
             }
         };
     }
@@ -811,11 +817,11 @@ pub const Server = struct {
         var call = Call{ .req = req, .rsp = rsp, .alloc = arena };
 
         if (!std.mem.eql(u8, req.method, "POST")) {
-            std.debug.print("[zgrpc.grpc] 非 POST 请求 {s} {s} → 405\n", .{ req.method, req.path });
+            log.grpc.info("非 POST 请求 {s} {s} → 405", .{ req.method, req.path });
             return httpError(rsp, "405", "gRPC requires POST");
         }
         if (!describeContentType(req, &call)) {
-            std.debug.print("[zgrpc.grpc] 不支持的 content-type（{s}）→ 415\n", .{req.header("content-type") orelse "缺失"});
+            log.grpc.info("不支持的 content-type（{s}）→ 415", .{req.header("content-type") orelse "缺失"});
             return httpError(rsp, "415", "content-type must be application/grpc[+proto] or application/grpc-web[+proto]");
         }
 
@@ -828,7 +834,7 @@ pub const Server = struct {
         }
 
         const route = self.find(req.path) orelse {
-            std.debug.print("[zgrpc.grpc] 未注册的方法：{s}\n", .{req.path});
+            log.grpc.warn("未注册的方法：{s}", .{req.path});
             call.setStatus(.unimplemented, "未注册的方法");
             return call.finish();
         };
@@ -838,18 +844,18 @@ pub const Server = struct {
             if (call.expired()) {
                 // 过期优先：即便 handler 报的是别的错，对客户端而言语义就是「超了」
                 call.setStatus(.deadline_exceeded, "超过 grpc-timeout");
-                std.debug.print("[zgrpc.grpc] 处理 {s} 超过了 grpc-timeout（{s}）\n", .{ req.path, @errorName(e) });
+                log.grpc.warn("处理 {s} 超过了 grpc-timeout（{s}）", .{ req.path, @errorName(e) });
             } else {
                 // 业务未显式设过状态时兜底为 internal，并留下可定位日志
                 if (call.status == .ok) call.setStatus(.internal, @errorName(e));
-                std.debug.print("[zgrpc.grpc] 处理 {s} 失败：{s}\n", .{ req.path, @errorName(e) });
+                log.grpc.err("处理 {s} 失败：{s}", .{ req.path, @errorName(e) });
             }
         };
 
         // handler 正常返回但已经超过 `grpc-timeout`：语义上仍是超时，不能眼睁睁回 OK
         if (call.status == .ok and call.expired()) {
             call.setStatus(.deadline_exceeded, "超过 grpc-timeout");
-            std.debug.print("[zgrpc.grpc] 处理 {s} 正常返回但已超时 → DEADLINE_EXCEEDED\n", .{req.path});
+            log.grpc.info("处理 {s} 正常返回但已超时 → DEADLINE_EXCEEDED", .{req.path});
         }
         return call.finish();
     }
@@ -866,11 +872,11 @@ pub const Server = struct {
         rsp.stream.user_data = call;
 
         if (!std.mem.eql(u8, req.method, "POST")) {
-            std.debug.print("[zgrpc.grpc] 非 POST 请求 {s} {s} → 405\n", .{ req.method, req.path });
+            log.grpc.info("非 POST 请求 {s} {s} → 405", .{ req.method, req.path });
             return httpError(rsp, "405", "gRPC requires POST");
         }
         if (!describeContentType(req, call)) {
-            std.debug.print("[zgrpc.grpc] 不支持的 content-type（{s}）→ 415\n", .{req.header("content-type") orelse "缺失"});
+            log.grpc.info("不支持的 content-type（{s}）→ 415", .{req.header("content-type") orelse "缺失"});
             return httpError(rsp, "415", "content-type must be application/grpc[+proto] or application/grpc-web[+proto]");
         }
 
@@ -891,7 +897,7 @@ pub const Server = struct {
             return;
         }
 
-        std.debug.print("[zgrpc.grpc] 未注册的方法：{s}\n", .{req.path});
+        log.grpc.warn("未注册的方法：{s}", .{req.path});
         call.setStatus(.unimplemented, "未注册的方法");
         return call.finish();
     }
@@ -925,10 +931,10 @@ pub const Server = struct {
                 route.handler(call.route_ctx, call, call.alloc) catch |e| {
                     if (call.expired()) {
                         call.setStatus(.deadline_exceeded, "超过 grpc-timeout");
-                        std.debug.print("[zgrpc.grpc] 处理 {s} 超过了 grpc-timeout（{s}）\n", .{ call.req.path, @errorName(e) });
+                        log.grpc.warn("处理 {s} 超过了 grpc-timeout（{s}）", .{ call.req.path, @errorName(e) });
                     } else {
                         if (call.status == .ok) call.setStatus(.internal, @errorName(e));
-                        std.debug.print("[zgrpc.grpc] 处理 {s} 失败：{s}\n", .{ call.req.path, @errorName(e) });
+                        log.grpc.err("处理 {s} 失败：{s}", .{ call.req.path, @errorName(e) });
                     }
                 };
                 // 慢 handler 正常返回但已超时：仍然按超时告知客户端
@@ -955,10 +961,10 @@ pub const Server = struct {
             sr.on_message(call.route_ctx, call, msg) catch |e| {
                 if (call.expired()) {
                     call.setStatus(.deadline_exceeded, "超过 grpc-timeout");
-                    std.debug.print("[zgrpc.grpc] 流式处理 {s} 超过了 grpc-timeout（{s}）\n", .{ call.req.path, @errorName(e) });
+                    log.grpc.warn("流式处理 {s} 超过了 grpc-timeout（{s}）", .{ call.req.path, @errorName(e) });
                 } else {
                     if (call.status == .ok) call.setStatus(.internal, @errorName(e));
-                    std.debug.print("[zgrpc.grpc] 流式处理 {s} 失败：{s}\n", .{ call.req.path, @errorName(e) });
+                    log.grpc.err("流式处理 {s} 失败：{s}", .{ call.req.path, @errorName(e) });
                 }
                 return call.finish();
             };
@@ -974,7 +980,7 @@ pub const Server = struct {
             if (sr.on_end) |f| {
                 f(call.route_ctx, call) catch |e| {
                     if (call.status == .ok) call.setStatus(.internal, @errorName(e));
-                    std.debug.print("[zgrpc.grpc] 流式 on_end 失败：{s}\n", .{@errorName(e)});
+                    log.grpc.err("流式 on_end 失败：{s}", .{@errorName(e)});
                 };
             }
             return call.finish();
@@ -983,7 +989,7 @@ pub const Server = struct {
 
     fn streamOnReset(ctx: *anyopaque, stream_id: u32) void {
         _ = ctx;
-        std.debug.print("[zgrpc.grpc] 客户端取消了流 {d}\n", .{stream_id});
+        log.grpc.debug("客户端取消了流 {d}", .{stream_id});
     }
 };
 

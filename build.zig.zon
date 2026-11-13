@@ -3,7 +3,10 @@
     .name = .zgrpc,
     .version = "0.2.1",
     .minimum_zig_version = "0.17.1",
-    .dependencies = .{},
+    .dependencies = .{
+        // 日志 / 配置组件（规则对齐 DH.NCore）
+        .zzig = .{ .path = "../zzig" },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

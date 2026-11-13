@@ -13,6 +13,7 @@
 //! ```
 
 const std = @import("std");
+const log = @import("log.zig");
 const client_mod = @import("client.zig");
 const clock = @import("clock.zig");
 
@@ -134,7 +135,7 @@ pub const Caller = struct {
         const ep = self.endpoints[self.rr % self.endpoints.len];
         self.rr +%= 1;
         const c = Conn.create(self.alloc, self.io, ep, self.opts) catch |e| {
-            std.debug.print("[zgrpc.caller] 连接 {s}:{d} 失败：{s}\n", .{ ep.host, ep.port, @errorName(e) });
+            log.caller.warn("连接 {s}:{d} 失败：{s}", .{ ep.host, ep.port, @errorName(e) });
             return e;
         };
         self.conn = c;
@@ -182,7 +183,7 @@ pub const Caller = struct {
                 last_err = e;
                 if (attempt < max_attempts) {
                     self.retries_total +|= 1;
-                    std.debug.print("[zgrpc.caller] 第 {d}/{d} 次尝试建连失败（{s}），退避 {d}ms 后重试\n", .{ attempt, max_attempts, @errorName(e), backoff_ms });
+                    log.caller.debug("第 {d}/{d} 次尝试建连失败（{s}），退避 {d}ms 后重试", .{ attempt, max_attempts, @errorName(e), backoff_ms });
                     self.sleepBackoff(&backoff_ms);
                     continue;
                 }
@@ -195,7 +196,7 @@ pub const Caller = struct {
                 last_err = e;
                 if (attempt < max_attempts) {
                     self.retries_total +|= 1;
-                    std.debug.print("[zgrpc.caller] 第 {d}/{d} 次尝试失败（{s}），退避 {d}ms 后重试\n", .{ attempt, max_attempts, @errorName(e), backoff_ms });
+                    log.caller.debug("第 {d}/{d} 次尝试失败（{s}），退避 {d}ms 后重试", .{ attempt, max_attempts, @errorName(e), backoff_ms });
                     self.sleepBackoff(&backoff_ms);
                     continue;
                 }
@@ -209,7 +210,7 @@ pub const Caller = struct {
 
             if (attempt < max_attempts and self.isRetryable(res.status)) {
                 self.retries_total +|= 1;
-                std.debug.print("[zgrpc.caller] 第 {d}/{d} 次拿到可重试 status={d}，退避 {d}ms 后重试\n", .{ attempt, max_attempts, res.status, backoff_ms });
+                log.caller.debug("第 {d}/{d} 次拿到可重试 status={d}，退避 {d}ms 后重试", .{ attempt, max_attempts, res.status, backoff_ms });
                 self.dropConn();
                 self.sleepBackoff(&backoff_ms);
                 continue;

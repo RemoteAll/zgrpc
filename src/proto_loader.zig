@@ -15,6 +15,7 @@
 //! 否则只会看到栈溢出或无穷递归。
 
 const std = @import("std");
+const log = @import("log.zig");
 const proto = @import("proto.zig");
 
 pub const LoadError = error{ ImportNotFound, ImportCycle, TooLarge } || proto.ParseError;
@@ -80,9 +81,16 @@ pub const Loader = struct {
     }
 
     fn reportCycle(self: *Loader, closing: []const u8) void {
-        std.debug.print("[zgrpc.proto] import 循环：", .{});
-        for (self.stack.items) |s| std.debug.print("{s} → ", .{s});
-        std.debug.print("{s}\n", .{closing});
+        // 拼成一整行再打：逐段 print 会让每段都带上自己的前缀与级别标记，读起来是碎的三行。
+        var line: std.ArrayListUnmanaged(u8) = .empty;
+        defer line.deinit(std.heap.page_allocator);
+        for (self.stack.items) |s| {
+            line.appendSlice(std.heap.page_allocator, s) catch return;
+            line.appendSlice(std.heap.page_allocator, " → ") catch return;
+        }
+        line.appendSlice(std.heap.page_allocator, closing) catch return;
+        line.appendSlice(std.heap.page_allocator, "\n") catch return;
+        log.proto.err("import 循环：{s}", .{line.items});
     }
 
     fn loadOne(self: *Loader, name: []const u8) LoadError!void {
@@ -118,12 +126,12 @@ pub const Loader = struct {
 
         if (self.memory) |m| {
             if (m.get(disk)) |s| return s;
-            std.debug.print("[zgrpc.proto] 找不到 import 文件：{s}（测试内存模式）\n", .{disk});
+            log.proto.err("找不到 import 文件：{s}（测试内存模式）", .{disk});
             return error.ImportNotFound;
         }
 
         return std.Io.Dir.cwd().readFileAlloc(self.io, disk, self.alloc, .limited(max_file_size)) catch |e| {
-            std.debug.print("[zgrpc.proto] 读 {s} 失败：{s}（import 路径按 root 所在目录解析）\n", .{ disk, @errorName(e) });
+            log.proto.err("读 {s} 失败：{s}（import 路径按 root 所在目录解析）", .{ disk, @errorName(e) });
             return error.ImportNotFound;
         };
     }

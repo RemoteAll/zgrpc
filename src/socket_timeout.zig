@@ -33,6 +33,7 @@
 //!   `Client` 的 deadline 兜。
 
 const std = @import("std");
+const log = @import("log.zig");
 const builtin = @import("builtin");
 
 pub const SetError = error{
@@ -70,7 +71,7 @@ fn setRecvTimeoutAfd(io: std.Io, stream: std.Io.net.Stream, ms: u32) SetError!vo
         .code = std.os.windows.IOCTL.AFD.SOCKOPT,
         .in = std.mem.asBytes(&info),
     } }) catch |e| {
-        std.debug.print("[zgrpc.socket_timeout] AFD SOCKOPT 调用失败：{s}\n", .{@errorName(e)});
+        log.socket.warn("AFD SOCKOPT 调用失败：{s}", .{@errorName(e)});
         return error.SetFailed;
     };
     switch (result.device_io_control.u.Status) {
@@ -78,8 +79,8 @@ fn setRecvTimeoutAfd(io: std.Io, stream: std.Io.net.Stream, ms: u32) SetError!vo
         .INSUFFICIENT_RESOURCES => return error.SystemResources,
         .CANCELLED => return error.SetFailed,
         else => |status| {
-            std.debug.print(
-                "[zgrpc.socket_timeout] 设置 SO_RCVTIMEO={d}ms 失败：status=0x{X}（AFD SOCKOPT）\n",
+            log.socket.warn(
+                "设置 SO_RCVTIMEO={d}ms 失败：status=0x{X}（AFD SOCKOPT）",
                 .{ ms, @intFromEnum(status) },
             );
             return error.SetFailed;
@@ -100,7 +101,7 @@ fn setRecvTimeoutPosix(stream: std.Io.net.Stream, ms: u32) SetError!void {
         std.posix.SO.RCVTIMEO,
         std.mem.asBytes(&tv),
     ) catch |e| {
-        std.debug.print("[zgrpc.socket_timeout] setsockopt(SO_RCVTIMEO={d}ms) 失败：{s}\n", .{ ms, @errorName(e) });
+        log.socket.warn("setsockopt(SO_RCVTIMEO={d}ms) 失败：{s}", .{ ms, @errorName(e) });
         return error.SetFailed;
     };
 }
@@ -126,7 +127,7 @@ pub fn setNoDelay(io: std.Io, stream: std.Io.net.Stream, enable: bool) SetError!
             .code = std.os.windows.IOCTL.AFD.SOCKOPT,
             .in = std.mem.asBytes(&info),
         } }) catch |e| {
-            std.debug.print("[zgrpc.socket_timeout] 设置 TCP_NODELAY 调用失败：{s}\n", .{@errorName(e)});
+            log.socket.warn("设置 TCP_NODELAY 调用失败：{s}", .{@errorName(e)});
             return error.SetFailed;
         };
         switch (result.device_io_control.u.Status) {
@@ -134,8 +135,8 @@ pub fn setNoDelay(io: std.Io, stream: std.Io.net.Stream, enable: bool) SetError!
             .INSUFFICIENT_RESOURCES => return error.SystemResources,
             .CANCELLED => return error.SetFailed,
             else => |status| {
-                std.debug.print(
-                    "[zgrpc.socket_timeout] 设置 TCP_NODELAY={} 失败：status=0x{X}\n",
+                log.socket.warn(
+                    "设置 TCP_NODELAY={} 失败：status=0x{X}",
                     .{ enable, @intFromEnum(status) },
                 );
                 return error.SetFailed;
@@ -150,7 +151,7 @@ pub fn setNoDelay(io: std.Io, stream: std.Io.net.Stream, enable: bool) SetError!
         std.posix.TCP.NODELAY,
         std.mem.asBytes(&v),
     ) catch |e| {
-        std.debug.print("[zgrpc.socket_timeout] setsockopt(TCP_NODELAY) 失败：{s}\n", .{@errorName(e)});
+        log.socket.warn("setsockopt(TCP_NODELAY) 失败：{s}", .{@errorName(e)});
         return error.SetFailed;
     };
 }

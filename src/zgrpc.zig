@@ -35,6 +35,10 @@ pub const proto_loader = @import("proto_loader.zig");
 pub const descriptor = @import("descriptor.zig");
 pub const reflection = @import("reflection.zig");
 pub const afd_reader = @import("afd_reader.zig");
+/// 统一日志门面：`log.setLevel(.debug)` 打开全部明细（默认 `.info`）。
+///
+/// 接口与 zzig 的 `logs.logger` 对齐，将来若要统一到 zzig，只需替换这一层。
+pub const log = @import("log.zig");
 
 /// 库版本（语义化）。
 pub const version = "0.2.1";

@@ -7,6 +7,7 @@
 //! 交互式双向流（bidi）需要自己基于 `h2` 层构建，见 README「未做」。
 
 const std = @import("std");
+const log = @import("log.zig");
 const builtin = @import("builtin");
 const h2 = @import("h2.zig");
 const hpack = @import("hpack.zig");
@@ -171,7 +172,7 @@ pub const Client = struct {
         // Windows 无需预先设置超时值：时限在每次读时作为参数传入。
         if (builtin.os.tag != .windows) {
             socket_timeout.setRecvTimeout(io, stream, 0) catch |e| {
-                std.debug.print("[zgrpc.client] 设置 SO_RCVTIMEO 失败，本地超时不可用：{s}\n", .{@errorName(e)});
+                log.client.warn("设置 SO_RCVTIMEO 失败，本地超时不可用：{s}", .{@errorName(e)});
                 return;
             };
         }
@@ -185,7 +186,7 @@ pub const Client = struct {
     pub fn tuneSocket(self: *Client, stream: std.Io.net.Stream, io: std.Io) void {
         _ = self;
         socket_timeout.setNoDelay(io, stream, true) catch |e| {
-            std.debug.print("[zgrpc.client] 关闭 Nagle 失败（延迟可能偏高）：{s}\n", .{@errorName(e)});
+            log.client.warn("关闭 Nagle 失败（延迟可能偏高）：{s}", .{@errorName(e)});
         };
     }
     /// 读满 `dest`；启用本地超时后按**剩余时间**喂超时，到点返回 `error.Timeout`。
@@ -228,7 +229,7 @@ pub const Client = struct {
             } else {
                 if (remain) |ms| socket_timeout.setRecvTimeout(io, stream, ms) catch |e| {
                     // 不能静默吞：设不上超时会让本次调用失去时限保护（可能永远阻塞）
-                    std.debug.print("[zgrpc.client] 设置接收超时失败（{d}ms）：{s} —— 本次调用可能无法按时中断\n", .{ ms, @errorName(e) });
+                    log.client.warn("设置接收超时失败（{d}ms）：{s} —— 本次调用可能无法按时中断", .{ ms, @errorName(e) });
                 };
                 var datas = [1][]u8{slice};
                 got = stream.read(io, &datas) catch |e| {
@@ -265,8 +266,8 @@ pub const Client = struct {
         const res = io.operateTimeout(op, timeout) catch |e| switch (e) {
             error.ConcurrencyUnavailable => {
                 self.timeout_mode = .platform;
-                std.debug.print(
-                    "[zgrpc.client] 当前 Io 后端不支持带超时操作，回退到平台原生读超时（异步后端可省掉这层）\n",
+                log.client.warn(
+                    "当前 Io 后端不支持带超时操作，回退到平台原生读超时（异步后端可省掉这层）",
                     .{},
                 );
                 return null;
@@ -391,10 +392,10 @@ pub const Client = struct {
             const hdr = readFrameHeader(self) catch |e| {
                 const mapped = self.mapReadError(e);
                 if (mapped == error.Timeout) {
-                    std.debug.print("[zgrpc.client] 读响应超时（本地 timeout 到期）\n", .{});
+                    log.client.warn("读响应超时（本地 timeout 到期）", .{});
                     return error.Timeout;
                 }
-                std.debug.print("[zgrpc.client] 读响应帧结束（{s}）\n", .{@errorName(e)});
+                log.client.debug("读响应帧结束（{s}）", .{@errorName(e)});
                 return error.ConnectionClosed;
             };
             const payload = try arena.alloc(u8, hdr.length);
@@ -432,7 +433,7 @@ pub const Client = struct {
                     const idx = indexOf(results, hdr.stream_id) orelse continue;
                     var hs: std.ArrayListUnmanaged(hpack.Header) = .empty;
                     self.decoder.decode(payload, &hs, arena) catch |e| {
-                        std.debug.print("[zgrpc.client] HPACK 解码失败（流 {d}）：{s}\n", .{
+                        log.client.err("HPACK 解码失败（流 {d}）：{s}", .{
                             hdr.stream_id, @errorName(e),
                         });
                         return e;
@@ -534,10 +535,10 @@ pub const Client = struct {
             const hdr = readFrameHeader(self) catch |e| {
                 const mapped = self.mapReadError(e);
                 if (mapped == error.Timeout) {
-                    std.debug.print("[zgrpc.client] 读响应超时（本地 timeout 到期）\n", .{});
+                    log.client.warn("读响应超时（本地 timeout 到期）", .{});
                     return error.Timeout;
                 }
-                std.debug.print("[zgrpc.client] 读响应帧结束（{s}）\n", .{@errorName(e)});
+                log.client.debug("读响应帧结束（{s}）", .{@errorName(e)});
                 return error.ConnectionClosed;
             };
             const payload = try arena.alloc(u8, hdr.length);

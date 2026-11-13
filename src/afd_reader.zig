@@ -24,6 +24,7 @@
 //! 读线程实现已删除（失败过程与实测数据仍在 `docs/决策记录.md`）。
 
 const std = @import("std");
+const log = @import("log.zig");
 const builtin = @import("builtin");
 const windows = std.os.windows;
 
@@ -138,15 +139,15 @@ pub fn readDiagnostic(handle: windows.HANDLE, dest: []u8, use_event: bool) ReadE
         null,
         0,
     );
-    std.debug.print(
-        "[zgrpc.afd] 诊断：use_event={} -> NTSTATUS 0x{X}（SUCCESS=0x0, PENDING=0x103）\n",
-        .{ use_event, @intFromEnum(status) },
+    log.afd.debug(
+        "诊断：use_event={} -> NTSTATUS 0x{X}（SUCCESS=0x0, PENDING=0x103）",
+        .{ use_event, @backingInt(status) },
     );
     if (status == .SUCCESS) return iosb.Information;
     if (use_event) {
         if (status == .PENDING) {
             const r = windows.ntdll.NtWaitForSingleObject(event, .FALSE, null);
-            std.debug.print("[zgrpc.afd] 诊断：等待完成 -> 0x{X}\n", .{@intFromEnum(r)});
+            log.afd.debug("诊断：等待完成 -> 0x{X}", .{@backingInt(r)});
             return fromIosb(iosb);
         }
         // event 已置位时也会走到这
@@ -178,9 +179,9 @@ fn mapStatus(status: windows.NTSTATUS) ReadError {
         .CONNECTION_RESET, .REMOTE_DISCONNECT, .LOCAL_DISCONNECT => error.ConnectionResetByPeer,
         .CONNECTION_ABORTED, .CONNECTION_DISCONNECTED => error.ConnectionResetByPeer,
         else => |s| blk: {
-            std.debug.print(
-                "[zgrpc.afd] 未预期的 AFD 读状态：NTSTATUS 0x{X}\n",
-                .{@intFromEnum(s)},
+            log.afd.warn(
+                "未预期的 AFD 读状态：NTSTATUS 0x{X}",
+                .{@backingInt(s)},
             );
             break :blk error.Unexpected;
         },

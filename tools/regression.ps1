@@ -16,7 +16,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # 测试数下限：只能抬高，不能降低（降低必须在 docs/决策记录.md 写明依据）
-$minTests = 83
+$minTests = 87
 
 # 随机空闲端口：Windows 上 `Stop-Process -Force`（= TerminateProcess）会让监听 socket
 # 变成 zombie LISTEN（netstat 里 OwningProcess=0），持续数十秒且无法 kill。
@@ -88,11 +88,24 @@ if ($SkipBuild) {
     }
 }
 
-# ---------- 2. 单元/端到端测试（直接用 zig test：不吃构建缓存，每次真跑）----------
+# ---------- 2. 单元/端到端测试 ----------
+# 注意：必须走 `zig build test`（而不是 `zig test src\zgrpc.zig`）——
+# 库现在依赖 zzig（日志 / 配置组件），单文件方式解析不了模块依赖。
+# `zig build test` 只在失败时输出细节、拿不到测试数量，所以它负责「编译 + 判定通过」，
+# 数量由它同时装出的固定路径 `zig-out\bin\zgrpc-tests.exe` 解析（也是人工可直跑的那个）。
 $testLog = "$reportDir\test.log"
-& $zig test 'src\zgrpc.zig' *> $testLog
+& $zig build test *> $testLog
 $testCode = $LASTEXITCODE
-$testText = Get-Content $testLog -Raw -ErrorAction SilentlyContinue
+
+$testExe = Join-Path $root 'zig-out\bin\zgrpc-tests.exe'
+$testText = ''
+if ($testCode -eq 0 -and (Test-Path $testExe)) {
+    & $testExe *>> $testLog
+    $testCode = $LASTEXITCODE
+    $testText = Get-Content $testLog -Raw -ErrorAction SilentlyContinue
+} else {
+    $testText = Get-Content $testLog -Raw -ErrorAction SilentlyContinue
+}
 
 if ($testCode -ne 0) {
     Write-Report "[回归] FAIL：zig test 退出码 $testCode（详见 $testLog）"

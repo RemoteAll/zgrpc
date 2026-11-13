@@ -17,17 +17,30 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // 公共工具库（日志 / 配置）：日志级别与行格式、配置读取统一走它，
+    // 规则对齐 DH.NCore（经 DH.RustBase 落地）。
+    const zzig = b.dependency("zzig", .{ .target = target, .optimize = optimize });
+
     const zgrpc = b.addModule("zgrpc", .{
         .root_source_file = b.path("src/zgrpc.zig"),
         .target = target,
         .optimize = optimize,
     });
+    zgrpc.addImport("zzig", zzig.module("zzig"));
 
     // 单元测试（`zig build test`）
     const unit_tests = b.addTest(.{ .root_module = zgrpc });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "运行全部单元测试");
     test_step.dependOn(&run_unit_tests.step);
+
+    // 同时把测试二进制装到固定路径：回归脚本要按 `All N tests passed` 解析测试数，
+    // 而 `zig build test` 只在失败时输出细节、拿不到数量。
+    // 这样也方便人工直接跑 `zig-out/bin/zgrpc-tests.exe`。
+    const install_tests = b.addInstallArtifact(unit_tests, .{
+        .dest_sub_path = "zgrpc-tests.exe",
+    });
+    test_step.dependOn(&install_tests.step);
 
     // 代码生成产物测试（`examples/echo.pb.zig` 由 tools/proto_gen.zig 生成）：
     // 把「生成代码能用」也纳入一键回归，而不是只靠肉眼。
@@ -59,7 +72,7 @@ pub fn build(b: *std.Build) void {
     const gen_exe = b.addExecutable(.{ .name = "proto_gen", .root_module = gen_mod });
     const gen_run = b.addRunArtifact(gen_exe);
     gen_run.addArgs(&.{ "examples/echo.proto", "examples/echo.pb.zig" });
-        // 基准：`zig build bench -Doptimize=ReleaseFast -- --iterations 5000`
+    // 基准：`zig build bench -Doptimize=ReleaseFast -- --iterations 5000`
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("tools/bench.zig"),
         .target = target,

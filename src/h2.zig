@@ -13,6 +13,7 @@
 //! `DATA`（含 PADDED、流控回补）、`WINDOW_UPDATE`（连接级 + 每流）、`PING`(ACK)、`RST_STREAM`、`GOAWAY`。
 
 const std = @import("std");
+const log = @import("log.zig");
 const hpack = @import("hpack.zig");
 
 /// 客户端连接前言（RFC 9113 §3.4）。
@@ -393,11 +394,11 @@ pub const Connection = struct {
     fn runLoop(self: *Connection) !void {
         var pf: [client_preface.len]u8 = undefined;
         self.reader.readSliceAll(&pf) catch |e| {
-            std.debug.print("[zgrpc.h2] 读连接前言失败：{s}\n", .{@errorName(e)});
+            log.h2.warn("读连接前言失败：{s}", .{@errorName(e)});
             return e;
         };
         if (!std.mem.eql(u8, &pf, client_preface)) {
-            std.debug.print("[zgrpc.h2] 连接前言不匹配（可能是 HTTP/1.1 打到 h2 端口）\n", .{});
+            log.h2.warn("连接前言不匹配（可能是 HTTP/1.1 打到 h2 端口）", .{});
             return error.BadPreface;
         }
 
@@ -415,14 +416,14 @@ pub const Connection = struct {
 
             const hdr = self.readFrameHeader() catch |e| {
                 // 对端关闭/半包 → 正常收尾；其它读错误也在这里定位
-                std.debug.print("[zgrpc.h2] 读帧结束（{s}），连接收尾\n", .{@errorName(e)});
+                log.h2.debug("读帧结束（{s}），连接收尾", .{@errorName(e)});
                 return error.ConnectionClosed;
             };
 
             const payload = try self.alloc.alloc(u8, hdr.length);
             self.reader.readSliceAll(payload) catch |e| {
                 self.alloc.free(payload);
-                std.debug.print("[zgrpc.h2] 读帧体失败（流 {d}，{d} 字节）：{s}\n", .{
+                log.h2.warn("读帧体失败（流 {d}，{d} 字节）：{s}", .{
                     hdr.stream_id, hdr.length, @errorName(e),
                 });
                 return error.ConnectionClosed;
@@ -674,7 +675,7 @@ pub const Connection = struct {
         // RFC 9113 §6.4：RST_STREAM 载荷必为 4 字节，否则是连接级 FRAME_SIZE_ERROR
         if (payload.len != 4) return error.FrameSizeError;
         if (self.findStream(hdr.stream_id)) |s| {
-            std.debug.print("[zgrpc.h2] 对端重置流 {d}，丢弃其状态\n", .{hdr.stream_id});
+            log.h2.info("对端重置流 {d}，丢弃其状态", .{hdr.stream_id});
             if (self.stream_hooks) |hooks| {
                 if (hooks.onReset) |cb| cb(hooks.ctx, hdr.stream_id);
             }
@@ -686,13 +687,13 @@ pub const Connection = struct {
     fn pumpForWindow(self: *Connection, stream: *StreamState) !void {
         while (self.send_window <= 0 or stream.send_window <= 0) {
             const hdr = self.readFrameHeader() catch |e| {
-                std.debug.print("[zgrpc.h2] 等窗口时读帧结束（{s}）\n", .{@errorName(e)});
+                log.h2.debug("等窗口时读帧结束（{s}）", .{@errorName(e)});
                 return error.ConnectionClosed;
             };
             const payload = try self.alloc.alloc(u8, hdr.length);
             self.reader.readSliceAll(payload) catch |e| {
                 self.alloc.free(payload);
-                std.debug.print("[zgrpc.h2] 等窗口时读帧体失败：{s}\n", .{@errorName(e)});
+                log.h2.warn("等窗口时读帧体失败：{s}", .{@errorName(e)});
                 return error.ConnectionClosed;
             };
 
@@ -723,14 +724,14 @@ pub const Connection = struct {
     fn onHeaders(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
         // RFC 9113 §5.1.1：客户端发起的流号必须是正奇数（偶数是服务端推送专用，本库不用）
         if (hdr.stream_id == 0 or hdr.stream_id % 2 == 0) {
-            std.debug.print("[zgrpc.h2] 非法流号 {d}（客户端发起必须为奇数）\n", .{hdr.stream_id});
+            log.h2.warn("非法流号 {d}（客户端发起必须为奇数）", .{hdr.stream_id});
             try self.sendGoAway(.protocol_error);
             return error.ProtocolError;
         }
         const s = self.findStream(hdr.stream_id) orelse blk: {
             if (self.streams.items.len >= self.opts.max_concurrent_streams) {
-                std.debug.print(
-                    "[zgrpc.h2] 并发流超上限 {d}，拒绝流 {d}\n",
+                log.h2.warn(
+                    "并发流超上限 {d}，拒绝流 {d}",
                     .{ self.opts.max_concurrent_streams, hdr.stream_id },
                 );
                 try self.sendRst(hdr.stream_id, .refused_stream);
@@ -755,7 +756,7 @@ pub const Connection = struct {
 
         try s.header_block.appendSlice(a, data);
         if (s.header_block.items.len > self.opts.max_header_block) {
-            std.debug.print("[zgrpc.h2] header block 超上限 {d} 字节\n", .{self.opts.max_header_block});
+            log.h2.warn("header block 超上限 {d} 字节", .{self.opts.max_header_block});
             try self.sendRst(hdr.stream_id, .enhance_your_calm);
             self.destroyStream(s);
             return;
@@ -770,7 +771,7 @@ pub const Connection = struct {
         const s = self.findStream(hdr.stream_id) orelse {
             // 流已不存在（比如上一条 HEADERS 已因超限被 RST/销毁）：**忽略该 CONTINUATION**。
             // 这里不能返回错误——那会把整条连接拆掉，连带弄死其它正常流（流级错误就按流处理）。
-            std.debug.print("[zgrpc.h2] 忽略孤立的 CONTINUATION（流 {d} 不存在）\n", .{hdr.stream_id});
+            log.h2.debug("忽略孤立的 CONTINUATION（流 {d} 不存在）", .{hdr.stream_id});
             return;
         };
         if (s.headers_done) {
@@ -817,7 +818,7 @@ pub const Connection = struct {
             s.rsp = rsp;
 
             hooks.onHeaders(hooks.ctx, makeRequest(s), rsp) catch |e| {
-                std.debug.print("[zgrpc.h2] 流式 onHeaders 失败（流 {d}）：{s}\n", .{ s.id, @errorName(e) });
+                log.h2.err("流式 onHeaders 失败（流 {d}）：{s}", .{ s.id, @errorName(e) });
                 if (!rsp.begun) rsp.begin("500", &.{}) catch {};
                 if (!rsp.ended) rsp.end(&.{}) catch {};
             };
@@ -841,7 +842,7 @@ pub const Connection = struct {
         };
 
         hooks.onData(hooks.ctx, rsp, data, end_stream) catch |e| {
-            std.debug.print("[zgrpc.h2] 流式 onData 失败（流 {d}，{d} 字节）：{s}\n", .{
+            log.h2.err("流式 onData 失败（流 {d}，{d} 字节）：{s}", .{
                 s.id, data.len, @errorName(e),
             });
             if (!rsp.begun) rsp.begin("500", &.{}) catch {};
@@ -858,7 +859,7 @@ pub const Connection = struct {
     fn finishHeaders(self: *Connection, s: *StreamState) !void {
         const a = s.allocator();
         self.decoder.decode(s.header_block.items, &s.headers, a) catch |e| {
-            std.debug.print("[zgrpc.h2] HPACK 解码失败（流 {d}）：{s}\n", .{ s.id, @errorName(e) });
+            log.h2.err("HPACK 解码失败（流 {d}）：{s}", .{ s.id, @errorName(e) });
             try self.sendGoAway(.compression_error);
             return error.CompressionError;
         };
@@ -883,7 +884,7 @@ pub const Connection = struct {
             // pad 长度越界：只拒绝该流（不能把错误抛上去，否则一条坏帧就能拆掉整条连接、
             // 连带弄死其它正常流。RFC 9113 也要求按流处理协议错误）。
             if (payload.len == 0 or @as(usize, payload[0]) > payload.len - 1) {
-                std.debug.print("[zgrpc.h2] 流 {d} 的 PADDED 帧 pad 长度越界（载荷 {d} 字节），拒绝该流\n", .{
+                log.h2.warn("流 {d} 的 PADDED 帧 pad 长度越界（载荷 {d} 字节），拒绝该流", .{
                     hdr.stream_id, payload.len,
                 });
                 try self.refundWindow(hdr.stream_id, payload.len, true);
@@ -906,7 +907,7 @@ pub const Connection = struct {
 
         const a = s.allocator();
         if (s.body.items.len + data.len > self.opts.max_body) {
-            std.debug.print("[zgrpc.h2] 请求体超上限 {d} 字节（流 {d}）\n", .{ self.opts.max_body, s.id });
+            log.h2.warn("请求体超上限 {d} 字节（流 {d}）", .{ self.opts.max_body, s.id });
             try self.sendRst(hdr.stream_id, .enhance_your_calm);
             self.destroyStream(s);
             return;
@@ -932,7 +933,7 @@ pub const Connection = struct {
         defer self.destroyStream(s);
 
         if (self.dispatch_depth >= max_dispatch_depth) {
-            std.debug.print("[zgrpc.h2] 派发嵌套过深（{d}），拒绝流 {d}\n", .{ self.dispatch_depth, s.id });
+            log.h2.warn("派发嵌套过深（{d}），拒绝流 {d}", .{ self.dispatch_depth, s.id });
             try self.sendRst(s.id, .refused_stream);
             return;
         }
@@ -951,7 +952,7 @@ pub const Connection = struct {
         };
 
         handler(ctx, req, &rsp, s.allocator()) catch |e| {
-            std.debug.print("[zgrpc.h2] 处理 {s} {s} 失败（流 {d}）：{s}\n", .{
+            log.h2.err("处理 {s} {s} 失败（流 {d}）：{s}", .{
                 req.method, req.path, s.id, @errorName(e),
             });
             if (!rsp.begun) rsp.begin("500", &.{}) catch {};
