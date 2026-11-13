@@ -12,3 +12,8 @@ artifacts/
 zig-pkg/
 # Rust 鏋勫缓浜х墿锛堝鎷嶅伐绋嬶級
 target/
+
+# 对拍构建产物
+bench_pair/payload.json
+bench_pair/goserver/goserver.exe
+bench_pair/goserver/goserver.pdb

@@ -1,0 +1,15 @@
+// 跨语言对拍用 proto（ghz 用它构造请求/解析响应）
+//
+// 服务端行为对所有实现都完全一致：**原样回显请求消息的 protobuf 字节**
+// （不做字段级编解码），这样比较的就纯粹是「h2 + gRPC 框架」的开销。
+syntax = "proto3";
+
+package bench;
+
+service Bench {
+  rpc Echo(Payload) returns (Payload);
+}
+
+message Payload {
+  bytes data = 1;
+}
