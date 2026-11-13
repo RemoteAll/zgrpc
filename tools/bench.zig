@@ -85,6 +85,8 @@ const Args = struct {
     pool: bool = false,
     /// 线程池 worker 上限
     pool_max: usize = 256,
+    /// >0：事件循环连接 + 每流任务池（消除同连接队头阻塞），值为池上限
+    streams: usize = 0,
     /// 强制开启服务端连接登记（默认已关闭；用于量化登记开销）
     track_conns: bool = false,
     /// 客户端走连接池（共享 `zgrpc.Pool`，用于验证连接复用/上限）
@@ -118,6 +120,8 @@ fn parseArgs(init: std.process.Init) Args {
             if (it.next()) |v| a.keepalive_ms = std.fmt.parseInt(u32, v, 10) catch a.keepalive_ms;
         } else if (std.mem.eql(u8, arg, "--pool")) {
             a.pool = true;
+        } else if (std.mem.eql(u8, arg, "--streams")) {
+            if (it.next()) |v| a.streams = std.fmt.parseInt(usize, v, 10) catch a.streams;
         } else if (std.mem.eql(u8, arg, "--pool-max")) {
             if (it.next()) |v| a.pool_max = std.fmt.parseInt(usize, v, 10) catch a.pool_max;
         } else if (std.mem.eql(u8, arg, "--track-conns")) {
@@ -162,7 +166,18 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // 服务端连接调度：默认每连接一线程；`--pool` 改为弹性线程池（短任务场景）
-    if (cfg.pool) {
+    if (cfg.streams > 0) {
+        // 事件循环连接 + 每流任务：消除同连接队头阻塞
+        const hpool = try zzig.threading.pool.Pool.create(io, gpa, .{
+            .min_workers = 0,
+            .max_workers = cfg.streams,
+            .idle_timeout_ms = 60_000,
+            .queue_capacity = 8192,
+        });
+        server.dispatch = .task;
+        server.pool = hpool;
+        say("[bench] 服务端调度：事件循环 + 每流任务池（max={d}）\n", .{cfg.streams});
+    } else if (cfg.pool) {
         const pool = try zzig.threading.pool.Pool.create(io, gpa, .{
             .min_workers = 0,
             .max_workers = cfg.pool_max,

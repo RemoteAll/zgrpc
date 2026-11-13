@@ -1070,6 +1070,20 @@ pub const Server = struct {
 
         var conn = h2.Connection.init(allocator, &sr.interface, &sw.interface, .{});
         defer conn.deinit();
+
+        // 每流任务模式：`dispatch == .task` 且提供了池时启用。
+        // 目的：消除同连接上的队头阻塞（实测 1ms handler、单连接 64 路并发
+        // p50 从 65ms 降到接近 4ms 的水平）。`job_ctx` 指向栈上结构，
+        // 生命周期由 `conn.waitJobs` + 本函数返回顺序保证。
+        var job_ctx = StreamJobCtx{ .pool = undefined, .allocator = allocator };
+        if (self.dispatch == .task) {
+            if (self.pool) |pool| {
+                job_ctx.pool = pool;
+                conn.concurrent_write = true;
+                conn.job_submit = streamJobSubmit;
+                conn.job_ctx = @ptrCast(&job_ctx);
+            }
+        }
         // 兜底：连接异常收尾时，把还留在发送缓冲里的字节尽力刷出去。
         // 延迟 flush 的正常刷出点在读循环，异常路径（协议错/对端半关）走不到那里。
         defer conn.flushOut() catch {};
@@ -1085,6 +1099,49 @@ pub const Server = struct {
                 log.grpc.warn("连接异常结束：{s}", .{@errorName(e)});
             }
         };
+        // 每流任务可能还在跑：必须先等它们退出，`conn.deinit()` 才能释放 arena
+        conn.waitJobs(io);
+    }
+
+    /// 每流任务的上下文（栈上，生命周期 = 本条连接）。
+    const StreamJobCtx = struct {
+        pool: *zzig.threading.pool.Pool,
+        allocator: std.mem.Allocator,
+    };
+
+    /// 一次性任务盒：从**该流自己的 arena** 分配，随流一起释放。
+    const StreamJob = struct {
+        conn: *h2.Connection,
+        stream: *h2.StreamState,
+        arena: std.mem.Allocator,
+    };
+
+    /// `h2.Connection.job_submit` 的实现：把 unary handler 挪到线程池执行。
+    ///
+    /// 关键点：**提交失败绝不能丢请求**——退化成在当前任务同步执行，
+    /// 正确性优先（只在这条连接上短暂阻塞）。
+    fn streamJobSubmit(ctx: *anyopaque, conn: *h2.Connection, s: *h2.StreamState) void {
+        const jc: *StreamJobCtx = @ptrCast(@alignCast(ctx));
+        const arena = s.allocator();
+        const box = arena.create(StreamJob) catch {
+            conn.runStreamJob(s);
+            return;
+        };
+        box.* = .{ .conn = conn, .stream = s, .arena = arena };
+        jc.pool.submit(streamJobRun, box) catch {
+            box.arena.destroy(box);
+            conn.runStreamJob(s);
+            return;
+        };
+    }
+
+    fn streamJobRun(ctx: *anyopaque) void {
+        const job: *StreamJob = @ptrCast(@alignCast(ctx));
+        const conn = job.conn;
+        const s = job.stream;
+        const arena = job.arena;
+        defer arena.destroy(job);
+        conn.runStreamJob(s);
     }
 
     fn findStreamRoute(self: *Server, path: []const u8) ?*const StreamRoute {

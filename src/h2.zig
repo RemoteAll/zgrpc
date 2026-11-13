@@ -270,6 +270,12 @@ pub const StreamState = struct {
     rsp: ?*Responder = null,
     /// 业务挂载点（流式模式：gRPC 的 Call）
     user_data: ?*anyopaque = null,
+    /// 该流的 handler 已交给**其它任务**执行：连接任务在此期间不得回收此流。
+    leased: bool = false,
+    /// handler 任务已经跑完（写锁保护）；连接任务在 `reapStreams` 里回收。
+    finished: bool = false,
+    /// 对端发了 RST_STREAM：handler 不应再写，等它收尾后再回收（写锁保护）。
+    aborted: bool = false,
 
     // --- 并发写模式（`Connection.concurrent_write`）专用 ---
     /// 窗口不足时暂存的待发正文。**只有该流自己的任务会 append**，
@@ -361,6 +367,14 @@ pub const Connection = struct {
     /// **不再调用会阻塞读的 `pumpForWindow`**（只有连接任务能读 socket）。
     /// 关闭时行为与之前完全一致（阻塞式，吞吐更好）。
     concurrent_write: bool = false,
+    /// 每流任务提交钩子：非 null 时 unary handler 会被提交到**其它任务**执行。
+    ///
+    /// 这是消除「队头阻塞」的关键：同一条连接上的慢 handler 不再挡住其它流。
+    /// 实现方只需转发给 `runStreamJob`（结束租约、回收都由它负责）。
+    job_submit: ?*const fn (ctx: *anyopaque, conn: *Connection, s: *StreamState) void = null,
+    job_ctx: ?*anyopaque = null,
+    /// 仍在执行中的每流任务数（写锁保护）。连接收尾前必须等它归零。
+    active_jobs: usize = 0,
 
     serve_ctx: ?*anyopaque = null,
     serve_handler: ?HandlerFn = null,
@@ -455,6 +469,9 @@ pub const Connection = struct {
         s.pending_out = .empty;
         s.pending_end = false;
         s.pending_trailers = null;
+        s.leased = false;
+        s.finished = false;
+        s.aborted = false;
     }
 
     fn createStream(self: *Connection, id: u32) !*StreamState {
@@ -563,6 +580,9 @@ pub const Connection = struct {
     }
 
     fn handleFrame(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
+        // 回收已跑完的租约流（每流任务模式）。放这里而不是循环末尾：
+        // 帧到达即意味着该流的响应很可能已写完，回收时机刚好。
+        self.reapStreams();
         switch (hdr.ftype) {
             .settings => try self.onSettings(hdr, payload),
             .ping => try self.onPing(hdr, payload),
@@ -717,6 +737,8 @@ pub const Connection = struct {
     ) !void {
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
+        // 对端已 RST：不再写（写了也是白写，还可能被回 GOAWAY）
+        if (s.aborted) return;
         try self.writeStreamDataLocked(s, bytes, end_stream);
     }
 
@@ -763,6 +785,7 @@ pub const Connection = struct {
     pub fn finishStream(self: *Connection, s: *StreamState, trailers_block: []const u8) !void {
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
+        if (s.aborted) return;
         if (s.pending_out.items.len > 0) {
             s.pending_trailers = trailers_block;
             return;
@@ -1005,7 +1028,7 @@ pub const Connection = struct {
             if (self.stream_hooks) |hooks| {
                 if (hooks.onReset) |cb| cb(hooks.ctx, hdr.stream_id);
             }
-            self.destroyStream(s);
+            self.killStream(s);
         }
     }
 
@@ -1074,14 +1097,14 @@ pub const Connection = struct {
         if (s.headers_done) {
             // 同流二次 HEADERS（trailers）本库不支持
             try self.sendRst(hdr.stream_id, .protocol_error);
-            self.destroyStream(s);
+            self.killStream(s);
             return;
         }
 
         const a = s.allocator();
         const data = stripHeaderExtras(hdr, payload) orelse {
             try self.sendRst(hdr.stream_id, .protocol_error);
-            self.destroyStream(s);
+            self.killStream(s);
             return;
         };
 
@@ -1089,7 +1112,7 @@ pub const Connection = struct {
         if (s.header_block.items.len > self.opts.max_header_block) {
             log.h2.warn("header block 超上限 {d} 字节", .{self.opts.max_header_block});
             try self.sendRst(hdr.stream_id, .enhance_your_calm);
-            self.destroyStream(s);
+            self.killStream(s);
             return;
         }
 
@@ -1107,14 +1130,14 @@ pub const Connection = struct {
         };
         if (s.headers_done) {
             try self.sendRst(hdr.stream_id, .protocol_error);
-            self.destroyStream(s);
+            self.killStream(s);
             return;
         }
         const a = s.allocator();
         try s.header_block.appendSlice(a, payload);
         if (s.header_block.items.len > self.opts.max_header_block) {
             try self.sendRst(hdr.stream_id, .enhance_your_calm);
-            self.destroyStream(s);
+            self.killStream(s);
             return;
         }
         if (hdr.flags & Flags.end_headers != 0) {
@@ -1220,7 +1243,7 @@ pub const Connection = struct {
                 });
                 try self.refundWindow(hdr.stream_id, payload.len, true);
                 try self.sendRst(hdr.stream_id, .protocol_error);
-                self.destroyStream(s);
+                self.killStream(s);
                 return;
             }
             const pad = @as(usize, payload[0]);
@@ -1240,7 +1263,7 @@ pub const Connection = struct {
         if (s.body.items.len + data.len > self.opts.max_body) {
             log.h2.warn("请求体超上限 {d} 字节（流 {d}）", .{ self.opts.max_body, s.id });
             try self.sendRst(hdr.stream_id, .enhance_your_calm);
-            self.destroyStream(s);
+            self.killStream(s);
             return;
         }
         try s.body.appendSlice(a, data);
@@ -1286,16 +1309,42 @@ pub const Connection = struct {
     fn dispatch(self: *Connection, s: *StreamState) !void {
         const ctx = self.serve_ctx orelse return;
         const handler = self.serve_handler orelse return;
-        defer self.destroyStream(s);
 
         if (self.dispatch_depth >= max_dispatch_depth) {
             log.h2.warn("派发嵌套过深（{d}），拒绝流 {d}", .{ self.dispatch_depth, s.id });
             try self.sendRst(s.id, .refused_stream);
+            self.killStream(s);
             return;
         }
+
+        // 每流一个任务：把 handler 挪出连接任务，消除队头阻塞。
+        // 租约期间该流归 handler 任务所有，连接任务只读、不回收（见 `reapStreams`）。
+        if (self.job_submit) |submit| {
+            if (self.job_ctx) |jctx| {
+                s.leased = true;
+                s.finished = false;
+                s.aborted = false;
+                self.write_mutex.lock();
+                self.active_jobs += 1;
+                self.write_mutex.unlock();
+                submit(jctx, self, s);
+                return;
+            }
+        }
+
+        defer self.destroyStream(s);
         self.dispatch_depth += 1;
         defer self.dispatch_depth -= 1;
+        try self.runInlineHandler(s, ctx, handler);
+    }
 
+    /// 在**当前任务**里同步执行 handler（默认路径：吞吐最好，但会队头阻塞）。
+    fn runInlineHandler(
+        self: *Connection,
+        s: *StreamState,
+        ctx: *anyopaque,
+        handler: HandlerFn,
+    ) !void {
         var rsp = Responder{ .conn = self, .stream = s };
         const req = Request{
             .stream_id = s.id,
@@ -1319,6 +1368,64 @@ pub const Connection = struct {
         // handler 没显式收尾时补上，保证每个流都有 END_STREAM
         if (!rsp.begun) try rsp.begin("200", &.{});
         if (!rsp.ended) try rsp.end(&.{});
+    }
+
+    /// 每流任务的入口：由提交钩子的执行方（线程池 / 事件循环任务）调用。
+    ///
+    /// 结束后自动释放租约，连接任务会在下次处理帧时回收该流。
+    pub fn runStreamJob(self: *Connection, s: *StreamState) void {
+        defer self.markStreamFinished(s);
+        const ctx = self.serve_ctx orelse return;
+        const handler = self.serve_handler orelse return;
+        self.runInlineHandler(s, ctx, handler) catch |e| {
+            log.h2.warn("流 {d} 处理结束但收尾失败：{s}", .{ s.id, @errorName(e) });
+        };
+    }
+
+    fn markStreamFinished(self: *Connection, s: *StreamState) void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        s.finished = true;
+        self.active_jobs -= 1;
+    }
+
+    /// 等所有每流任务结束（**连接收尾前必须调**，否则 `deinit` 会撕掉仍在用的 arena）。
+    pub fn waitJobs(self: *Connection, io: std.Io) void {
+        while (true) {
+            self.write_mutex.lock();
+            const n = self.active_jobs;
+            self.write_mutex.unlock();
+            if (n == 0) return;
+            std.Io.sleep(io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch return;
+        }
+    }
+
+    /// 回收已完成的租约流（**只由连接任务调用**）。
+    ///
+    /// `destroyStream` 会从 `streams` 里交换移除，所以销毁时不要自增下标。
+    fn reapStreams(self: *Connection) void {
+        var i: usize = 0;
+        while (i < self.streams.items.len) {
+            const s = self.streams.items[i];
+            if (!s.leased or !s.finished) {
+                i += 1;
+                continue;
+            }
+            self.destroyStream(s);
+        }
+    }
+
+    /// 安全地终止一条流：若它正被别的任务持有，只做标记，回收交给 `reapStreams`。
+    ///
+    /// 直接销毁会 use-after-free：handler 任务手上还有 `*StreamState`。
+    fn killStream(self: *Connection, s: *StreamState) void {
+        if (s.leased and !s.finished) {
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+            s.aborted = true;
+            return;
+        }
+        self.destroyStream(s);
     }
 };
 
