@@ -64,6 +64,8 @@ const Args = struct {
     pool_max: usize = 256,
     /// 强制开启服务端连接登记（默认已关闭；用于量化登记开销）
     track_conns: bool = false,
+    /// 客户端走连接池（共享 `zgrpc.Pool`，用于验证连接复用/上限）
+    client_pool: bool = false,
 };
 
 fn parseArgs(init: std.process.Init) Args {
@@ -92,6 +94,8 @@ fn parseArgs(init: std.process.Init) Args {
             if (it.next()) |v| a.pool_max = std.fmt.parseInt(usize, v, 10) catch a.pool_max;
         } else if (std.mem.eql(u8, arg, "--track-conns")) {
             a.track_conns = true;
+        } else if (std.mem.eql(u8, arg, "--client-pool")) {
+            a.client_pool = true;
         }
     }
     if (a.iterations == 0) a.iterations = 1;
@@ -165,6 +169,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ---------- 并发模式：N 条连接同时打 ----------
+    // ---------- 客户端连接池：验证复用与实际连接数 ----------
+    if (cfg.client_pool) {
+        try runClientPool(io, gpa, cfg);
+        return;
+    }
+
     if (cfg.conns > 1) {
         try runConcurrent(io, gpa, addr, cfg);
         return;
@@ -336,6 +346,88 @@ fn percentileIndex(len: usize, p: usize) usize {
     if (len == 0) return 0;
     const idx = (len * p + 99) / 100;
     return @min(idx, len) - 1;
+}
+
+/// 客户端连接池模式：N 个线程共享一个 `zgrpc.Pool`，每线程跑 iterations 次 unary。
+///
+/// 验证点：连接数被 `max_total` 收住、连接被反复复用（reused 远大于 created）。
+const PoolWorker = struct {
+    pool: *zgrpc.Pool,
+    payload: []const u8,
+    iterations: usize,
+    ok: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
+fn poolWorkerMain(w: *PoolWorker) void {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+
+    var i: usize = 0;
+    while (i < w.iterations) : (i += 1) {
+        _ = arena_state.reset(.retain_capacity);
+        const res = w.pool.unary(method, w.payload, arena_state.allocator()) catch {
+            _ = w.failed.fetchAdd(1, .monotonic);
+            continue;
+        };
+        if (res.messages.len == 1) {
+            _ = w.ok.fetchAdd(1, .monotonic);
+        } else {
+            _ = w.failed.fetchAdd(1, .monotonic);
+        }
+    }
+}
+
+fn runClientPool(io: std.Io, gpa: std.mem.Allocator, cfg: Args) !void {
+    const eps = [_]zgrpc.caller.Endpoint{.{ .host = "127.0.0.1", .port = port }};
+    var pool = zgrpc.Pool.init(gpa, io, &eps, .{
+        .max_total = @max(@as(usize, 1), cfg.conns),
+        .max_idle = @max(@as(usize, 1), cfg.conns),
+        .call = .{ .timeout_ms = 10_000 },
+    });
+    defer pool.deinit();
+
+    const payload = try gpa.alloc(u8, cfg.payload);
+    defer gpa.free(payload);
+    @memset(payload, 'x');
+
+    const threads_n = @max(@as(usize, 1), cfg.conns);
+    const workers = try gpa.alloc(PoolWorker, threads_n);
+    defer gpa.free(workers);
+    const threads = try gpa.alloc(std.Thread, threads_n);
+    defer gpa.free(threads);
+
+    const t0 = zgrpc.clock.monotonicNs();
+    for (workers, 0..) |*w, i| {
+        w.* = .{ .pool = &pool, .payload = payload, .iterations = cfg.iterations };
+        threads[i] = try std.Thread.spawn(.{}, poolWorkerMain, .{w});
+    }
+    for (threads) |t| t.join();
+    const total_ns: u64 = @intCast(zgrpc.clock.monotonicNs() - t0);
+
+    var ok: u64 = 0;
+    var failed: u64 = 0;
+    for (workers) |w| {
+        ok += w.ok.load(.monotonic);
+        failed += w.failed.load(.monotonic);
+    }
+    const s = pool.stats();
+    const calls = threads_n * cfg.iterations;
+    const qps = @as(f64, @floatFromInt(calls)) * 1e9 / @as(f64, @floatFromInt(@max(total_ns, 1)));
+
+    std.debug.print(
+        \\
+        \\=== 客户端连接池（共享 zgrpc.Pool）===
+        \\线程 / 每线程调用 : {d} / {d}
+        \\成功 / 失败       : {d} / {d}
+        \\总耗时           : {d:.2} ms   QPS {d:.0}
+        \\池统计           : 新建 {d} 次，复用 {d} 次，丢弃 {d} 次；total={d} idle={d}（max_total={d}）
+        \\
+    , .{
+        threads_n,                               cfg.iterations, ok,        failed,
+        @as(f64, @floatFromInt(total_ns)) / 1e6, qps,            s.created, s.reused,
+        s.discarded,                             s.total,        s.idle,    cfg.conns,
+    });
 }
 
 /// 短连接模式：每次调用都新建连接、用完即关。

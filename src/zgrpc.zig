@@ -24,6 +24,9 @@ pub const h2 = @import("h2.zig");
 pub const grpc = @import("grpc.zig");
 pub const client = @import("client.zig");
 pub const caller = @import("caller.zig");
+/// 连接池（对齐标准 gRPC 客户端的 Channel / ClientConn 语义）。
+pub const Pool = caller.Pool;
+pub const PoolOptions = caller.PoolOptions;
 pub const gzip = @import("gzip.zig");
 pub const health = @import("health.zig");
 pub const clock = @import("clock.zig");

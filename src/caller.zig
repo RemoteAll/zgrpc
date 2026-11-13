@@ -52,7 +52,7 @@ pub const Options = struct {
 };
 
 /// 一条已建立的连接（含它自己的收发缓冲，缓冲随连接一起释放）。
-const Conn = struct {
+pub const Conn = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -220,6 +220,270 @@ pub const Caller = struct {
         return last_err;
     }
 };
+
+// ===========================================================================
+// 连接池（对齐标准 gRPC 客户端的 Channel / ClientConn 语义）
+// ===========================================================================
+//
+// 为什么需要：`Caller` 只缓存**一条**连接且不是线程安全的（`conn` / `rr` / 计数器都是可变状态）。
+// 多线程共用一个 `Caller` 会直接数据竞争；给每个线程建一个 `Caller` 又会连接数失控。
+// 连接池把「借 / 还 / 上限 / 空闲回收 / 坏连接丢弃」集中管理。
+//
+// 为什么不能靠 h2 多路复用省掉池：`client.Client` 是**同步阻塞**模型，内部持有
+// stream_id 序列与 HPACK 动态表，同一条连接上无法并发发起多个 unary。所以并发度 ≈ 连接数。
+
+pub const PoolOptions = struct {
+    /// 总连接上限（含已借出的）
+    max_total: usize = 8,
+    /// 空闲列表上限，超出则关闭连归还的连接
+    max_idle: usize = 8,
+    /// 空闲超过它就关闭（毫秒）
+    idle_timeout_ms: i64 = 30_000,
+    /// 借不到连接时的最长等待（毫秒）
+    acquire_timeout_ms: i64 = 5_000,
+    /// 单连接建连/调用参数
+    call: Options = .{},
+};
+
+const IdleConn = struct {
+    conn: *Conn,
+    since_ms: i64,
+};
+
+fn tickMs() i64 {
+    return @intCast(@divTrunc(clock.monotonicNs(), 1_000_000));
+}
+
+pub const Pool = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    endpoints: []const Endpoint,
+    opts: PoolOptions,
+
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+
+    /// 空闲连接（LIFO，取最近用过的，缓存命中率更高）
+    idle: std.ArrayListUnmanaged(IdleConn) = .empty,
+    /// 已建立连接数（含借出）
+    total: usize = 0,
+    closed: bool = false,
+    /// round-robin 地址下标
+    rr: usize = 0,
+
+    // 可观测计数
+    created: u64 = 0,
+    reused: u64 = 0,
+    discarded: u64 = 0,
+
+    pub fn init(alloc: std.mem.Allocator, io: std.Io, endpoints: []const Endpoint, opts: PoolOptions) Pool {
+        return .{ .alloc = alloc, .io = io, .endpoints = endpoints, .opts = opts };
+    }
+
+    /// 关闭所有空闲连接。**借出中的连接不在此处理**（由借出方 `release`）。
+    pub fn deinit(self: *Pool) void {
+        const alloc = self.alloc;
+        const io = self.io;
+        self.mutex.lockUncancelable(io);
+        self.closed = true;
+        const items = self.idle;
+        self.idle = .empty;
+        self.total -= items.items.len;
+        std.Io.Condition.broadcast(&self.cond, io);
+        self.mutex.unlock(io);
+
+        for (items.items) |it| it.conn.destroy();
+        alloc.free(items.items);
+    }
+
+    /// 借一条连接：优先复用空闲，不足且未达上限则新建，达上限则等待归还。
+    pub fn acquire(self: *Pool) !*Conn {
+        const deadline = tickMs() + self.opts.acquire_timeout_ms;
+
+        while (true) {
+            var expired: ?*Conn = null;
+            self.mutex.lockUncancelable(self.io);
+
+            // 1) 空闲栈（顺手淘汰过期/已关闭的连接）
+            while (self.idle.items.len > 0) {
+                const item = self.idle.pop().?;
+                if (self.closed or (tickMs() - item.since_ms) > self.opts.idle_timeout_ms) {
+                    self.total -= 1;
+                    self.discarded +|= 1;
+                    if (expired) |e| e.destroy();
+                    expired = item.conn;
+                    continue;
+                }
+                self.reused +|= 1;
+                self.mutex.unlock(self.io);
+                if (expired) |e| e.destroy();
+                return item.conn;
+            }
+            if (expired) |e| {
+                self.mutex.unlock(self.io);
+                e.destroy();
+                continue;
+            }
+
+            if (self.closed) {
+                self.mutex.unlock(self.io);
+                return error.PoolClosed;
+            }
+
+            if (self.endpoints.len == 0) {
+                self.mutex.unlock(self.io);
+                return error.NoEndpoints;
+            }
+
+            if (self.total < self.opts.max_total) {
+                // 名额在锁内预留，保证并发下不冲破上限
+                self.total += 1;
+                const ep = self.nextEndpoint();
+                self.mutex.unlock(self.io);
+
+                const c = Conn.create(self.alloc, self.io, ep, self.opts.call) catch |e| {
+                    self.mutex.lockUncancelable(self.io);
+                    self.total -= 1;
+                    std.Io.Condition.signal(&self.cond, self.io);
+                    self.mutex.unlock(self.io);
+                    return e;
+                };
+                self.mutex.lockUncancelable(self.io);
+                self.created +|= 1;
+                self.mutex.unlock(self.io);
+                return c;
+            }
+
+            // 2) 达上限：等别人归还（`waitTimeout` 要求调用时持有互斥量）
+            const remain = deadline - tickMs();
+            if (remain <= 0) {
+                self.mutex.unlock(self.io);
+                return error.AcquireTimeout;
+            }
+            _ = std.Io.Condition.waitTimeout(&self.cond, self.io, &self.mutex, .{
+                .duration = .{
+                    .raw = .{ .nanoseconds = @as(i96, remain) * std.time.ns_per_ms },
+                    .clock = .awake,
+                },
+            }) catch {};
+            self.mutex.unlock(self.io);
+        }
+    }
+
+    /// 归还连接。`healthy = false` 时直接关闭（不回到空闲列表）。
+    pub fn release(self: *Pool, c: *Conn, healthy: bool) void {
+        var to_destroy: ?*Conn = null;
+        self.mutex.lockUncancelable(self.io);
+        if (!healthy) self.discarded +|= 1;
+        if (!healthy or self.closed or self.idle.items.len >= self.opts.max_idle) {
+            self.total -= 1;
+            to_destroy = c;
+        } else {
+            self.idle.append(self.alloc, .{ .conn = c, .since_ms = tickMs() }) catch {
+                self.total -= 1;
+                to_destroy = c;
+            };
+        }
+        std.Io.Condition.signal(&self.cond, self.io);
+        self.mutex.unlock(self.io);
+
+        if (to_destroy) |d| d.destroy();
+    }
+
+    /// 借连接 → 调用 → 归还，失败自动丢弃并发起重试（退避同 `RetryPolicy`）。
+    pub fn unary(
+        self: *Pool,
+        method: []const u8,
+        payload: []const u8,
+        arena: std.mem.Allocator,
+    ) !client_mod.Result {
+        const max_attempts = @max(@as(u8, 1), self.opts.call.retry.max_attempts);
+        var backoff_ms = self.opts.call.retry.initial_backoff_ms;
+        var attempt: u8 = 1;
+
+        while (true) : (attempt += 1) {
+            for (self.opts.call.interceptors) |it| {
+                if (it.on_request) |f| f(it.ctx, method, attempt);
+            }
+            const t0 = clock.monotonicNs();
+
+            const c = self.acquire() catch |e| {
+                if (attempt >= max_attempts) return e;
+                clock.sleepNs(@as(u64, backoff_ms) * std.time.ns_per_ms);
+                backoff_ms = @min(backoff_ms *| 2, self.opts.call.retry.max_backoff_ms);
+                continue;
+            };
+
+            const res = c.client.unary(method, payload, arena) catch |e| {
+                // 连接状态已不可信：不回到池里
+                self.release(c, false);
+                if (attempt >= max_attempts) return e;
+                clock.sleepNs(@as(u64, backoff_ms) * std.time.ns_per_ms);
+                backoff_ms = @min(backoff_ms *| 2, self.opts.call.retry.max_backoff_ms);
+                continue;
+            };
+
+            const elapsed = clock.monotonicNs() - t0;
+            for (self.opts.call.interceptors) |it| {
+                if (it.on_response) |f| f(it.ctx, method, res.status, elapsed, attempt);
+            }
+            self.release(c, true);
+            return res;
+        }
+    }
+
+    pub fn stats(self: *Pool) struct { created: u64, reused: u64, discarded: u64, total: usize, idle: usize } {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return .{
+            .created = self.created,
+            .reused = self.reused,
+            .discarded = self.discarded,
+            .total = self.total,
+            .idle = self.idle.items.len,
+        };
+    }
+
+    fn nextEndpoint(self: *Pool) Endpoint {
+        const n = self.endpoints.len;
+        const ep = self.endpoints[self.rr % n];
+        self.rr +%= 1;
+        return ep;
+    }
+};
+
+test "pool：建连失败会回滚名额（不泄漏计数）" {
+    // 127.0.0.1:1 无监听，必然快速失败；只验证会计逻辑
+    const eps = [_]Endpoint{.{ .host = "127.0.0.1", .port = 1 }};
+    var pool = Pool.init(testing.allocator, std.testing.io, &eps, .{
+        .acquire_timeout_ms = 200,
+        .call = .{ .timeout_ms = 100 },
+    });
+    defer pool.deinit();
+
+    var succeeded = false;
+    if (pool.acquire()) |_| {
+        succeeded = true;
+    } else |_| {}
+    try testing.expect(!succeeded);
+
+    // 失败必须把预留的名额退回去，否则池会“假满”再也借不到
+    const s = pool.stats();
+    try testing.expectEqual(@as(usize, 0), s.total);
+    try testing.expectEqual(@as(u64, 0), s.created);
+}
+
+test "pool：deinit 后再借返回 PoolClosed；空地址返回 NoEndpoints" {
+    const empty = [_]Endpoint{};
+    var p1 = Pool.init(testing.allocator, std.testing.io, &empty, .{});
+    try testing.expectError(error.NoEndpoints, p1.acquire());
+    p1.deinit();
+
+    const eps = [_]Endpoint{.{ .host = "127.0.0.1", .port = 1 }};
+    var p2 = Pool.init(testing.allocator, std.testing.io, &eps, .{});
+    p2.deinit();
+    try testing.expectError(error.PoolClosed, p2.acquire());
+}
 
 // ---------------------------------------------------------------------------
 // 测试
