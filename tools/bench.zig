@@ -150,6 +150,8 @@ const Args = struct {
     streams: usize = 0,
     /// >1：同一连接上并开 N 条流的批量模式（真多路复用，才测得出每流并发）
     batch: usize = 1,
+    /// 用户显式给了 `--batch`（`--batch 1` 也要走批量路径，顺序单流照样用它测）
+    batch_set: bool = false,
     /// 强制开启服务端连接登记（默认已关闭；用于量化登记开销）
     track_conns: bool = false,
     /// 客户端走连接池（共享 `zgrpc.Pool`，用于验证连接复用/上限）
@@ -187,6 +189,7 @@ fn parseArgs(init: std.process.Init) Args {
             if (it.next()) |v| a.streams = std.fmt.parseInt(usize, v, 10) catch a.streams;
         } else if (std.mem.eql(u8, arg, "--batch")) {
             if (it.next()) |v| a.batch = std.fmt.parseInt(usize, v, 10) catch a.batch;
+            a.batch_set = true;
         } else if (std.mem.eql(u8, arg, "--pool-max")) {
             if (it.next()) |v| a.pool_max = std.fmt.parseInt(usize, v, 10) catch a.pool_max;
         } else if (std.mem.eql(u8, arg, "--track-conns")) {
@@ -353,7 +356,7 @@ pub fn main(init: std.process.Init) !void {
     // ---------- 批量多流模式：同一连接上并开 N 条流 ----------
     // 只有这个模式能真正测出「同连接每流并发」：ghz 在 `--connections 1` 下
     // 并不会同时开多条流，用它判断队头阻塞会得出错误结论。
-    if (cfg.batch > 1) {
+    if (cfg.batch_set and cfg.batch > 0) {
         try runBatch(io, gpa, &client, method, cfg);
         return;
     }

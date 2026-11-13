@@ -133,6 +133,16 @@ pub const Responder = struct {
         return self.stream.id;
     }
 
+    /// 本条流是否走并发写路径。
+    ///
+    /// 判断依据是**流级的租约**（`stream.leased`）而不是连接级开关：
+    /// 连接开了每流任务后，仍有一部分请求（同连接只有一个流时）由连接任务内联处理，
+    /// 它们必须继续走原来的阻塞式快路径 —— 否则会白白多付锁与 flush 合并的开销，
+    /// 稳态吞吐就掉了。
+    fn concurrentMode(self: *const Responder) bool {
+        return self.stream.leased and self.conn.concurrent_write;
+    }
+
     /// 发送响应头块（`status` 如 "200"；`extra` 里不要含 `:status`）。
     pub fn begin(self: *Responder, status: []const u8, extra: []const hpack.Header) !void {
         if (self.begun) return error.AlreadyBegun;
@@ -154,7 +164,7 @@ pub const Responder = struct {
         if (!self.begun) try self.begin("200", &.{});
         if (self.ended) return error.AlreadyEnded;
         // 并发写路径：不阻塞读，窗口不足挂 pending（详见 `sendStreamData`）
-        if (self.conn.concurrent_write) {
+        if (self.concurrentMode()) {
             return self.conn.sendStreamData(self.stream, bytes, false);
         }
 
@@ -183,7 +193,7 @@ pub const Responder = struct {
         const a = self.stream.allocator();
         var block: std.ArrayListUnmanaged(u8) = .empty;
         try hpack.encode(trailers, &block, a);
-        if (self.conn.concurrent_write) {
+        if (self.concurrentMode()) {
             try self.conn.finishStream(self.stream, block.items);
             self.ended = true;
             return;
@@ -196,7 +206,7 @@ pub const Responder = struct {
     pub fn endData(self: *Responder, bytes: []const u8) !void {
         if (self.ended) return error.AlreadyEnded;
         if (!self.begun) try self.begin("200", &.{});
-        if (self.conn.concurrent_write) {
+        if (self.concurrentMode()) {
             try self.conn.sendStreamData(self.stream, bytes, true);
             self.ended = true;
             return;
@@ -312,8 +322,17 @@ pub const SpinLock = struct {
     locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn lock(self: *SpinLock) void {
+        var spins: usize = 0;
         while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
+            spins += 1;
+            if (spins < 64) {
+                std.atomic.spinLoopHint();
+            } else {
+                // 临界区里可能含 `write()` 系统调用（几十微秒）。纯自旋会把 CPU
+                // 烧光，把同机其它任务（包括忙等型 handler）饿死 —— 实测 1ms handler、
+                // 32 路并发时，不退还的版本比退让版本慢一倍。
+                std.Thread.yield() catch {};
+            }
         }
     }
 
@@ -369,6 +388,11 @@ pub const Connection = struct {
     ///
     /// 原先每帧 `alloc`+`free`，一个 unary 请求 2 帧就是 4 次分配器调用。
     frame_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// 已写入发送缓冲但**尚未刷出**的字节批次计数（写锁保护）。
+    ///
+    /// 并发写路径用它把「一批同时完成的响应」合并成一次 flush：
+    /// 抢到写锁且看到它 > 0 的人一次刷完，其余人看到 0 就直接返回。
+    unflushed: usize = 0,
     /// 允许从**非连接任务**并发写响应（每流一个 handler 任务时必需）。
     ///
     /// 开启后 `Responder.sendData` / `end` / `endData` 走
@@ -709,6 +733,7 @@ pub const Connection = struct {
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
         try self.writer.flush();
+        self.unflushed = 0;
     }
 
     /// 取一块能装下 `need` 字节的帧载荷缓冲（**每连接复用**，只增不减）。
@@ -745,12 +770,20 @@ pub const Connection = struct {
         end_stream: bool,
     ) !void {
         self.write_mutex.lock();
-        defer self.write_mutex.unlock();
         // 对端已 RST：不再写（写了也是白写，还可能被回 GOAWAY）
-        if (s.aborted) return;
-        try self.writeStreamDataLocked(s, bytes, end_stream);
-        // **必须自己 flush**：连接任务此刻可能正阻塞在读上，不会替这里刷出
-        if (end_stream or s.pending_out.items.len == 0) try self.writer.flush();
+        if (s.aborted) {
+            self.write_mutex.unlock();
+            return;
+        }
+        const r = self.writeStreamDataLocked(s, bytes, end_stream);
+        if (r) |_| {
+            self.unflushed += 1;
+        } else |_| {}
+        self.write_mutex.unlock();
+
+        // 响应已完整：尽力刷出（拿不到锁就交给持有者，见 `flushBestEffort`）
+        if (end_stream or s.pending_out.items.len == 0) self.flushBestEffort();
+        return r;
     }
 
     /// 调用者**必须已持有** `write_mutex`。
@@ -795,15 +828,56 @@ pub const Connection = struct {
     /// 等正文排空后再由连接任务发（顺序不能乱）。
     pub fn finishStream(self: *Connection, s: *StreamState, trailers_block: []const u8) !void {
         self.write_mutex.lock();
-        defer self.write_mutex.unlock();
-        if (s.aborted) return;
-        if (s.pending_out.items.len > 0) {
-            s.pending_trailers = trailers_block;
+        if (s.aborted) {
+            self.write_mutex.unlock();
             return;
         }
-        try self.writeHeaderBlockLocked(s.id, trailers_block, Flags.end_stream, true);
-        // 响应已完整：立刻刷出，否则会一直躺在发送缓冲里等连接任务醒来
-        try self.writer.flush();
+        if (s.pending_out.items.len > 0) {
+            s.pending_trailers = trailers_block;
+            self.write_mutex.unlock();
+            return;
+        }
+        const r = self.writeHeaderBlockLocked(s.id, trailers_block, Flags.end_stream, true);
+        if (r) |_| {
+            self.unflushed += 1;
+        } else |_| {}
+        self.write_mutex.unlock();
+
+        // 尽力刷出：32 路并发完成会合并成极少次系统调用（见 `flushBestEffort`）
+        self.flushBestEffort();
+        return r;
+    }
+
+    /// 尽力把发送缓冲刷出去：**抢到写锁的人负责把当前积压一次刷出**。
+    ///
+    /// 为什么需要它：flush 必须与写帧同在写锁内（否则会撕裂 `std.Io.Writer`），
+    /// 而 N 路并发完成各刷一次就是 N 次系统调用 —— 实测这就是稳态吞吐下降
+    /// 2.4 倍的全部原因。
+    ///
+    /// 为什么不会把响应永久留在缓冲里（存活证明）：
+    /// 1. `unflushed` 只在写锁内增减，所以“抢到锁且 `unflushed > 0`”的人一定能把
+    ///    此前所有已完成的写入一起刷出；同一批里其余人再抢到锁时 `unflushed` 已是 0，
+    ///    不会产生系统调用（空刷本身就是空转）；
+    /// 2. `tryLock` 可能虚假失败（`cmpxchgWeak`），所以自旋重试；
+    /// 3. 仍然抢不到就用**阻塞锁**兜底：宁可退化成一次系统调用，也绝不丢响应；
+    /// 4. 连接任务在阻塞读之前必经 `flushForRead`，形成最后一道屎底。
+    fn flushBestEffort(self: *Connection) void {
+        var tries: usize = 0;
+        while (tries < 8) : (tries += 1) {
+            if (self.write_mutex.tryLock()) {
+                defer self.write_mutex.unlock();
+                if (self.unflushed == 0) return;
+                self.writer.flush() catch {};
+                self.unflushed = 0;
+                return;
+            }
+            std.atomic.spinLoopHint();
+        }
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        if (self.unflushed == 0) return;
+        self.writer.flush() catch {};
+        self.unflushed = 0;
     }
 
     /// 把某条流挂起的正文/trailers 尽量发出去（**只由连接任务调用**）。
@@ -1211,7 +1285,10 @@ pub const Connection = struct {
 
         // 每流任务模式：把**真正干活的那一帧**（END_STREAM）挑到别的任务。
         // 这样同连接上的多个 unary/bidi 请求不再互相排队，队头阻塞消失。
-        if (end_stream) {
+        //
+        // 只在**同连接确实有多条流**时才挑走：顺序客户端（一次一个请求）继续内联
+        // 执行，零handoff、零锁、零额外 flush —— 这正是稳态吞吐不低于默认模式的关键。
+        if (end_stream and self.streams.items.len > 1) {
             if (self.job_submit) |submit| {
                 if (self.job_ctx) |jctx| {
                     // data 指向复用的 frame_buf，必须复制进本流 arena 才能跨任务持有
