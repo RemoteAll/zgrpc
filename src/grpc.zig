@@ -709,6 +709,16 @@ pub const Server = struct {
     /// 需要 keepalive 时**无需手动开**：`spawnKeepalive()` 与 `pingAll()` 会自动置 true
     /// （首次 `pingAll()` 之前已建立的连接不会被登记）。
     track_conns: bool = false,
+    /// 每连接的**接收缓冲**大小（字节）。
+    ///
+    /// 这个值决定「一次系统调用能拿回多少个请求帧」：64 路并发 × ~230 字节 ≈ 15 KiB，
+    /// 所以默认 32 KiB 才够一口气读完整批，让「延迟 flush」把 N 个响应合成一次 write。
+    ///
+    /// 但它同时是**每连接固定内存开销**。上千长连接时应调小（如 8 KiB）：
+    /// 实测 5000 连接下 48 KiB/连接 ≈ 240 MB，是那时的主要内存成本。
+    conn_recv_buf_size: usize = 32 * 1024,
+    /// 每连接的**发送缓冲**大小（字节），同时是延迟 flush 的批量上限（默认 16 KiB）。
+    conn_send_buf_size: usize = 16 * 1024,
     /// keepalive 线程的停止标志（`spawnKeepalive` 用）
     keepalive_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     /// 因「连接正忙」而跳过的 PING 次数（聚合计数）。
@@ -869,9 +879,43 @@ pub const Server = struct {
     /// - `.thread_per_conn`：每连接起一独立线程（默认；长连接/流式场景正确选择）
     /// - `.pool`：提交到弹性线程池（短连接高频建连场景）；提交失败会**回退**到独立线程，
     ///   绝不因为队列满而丢掉连接
+    /// 推荐的监听队列长度。
+    ///
+    /// `std.Io.net` 的默认值只有 **128**。连接突发时（如 2000 个客户端同时建连）
+    /// 如果 accept 侧来不及把连接取走，内核队列就会满，客户端直接收到 `connection refused`。
+    ///
+    /// 实测：每连接一线程模式下建线程约 86us/个，2000 个并发建连时
+    /// 光建线程就要 ~172ms，128 的队列远远不够（实测丢了 49771 次连接）。
+    /// 所以服务端监听时建议显式传大一些：
+    ///
+    /// ```zig
+    /// var listener = try addr.listen(io, .{ .reuse_address = true, .kernel_backlog = zgrpc.grpc.Server.default_backlog });
+    /// ```
+    pub const default_backlog: u31 = 1024;
+
+    /// 接受连接并按 `dispatch` 调度（阻塞直到 listener 不再返回连接）。
+    ///
+    /// - `.thread_per_conn`：每连接起一独立线程（默认；长连接/流式场景正确选择）
+    /// - `.pool`：提交到弹性线程池（短连接高频建连场景）；提交失败会**回退**到独立线程，
+    ///   绝不因为队列满而丢掉连接
+    ///
+    /// **不会因为单次 accept 失败就退出整个循环**：瞬时的资源紧张（如 fd/句柄耗尽）
+    /// 只记日志并短暂退避，连接照常继续接受——之前这里是 `catch return`，
+    /// 一次瞬时错误会把整个服务端的 accept 循环终止，表面上「服务还在」但已不再接新连接。
     pub fn acceptLoop(self: *Server, io: std.Io, allocator: std.mem.Allocator, listener: *std.Io.net.Server) void {
         while (true) {
-            const stream = listener.accept(io) catch return;
+            const stream = listener.accept(io) catch |e| switch (e) {
+                // listener 已被关闭：这才是真正的收尾信号
+                error.SocketNotListening, error.Canceled => return,
+                else => {
+                    log.grpc.err("accept 失败（{s}），退避 10ms 后继续接受", .{@errorName(e)});
+                    // 瞬时错误（句柄耗尽 / 对端在建连中途放弃）：退避一下再继续，
+                    // 不能退出循环，否则服务端会静默地不再接新连接。
+                    // 注意：Zig 0.17.1 的 `std.Thread` 没有 `sleep`，延时必须走 `std.Io`。
+                    std.Io.sleep(io, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
+                    continue;
+                },
+            };
             self.dispatchStream(io, allocator, stream);
         }
     }
@@ -907,12 +951,27 @@ pub const Server = struct {
     }
 
     /// 独立线程模型（默认）：起线程后立即 detach，连接结束由线程自己退出。
+    ///
+    /// **这是「每连接一线程」模型的根本天花板**：线程数随连接数线性增长。
+    /// 实测 1000 连接 = 1003 线程 / 163 MB；2000 连接 = 2003 线程 / 354 MB，
+    /// 且建线程速度（约 86us/个）跟不上连接突发，内核监听队列溢出后客户端会收到
+    /// `connection refused`（实测 2000 并发丢 49771 次建连）。
+    ///
+    /// 上千长连接的场景请改用**事件循环模型**：把 `std.Io` 换成异步后端（如 zio，
+    /// Windows 走 IOCP、Linux 走 io_uring），连接改为在运行时里起任务而不是起线程。
+    /// 实测 2000 连接只需 **19 线程**，库代码一行都不用改。
     fn spawnConnThread(self: *Server, io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream) void {
         const th = std.Thread.spawn(
             .{ .stack_size = conn_stack_size },
             serveConn,
             .{ self, allocator, io, stream },
-        ) catch {
+        ) catch |e| {
+            // 不能静默关连接：客户端只会看到「连接被对端关闭」，排查时毫无线索。
+            // 线程起不来说明已经到达这个模型的上限（见上方说明），必须明确告警。
+            log.grpc.err(
+                "为连接创建线程失败（{s}）：已到达「每连接一线程」模型的上限，连接将被关闭；上千长连接请改用事件循环后端",
+                .{@errorName(e)},
+            );
             stream.close(io);
             return;
         };
@@ -955,12 +1014,15 @@ pub const Server = struct {
         // 缓冲大小：**接收侧决定一次系统调用能拿回多少个请求帧**。
         // 64 路并发 × ~230 字节/请求 ≈ 15 KiB，≥32 KiB 才能一口气读完整批，
         // 从而让“延迟 flush”真正把 N 个响应合成一次 write。
-        const recv_buf = allocator.alloc(u8, 32 * 1024) catch {
+        //
+        // 但这两块是**每连接固定开销**（默认共 48 KiB）：上千长连接时它会成为主要内存成本
+        // （实测 5000 连接 ≈ 240 MB），那时应把 `conn_recv_buf_size` / `conn_send_buf_size` 调小。
+        const recv_buf = allocator.alloc(u8, self.conn_recv_buf_size) catch {
             log.grpc.err("连接接收缓冲分配失败", .{});
             return;
         };
         defer allocator.free(recv_buf);
-        const send_buf = allocator.alloc(u8, 16 * 1024) catch {
+        const send_buf = allocator.alloc(u8, self.conn_send_buf_size) catch {
             log.grpc.err("连接发送缓冲分配失败", .{});
             return;
         };

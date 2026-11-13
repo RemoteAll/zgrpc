@@ -26,3 +26,4 @@ bench_pair/goserver/goserver.exe
 bench_pair/goserver/goserver.pdb
 bench_pair/*.log.commitmsg
 .zg/
+*.txt

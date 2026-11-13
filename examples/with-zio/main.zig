@@ -86,7 +86,11 @@ pub fn main(init: std.process.Init) !void {
     var server = zgrpc.grpc.Server{ .routes = &routes, .outer_ctx = &dummy };
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", listen_port);
-    var listener = try addr.listen(io, .{ .reuse_address = true });
+    var listener = try addr.listen(io, .{
+        .reuse_address = true,
+        // 默认 backlog 只有 128，高并发建连会拒连
+        .kernel_backlog = zgrpc.grpc.Server.default_backlog,
+    });
     defer listener.deinit(io);
 
     // 服务端作为**运行时里的一个任务**跑（不能用裸 std.Thread：

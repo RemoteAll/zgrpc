@@ -1,0 +1,46 @@
+fix(server): 高连接数下的三个真实缺陷（监听队列、accept 循环退出、建线程静默丢弃）
+
+用户指出：「高并发长连接下不能一个连接一个线程，否则服务器线程完全不够用」。
+实测验证了这一点，并顺带发现并修掉三处缺陷。
+
+实测（ghz 保持长连接压 12s，期间采样服务端资源）
+
+| 并发长连接 | 每连接一线程 | 事件循环(zio/IOCP) |
+|---|---|---|
+| 300 | 303 线程 / 57 MB | 21 线程 / 52 MB |
+| 1000 | 1003 线程 / 163 MB | 18 线程 / 114 MB |
+| 2000 | 2003 线程 / 319 MB | 19 线程 / 303 MB |
+| 5000 | 需 ~5003 线程 / 293 MB，且丢 22654 次连接 | 21 线程 / 749 MB，0 拒连 |
+
+修复 1：监听队列太小
+- `std.Io.net` 的 `kernel_backlog` 默认只有 128。建一条线程约 86us，5000 个并发建连
+  光建线程就要 ~430ms，这期间内核队列被灌满，客户端收到 connection refused（实测 22654 次）。
+- 新增 `Server.default_backlog = 1024`，bench 与 zio 示例显式传入。
+- 同时修正上一轮的错误归因：2000 连接丢 49771 次不是建线程失败，而是 backlog=128；
+  提到 1024 后 2000 连接零拒连。
+
+修复 2：accept 循环一次性退出
+- 原 `listener.accept(io) catch return;`：一次瞬时 accept 失败（句柄耗尽/对端中断）
+  会终止整个 accept 循环，表面服务还在但已不再接新连接。
+- 改为记 error 日志 + 退避 10ms 继续；只有 listener 真正关闭才返回。
+  注意 Zig 0.17.1 的 `std.Thread` 没有 sleep，退避走 `std.Io.sleep(io, ...)`。
+
+修复 3：建线程失败静默关连接
+- 原 `catch { stream.close(io); return; }`，客户端只看到「连接被对端关闭」，无线索。
+- 改为明确告警并提示「已到达每连接一线程模型的上限，上千长连接请改用事件循环后端」。
+
+新增可配置项：每连接缓冲大小
+- `Server.conn_recv_buf_size`（默认 32 KiB）/ `conn_send_buf_size`（默认 16 KiB）。
+  这是每连接固定开销，5000 连接下 48 KiB/连接 ≈ 240 MB，是那时的主要内存成本。
+
+文档：`Server.acceptLoop` / `spawnConnThread` 上写明该模型的线程天花板与事件循环替代方案。
+
+影响范围
+- [x] 公共 API：新增 `Server.default_backlog`、`conn_recv_buf_size`、`conn_send_buf_size`
+- [x] 性能影响：行为修正（不再静默丢连接/退出 accept）
+- [ ] 兼容性变更
+
+测试情况
+- [x] zig build test -> 8/8 steps；103/103 tests passed
+- [x] 2000 连接（backlog 1024）：212415 OK，零拒连
+- [x] 事件循环版 5000 连接：176576 OK，21 线程，零拒连

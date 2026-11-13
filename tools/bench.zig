@@ -175,8 +175,12 @@ pub fn main(init: std.process.Init) !void {
     var listener: std.Io.net.Server = undefined;
     var have_listener = false;
     if (!cfg.no_serve) {
-        listener = addr.listen(io, .{ .reuse_address = true }) catch |e| {
-            say("[bench] 监听 {d} 失败：{s}\n", .{ target_port, @errorName(e) });
+        listener = addr.listen(io, .{
+            .reuse_address = true,
+            // 默认 backlog 只有 128，高并发建连时会拒连（见 Server.default_backlog）
+            .kernel_backlog = zgrpc.grpc.Server.default_backlog,
+        }) catch |e| {
+            std.debug.print("[bench] 监听 {d} 失败：{s}\n", .{ target_port, @errorName(e) });
             return e;
         };
         have_listener = true;
