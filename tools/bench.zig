@@ -13,6 +13,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zgrpc = @import("zgrpc");
+// 线程池来自 zzig（zgrpc 的运行期依赖），用于 `--pool` 对比测量
+const zzig = @import("zzig");
 
 const port: u16 = 18054;
 const method = "/bench.Bench/Echo";
@@ -38,19 +40,8 @@ fn acceptLoop(
     listener: *std.Io.net.Server,
     server: *zgrpc.grpc.Server,
 ) void {
-    while (true) {
-        const stream = listener.accept(io) catch return;
-        // 用推荐栈（128 KiB）而非 std 默认 16 MiB：实测每连接创建成本 147.3 → 86.1 us
-        const th = std.Thread.spawn(
-            .{ .stack_size = zgrpc.grpc.Server.conn_stack_size },
-            zgrpc.grpc.Server.serveConn,
-            .{ server, allocator, io, stream },
-        ) catch {
-            stream.close(io);
-            continue;
-        };
-        th.detach();
-    }
+    // 统一走库里的调度入口：`server.dispatch` 决定每连接一线程还是弹性线程池
+    server.acceptLoop(io, allocator, listener);
 }
 
 const Args = struct {
@@ -67,6 +58,10 @@ const Args = struct {
     /// >0 时开启服务端 keepalive（每 N 毫秒向所有连接发 PING），用于验证
     /// 「保活不会拖垮高并发」（之前 pingAll 会在锁内阻塞，慢连接会把新连接堵在登记前）
     keepalive_ms: u32 = 0,
+    /// 服务端改用弹性线程池调度连接（短连接场景对比用）
+    pool: bool = false,
+    /// 线程池 worker 上限
+    pool_max: usize = 256,
 };
 
 fn parseArgs(init: std.process.Init) Args {
@@ -89,6 +84,10 @@ fn parseArgs(init: std.process.Init) Args {
             a.serve_only = true;
         } else if (std.mem.eql(u8, arg, "--keepalive-ms")) {
             if (it.next()) |v| a.keepalive_ms = std.fmt.parseInt(u32, v, 10) catch a.keepalive_ms;
+        } else if (std.mem.eql(u8, arg, "--pool")) {
+            a.pool = true;
+        } else if (std.mem.eql(u8, arg, "--pool-max")) {
+            if (it.next()) |v| a.pool_max = std.fmt.parseInt(usize, v, 10) catch a.pool_max;
         }
     }
     if (a.iterations == 0) a.iterations = 1;
@@ -110,6 +109,21 @@ pub fn main(init: std.process.Init) !void {
         .{ .path = "/echo.Echo/Say", .handler = sayHandler },
     };
     var server = zgrpc.grpc.Server{ .routes = &routes, .outer_ctx = &dummy };
+
+    // 服务端连接调度：默认每连接一线程；`--pool` 改为弹性线程池（短任务场景）
+    if (cfg.pool) {
+        const pool = try zzig.threading.pool.Pool.create(io, gpa, .{
+            .min_workers = 0,
+            .max_workers = cfg.pool_max,
+            .idle_timeout_ms = 60_000,
+            .queue_capacity = 8192,
+        });
+        server.dispatch = .pool;
+        server.pool = pool;
+        std.debug.print("[bench] 服务端调度：弹性线程池（max={d}）\n", .{cfg.pool_max});
+    } else {
+        std.debug.print("[bench] 服务端调度：每连接一线程\n", .{});
+    }
     if (cfg.keepalive_ms > 0) {
         server.keepalive_interval_ms = cfg.keepalive_ms;
         const ka = try server.spawnKeepalive();

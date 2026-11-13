@@ -79,6 +79,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     bench_mod.addImport("zgrpc", zgrpc);
+    // bench 里要直接用 zzig 的弹性线程池做 `--pool` 对比
+    bench_mod.addImport("zzig", zzig.module("zzig"));
     const bench_exe = b.addExecutable(.{ .name = "bench", .root_module = bench_mod });
     b.installArtifact(bench_exe);
     // 透传命令行参数（Zig 0.17：用 b.args() 取）`n    if (comptime @hasDecl(std.Build, "args")) {}

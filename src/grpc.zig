@@ -14,6 +14,7 @@
 //! 不会打断已经阻塞在业务里的调用）、客户端流/bidi 的背压。
 
 const std = @import("std");
+const zzig = @import("zzig");
 const log = @import("log.zig");
 const h2 = @import("h2.zig");
 const hpack = @import("hpack.zig");
@@ -597,6 +598,19 @@ const max_stream_message: usize = 4 * 1024 * 1024;
 /// 小于该体积不压缩（小报文压完反而变大，与 zzig/DH.RustBase 同口径）。
 const compress_min_size: usize = 256;
 
+/// 连接调度方式：**该用则用，不该用则不用**。
+///
+/// 实测口径（`bench --short` / `bench --thread-cost`，ReleaseFast，本机 16 核）：
+/// - 线程创建+销毁 93.7us（128 KiB 栈）；短连接 p50 293~334us → 池化可省约 30%；
+/// - 长连接 16 → 512 连接吞吐持平（约 33k QPS）→ 池化无收益，且阻塞任务会占死池槽位。
+pub const ConnDispatch = enum {
+    /// 每连接一独立线程。**长连接 / 流式订阅 / 保活长轮询的正确选择**（并发无上限）。
+    thread_per_conn,
+    /// 提交到弹性线程池。**短连接 / 短 RPC / 探活高频建连的正确选择**。
+    /// 需要 `Server.pool`；提交失败会自动回退到独立线程。
+    pool,
+};
+
 /// gRPC 路由表；把它作为 `h2.Connection.serve` 的 handler 使用：
 /// ```zig
 /// var server = zgrpc.grpc.Server{ .routes = &routes };
@@ -632,6 +646,16 @@ pub const Server = struct {
     pings_skipped: u64 = 0,
     /// PING 写失败的次数（通常是连接刚关闭、`unregisterConn` 还没跑）。同样只计数不报日志。
     pings_failed: u64 = 0,
+
+    /// 连接调度方式。
+    ///
+    /// **该用则用**：池只适合**短**任务（短连接、短 RPC、探活），实测每次连接省下
+    /// 线程创建+销毁的 93.7us（128 KiB 栈，ReleaseFast），约占短连接 p50 的 30%。
+    /// **不该用时不用**：长连接 / 流式订阅 / 保活长轮询请保持 `thread_per_conn` ——
+    /// 阻塞任务会占满池槽位，反而把并发卡在 `max_workers` 上。
+    dispatch: ConnDispatch = .thread_per_conn,
+    /// `dispatch == .pool` 时必需；由调用方创建与销毁（生命周期必须长于 acceptLoop）。
+    pool: ?*zzig.threading.pool.Pool = null,
 
     pub fn context(self: *Server) *anyopaque {
         return @ptrCast(self);
@@ -761,6 +785,77 @@ pub const Server = struct {
     /// th.detach();
     /// ```
     pub const conn_stack_size: usize = 128 * 1024;
+
+    /// 接受连接并按 `dispatch` 调度（阻塞直到 listener 不再返回连接）。
+    ///
+    /// - `.thread_per_conn`：每连接起一独立线程（默认；长连接/流式场景正确选择）
+    /// - `.pool`：提交到弹性线程池（短连接高频建连场景）；提交失败会**回退**到独立线程，
+    ///   绝不因为队列满而丢掉连接
+    pub fn acceptLoop(self: *Server, io: std.Io, allocator: std.mem.Allocator, listener: *std.Io.net.Server) void {
+        while (true) {
+            const stream = listener.accept(io) catch return;
+            self.dispatchStream(io, allocator, stream);
+        }
+    }
+
+    /// 按 `dispatch` 调度一条已接受的连接（`acceptLoop` 的单条版本，也便于自定义 accept 流程）。
+    pub fn dispatchStream(self: *Server, io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream) void {
+        if (self.dispatch == .pool) {
+            if (self.pool) |pool| {
+                // 盒子由 allocator 分配：池任务只有一个 `*anyopaque` 上下文
+                if (allocator.create(ConnTask)) |box| {
+                    box.* = .{
+                        .server = self,
+                        .allocator = allocator,
+                        .io = io,
+                        .stream = stream,
+                        .box_alloc = allocator,
+                    };
+                    pool.submit(connTaskRun, box) catch |e| {
+                        // 队列满/池已停：回退到独立线程，不丢连接
+                        log.grpc.warn("连接提交线程池失败（{s}），回退为独立线程", .{@errorName(e)});
+                        box.box_alloc.destroy(box);
+                        self.spawnConnThread(io, allocator, stream);
+                    };
+                    return;
+                } else |_| {
+                    log.grpc.warn("连接任务盒分配失败，回退为独立线程", .{});
+                }
+            } else {
+                log.grpc.warn("dispatch=pool 但未提供 pool，回退为独立线程", .{});
+            }
+        }
+        self.spawnConnThread(io, allocator, stream);
+    }
+
+    /// 独立线程模型（默认）：起线程后立即 detach，连接结束由线程自己退出。
+    fn spawnConnThread(self: *Server, io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream) void {
+        const th = std.Thread.spawn(
+            .{ .stack_size = conn_stack_size },
+            serveConn,
+            .{ self, allocator, io, stream },
+        ) catch {
+            stream.close(io);
+            return;
+        };
+        th.detach();
+    }
+
+    /// 池任务的上下文：一次性，执行前先释放自己。
+    const ConnTask = struct {
+        server: *Server,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        stream: std.Io.net.Stream,
+        box_alloc: std.mem.Allocator,
+    };
+
+    fn connTaskRun(ctx: *anyopaque) void {
+        const box: *ConnTask = @ptrCast(@alignCast(ctx));
+        const task = box.*;
+        box.box_alloc.destroy(box);
+        task.server.serveConn(task.allocator, task.io, task.stream);
+    }
 
     /// 服务一条**已接受**的连接，返回时连接已关闭（配合「每连接一线程」模型）。
     ///
