@@ -1,0 +1,19 @@
+[package]
+name = "rustserver"
+version = "0.1.0"
+edition = "2021"
+
+# 只用本机 cargo 缓存里已有的版本（tonic/prost 不在缓存里，离线拿不到）。
+# h2 + tokio 正是 tonic 底下的协议与运行时层，行为与本仓库其它对照实现一致：
+# **原样回显请求体字节**，不做字段级编解码。
+[dependencies]
+h2 = "0.4.20"
+http = "1.5.0"
+bytes = "1.12.1"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "macros"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

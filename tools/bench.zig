@@ -472,8 +472,8 @@ fn runClientPool(io: std.Io, gpa: std.mem.Allocator, cfg: Args) !void {
     std.debug.print(
         "[bench-result] port={d} conns={d} threads={d} ok={d} failed={d} qps={d:.1} elapsed_ms={d:.2}\n",
         .{
-            target_port,                 cfg.conns, threads_n, ok, failed,
-            qps,                         @as(f64, @floatFromInt(total_ns)) / 1e6,
+            target_port, cfg.conns,                               threads_n, ok, failed,
+            qps,         @as(f64, @floatFromInt(total_ns)) / 1e6,
         },
     );
 }
