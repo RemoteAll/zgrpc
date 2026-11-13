@@ -51,12 +51,29 @@ pub fn main(init: std.process.Init) !void {
 
     var iterations: usize = 3000;
     var conns: usize = 1;
+    var listen_port: u16 = port;
+    // `serve` 模式：只起服务端（给外部压测工具用），与主 bench 的 `--serve-only` 等价。
+    // 这样可以用**同一个客户端**打线程版与事件循环版，否则两边客户端不同、数字不可比。
+    var serve_only = false;
     {
         var it = std.process.Args.Iterator.initAllocator(init.minimal.args, gpa) catch return;
         defer it.deinit();
         _ = it.skip();
-        if (it.next()) |a| iterations = std.fmt.parseInt(usize, a, 10) catch iterations;
-        if (it.next()) |a| conns = std.fmt.parseInt(usize, a, 10) catch conns;
+        if (it.next()) |a| {
+            if (std.mem.eql(u8, a, "serve")) {
+                serve_only = true;
+            } else {
+                iterations = std.fmt.parseInt(usize, a, 10) catch iterations;
+            }
+        }
+        if (it.next()) |a| {
+            if (serve_only) {
+                listen_port = std.fmt.parseInt(u16, a, 10) catch listen_port;
+            } else {
+                conns = std.fmt.parseInt(usize, a, 10) catch conns;
+            }
+        }
+        if (it.next()) |a| listen_port = std.fmt.parseInt(u16, a, 10) catch listen_port;
     }
     if (conns == 0) conns = 1;
     if (conns > 64) conns = 64;
@@ -68,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
     };
     var server = zgrpc.grpc.Server{ .routes = &routes, .outer_ctx = &dummy };
 
-    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", listen_port);
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
@@ -76,6 +93,14 @@ pub fn main(init: std.process.Init) !void {
     // zio 的 accept/读写在运行时上下文里才会挂起协程，跑到外部线程上会卡死）
     var srv_group: std.Io.Group = .init;
     srv_group.async(io, serveLoop, .{ io, gpa, &listener, &server });
+
+    // ---------- 只起服务端：给外部压测工具用（与 bench --serve-only 等价） ----------
+    if (serve_only) {
+        std.debug.print("zio server listening on 127.0.0.1:{d}\n", .{listen_port});
+        // 让主任务等 serveLoop 永不完结（await 后才不会在 main 返回时把运行时装掉）
+        srv_group.await(io) catch {};
+        return;
+    }
 
     // ---------- 客户端：N 个**协程**各持一条连接（zio 下协程远轻于线程） ----------
     const payload = gpa.alloc(u8, 128) catch return;
