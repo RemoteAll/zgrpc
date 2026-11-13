@@ -1124,13 +1124,13 @@ pub const Server = struct {
         const jc: *StreamJobCtx = @ptrCast(@alignCast(ctx));
         const arena = s.allocator();
         const box = arena.create(StreamJob) catch {
-            conn.runStreamJob(s);
+            conn.runJob(s);
             return;
         };
         box.* = .{ .conn = conn, .stream = s, .arena = arena };
         jc.pool.submit(streamJobRun, box) catch {
             box.arena.destroy(box);
-            conn.runStreamJob(s);
+            conn.runJob(s);
             return;
         };
     }
@@ -1141,7 +1141,7 @@ pub const Server = struct {
         const s = job.stream;
         const arena = job.arena;
         defer arena.destroy(job);
-        conn.runStreamJob(s);
+        conn.runJob(s);
     }
 
     fn findStreamRoute(self: *Server, path: []const u8) ?*const StreamRoute {

@@ -249,6 +249,9 @@ pub const StreamHooks = struct {
     onReset: ?*const fn (ctx: *anyopaque, stream_id: u32) void = null,
 };
 
+/// 每流任务的内容种类：同一个提交钩子要能承载两条路径（整请求派发 / 流式 END_STREAM）。
+pub const JobKind = enum { dispatch, stream_end };
+
 /// 一条流的全部请求状态。**自带 arena**：流结束时整体释放，
 /// 因此多流并存时不会互相污染（不用连接级 arena 的 reset 时机去赌）。
 pub const StreamState = struct {
@@ -276,6 +279,12 @@ pub const StreamState = struct {
     finished: bool = false,
     /// 对端发了 RST_STREAM：handler 不应再写，等它收尾后再回收（写锁保护）。
     aborted: bool = false,
+    /// 每流任务的内容种类（提交前由连接任务写好，任务只读）。
+    job_kind: JobKind = .dispatch,
+    /// END_STREAM 那一帧的正文：**已复制进本流 arena**（`frame_buf` 会被复用，不能直接持有）。
+    end_data: []const u8 = &.{},
+    /// 提交时快照的钩子：`serveStreaming` 返回后 `stream_hooks` 会被置空，任务不能再去读它。
+    end_hooks: ?StreamHooks = null,
 
     // --- 并发写模式（`Connection.concurrent_write`）专用 ---
     /// 窗口不足时暂存的待发正文。**只有该流自己的任务会 append**，
@@ -740,6 +749,8 @@ pub const Connection = struct {
         // 对端已 RST：不再写（写了也是白写，还可能被回 GOAWAY）
         if (s.aborted) return;
         try self.writeStreamDataLocked(s, bytes, end_stream);
+        // **必须自己 flush**：连接任务此刻可能正阻塞在读上，不会替这里刷出
+        if (end_stream or s.pending_out.items.len == 0) try self.writer.flush();
     }
 
     /// 调用者**必须已持有** `write_mutex`。
@@ -791,6 +802,8 @@ pub const Connection = struct {
             return;
         }
         try self.writeHeaderBlockLocked(s.id, trailers_block, Flags.end_stream, true);
+        // 响应已完整：立刻刷出，否则会一直躺在发送缓冲里等连接任务醒来
+        try self.writer.flush();
     }
 
     /// 把某条流挂起的正文/trailers 尽量发出去（**只由连接任务调用**）。
@@ -833,6 +846,7 @@ pub const Connection = struct {
             s.pending_trailers = null;
             try self.writeHeaderBlockLocked(s.id, block, Flags.end_stream, true);
         }
+        try self.writer.flush();
     }
 
     /// 若下一次读**必须真正走 socket**，则先把挂起的输出刷出去。
@@ -1195,6 +1209,28 @@ pub const Connection = struct {
             break :blk r;
         };
 
+        // 每流任务模式：把**真正干活的那一帧**（END_STREAM）挑到别的任务。
+        // 这样同连接上的多个 unary/bidi 请求不再互相排队，队头阻塞消失。
+        if (end_stream) {
+            if (self.job_submit) |submit| {
+                if (self.job_ctx) |jctx| {
+                    // data 指向复用的 frame_buf，必须复制进本流 arena 才能跨任务持有
+                    s.end_data = try s.allocator().dupe(u8, data);
+                    s.end_hooks = hooks;
+                    s.job_kind = .stream_end;
+                    s.leased = true;
+                    s.finished = false;
+                    s.aborted = false;
+                    // 写在写锁内：给任务一个明确的 happens-before
+                    self.write_mutex.lock();
+                    self.active_jobs += 1;
+                    self.write_mutex.unlock();
+                    submit(jctx, self, s);
+                    return;
+                }
+            }
+        }
+
         hooks.onData(hooks.ctx, rsp, data, end_stream) catch |e| {
             log.h2.err("流式 onData 失败（流 {d}，{d} 字节）：{s}", .{
                 s.id, data.len, @errorName(e),
@@ -1321,6 +1357,7 @@ pub const Connection = struct {
         // 租约期间该流归 handler 任务所有，连接任务只读、不回收（见 `reapStreams`）。
         if (self.job_submit) |submit| {
             if (self.job_ctx) |jctx| {
+                s.job_kind = .dispatch;
                 s.leased = true;
                 s.finished = false;
                 s.aborted = false;
@@ -1380,6 +1417,37 @@ pub const Connection = struct {
         self.runInlineHandler(s, ctx, handler) catch |e| {
             log.h2.warn("流 {d} 处理结束但收尾失败：{s}", .{ s.id, @errorName(e) });
         };
+    }
+
+    /// 每流任务的统一入口：提交钩子的执行方只需调这一个函数。
+    ///
+    /// 结束后必定释放租约（`markStreamFinished`），连接任务会在下次处理帧时回收该流。
+    pub fn runJob(self: *Connection, s: *StreamState) void {
+        switch (s.job_kind) {
+            .dispatch => self.runStreamJob(s),
+            .stream_end => self.runStreamEndJob(s),
+        }
+    }
+
+    /// 流式路径的每流任务：处理 END_STREAM 那一帧并收尾。
+    ///
+    /// 只依赖**提交时快照**的 `end_hooks` / `end_data`，不再读 `self.stream_hooks`
+    /// （那会在 `serveStreaming` 返回时被置空，晚到的任务会拿到 null 而静默丢失请求）。
+    fn runStreamEndJob(self: *Connection, s: *StreamState) void {
+        defer self.markStreamFinished(s);
+        const hooks = s.end_hooks orelse return;
+        const rsp = s.rsp orelse return;
+
+        hooks.onData(hooks.ctx, rsp, s.end_data, true) catch |e| {
+            log.h2.err("流式 onData 失败（流 {d}，{d} 字节）：{s}", .{
+                s.id, s.end_data.len, @errorName(e),
+            });
+            if (!rsp.begun) rsp.begin("500", &.{}) catch {};
+            if (!rsp.ended) rsp.end(&.{}) catch {};
+        };
+
+        // 业务未显式收尾时补上，保证每个流都有 END_STREAM
+        if (!rsp.ended) rsp.end(&.{}) catch {};
     }
 
     fn markStreamFinished(self: *Connection, s: *StreamState) void {

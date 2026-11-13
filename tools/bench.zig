@@ -234,7 +234,9 @@ pub fn main(init: std.process.Init) !void {
     if (cfg.streams > 0) {
         // 事件循环连接 + 每流任务：消除同连接队头阻塞
         const hpool = try zzig.threading.pool.Pool.create(io, gpa, .{
-            .min_workers = 0,
+            // handler 池按需扩容要付建线程成本（实测约 86us/个），预热到上限
+            // 才能反映稳态吞吐；上限本身就是并发上限，不会无限建线程。
+            .min_workers = cfg.streams,
             .max_workers = cfg.streams,
             .idle_timeout_ms = 60_000,
             .queue_capacity = 8192,
