@@ -347,6 +347,48 @@ pub const SpinLock = struct {
     }
 };
 
+/// 连接写锁。
+///
+/// **默认是自旋锁**（临界区只有「写一帧 + flush」，微秒级），一旦绑定了 `std.Io`
+/// （协程后端，见 `enableIo`）就换成 `std.Io.Mutex`：
+///
+/// 在协程后端（zio/IOCP）上，**每一次 socket 写都会让出协程**。如果用自旋锁，
+/// 持锁者已经挂起、其它协程还在 worker 线程上死转，迟早把 worker 全占满，
+/// 就再也没有线程去把持锁者唤醒 —— 实测 100 路并发直接整条连接挂死。
+/// `std.Io.Mutex` 的等待是 futex 挂起，会让出执行体重排，所以不会自锁。
+pub const WriteLock = struct {
+    spin: SpinLock = .{},
+    io_mutex: std.Io.Mutex = .init,
+    io: ?std.Io = null,
+
+    /// 绑定 `std.Io`：此后所有加锁都走 `std.Io.Mutex`（必须在开始服务前调用）。
+    pub fn enableIo(self: *WriteLock, io: std.Io) void {
+        self.io = io;
+    }
+
+    pub fn lock(self: *WriteLock) void {
+        if (self.io) |io| {
+            // 不引入额外取消点：写路径中途被取消会留下半个帧
+            self.io_mutex.lockUncancelable(io);
+            return;
+        }
+        self.spin.lock();
+    }
+
+    pub fn tryLock(self: *WriteLock) bool {
+        if (self.io != null) return self.io_mutex.tryLock();
+        return self.spin.tryLock();
+    }
+
+    pub fn unlock(self: *WriteLock) void {
+        if (self.io) |io| {
+            self.io_mutex.unlock(io);
+            return;
+        }
+        self.spin.unlock();
+    }
+};
+
 pub const Connection = struct {
     /// 连接级长期分配（HPACK 动态表、流对象与延后帧）
     alloc: std.mem.Allocator,
@@ -354,7 +396,7 @@ pub const Connection = struct {
     writer: *std.Io.Writer,
     /// 帧写入互斥：keepalive 线程可能与业务线程同时发帧，
     /// 一帧的「头 + 体 + flush」必须原子，否则会交错出非法帧。
-    write_mutex: SpinLock = .{},
+    write_mutex: WriteLock = .{},
     opts: Options = .{},
     decoder: hpack.Decoder,
 

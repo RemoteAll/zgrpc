@@ -1159,6 +1159,9 @@ pub const Server = struct {
             conn.concurrent_write = true;
             conn.job_submit = streamJobSubmit;
             conn.job_ctx = @ptrCast(&job_ctx);
+            // 协程后端：写锁必须换成会挂起等待的（自旋锁跨越挂起点会自锁，
+            // 实测 100 路并发即整条连接挂死，详见 `h2.WriteLock`）。
+            if (self.job_mode == .io_task) conn.write_mutex.enableIo(io);
         }
         // 兜底：连接异常收尾时，把还留在发送缓冲里的字节尽力刷出去。
         // 延迟 flush 的正常刷出点在读循环，异常路径（协议错/对端半关）走不到那里。
@@ -1199,11 +1202,16 @@ pub const Server = struct {
         mode: JobMode,
     };
 
-    /// 一次性任务盒：从**该流自己的 arena** 分配，随流一起释放。
+    /// 一次性任务盒。
+    ///
+    /// **不能从流 arena 分配**：任务结束时 `markStreamFinished` 先跑（连接任务随即可
+    /// `reapStreams` → `arena.reset()`），再回到 `streamJobRun` 的 defer 去释放时，
+    /// arena 已被重置 —— 那就是 use-after-free（实测 300 路并发直接段错误）。
+    /// 所以盒子用连接级分配器，并自带释放能力。
     const StreamJob = struct {
         conn: *h2.Connection,
         stream: *h2.StreamState,
-        arena: std.mem.Allocator,
+        alloc: std.mem.Allocator,
     };
 
     /// `h2.Connection.job_submit` 的实现：把 handler 挪出连接任务。
@@ -1212,12 +1220,11 @@ pub const Server = struct {
     /// 逐级降级，正确性优先。
     fn streamJobSubmit(ctx: *anyopaque, conn: *h2.Connection, s: *h2.StreamState) void {
         const jc: *StreamJobCtx = @ptrCast(@alignCast(ctx));
-        const arena = s.allocator();
-        const box = arena.create(StreamJob) catch {
+        const box = jc.allocator.create(StreamJob) catch {
             conn.runJob(s);
             return;
         };
-        box.* = .{ .conn = conn, .stream = s, .arena = arena };
+        box.* = .{ .conn = conn, .stream = s, .alloc = jc.allocator };
 
         // ① 运行时任务（协程）：事件循环后端上不占 OS 线程。
         //    用 `Group.concurrent` 而不是 `async`——`async` 的语义是「await 之前
@@ -1238,7 +1245,7 @@ pub const Server = struct {
         }
 
         // ③ 同步执行（绝不丢请求）
-        box.arena.destroy(box);
+        box.alloc.destroy(box);
         conn.runJob(s);
     }
 
@@ -1246,8 +1253,8 @@ pub const Server = struct {
         const job: *StreamJob = @ptrCast(@alignCast(ctx));
         const conn = job.conn;
         const s = job.stream;
-        const arena = job.arena;
-        defer arena.destroy(job);
+        const alloc = job.alloc;
+        defer alloc.destroy(job);
         conn.runJob(s);
     }
 
