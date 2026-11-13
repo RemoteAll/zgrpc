@@ -43,6 +43,35 @@ defer { server.stopKeepalive(); ka.join(); }
 只配 `keepalive_interval_ms` **不会自动发** —— 还需要 `spawnKeepalive()`，或由调用方周期调 `pingAll()`
 （适合已有事件循环的场景）。不主动断开无响应的连接：`h2.Connection.pingAcks()` 暴露计数，策略留给调用方。
 
+## 客户端调用策略（拦截器 / 重试 / 负载均衡）
+
+`zgrpc.caller` 是 `client.Client` **之上**的一层：`Client` 只管「一条已建立连接上的编解码」，
+选地址、断线重连、重试、打点都是**调用策略**，放在这一层才不会把 `Client` 撑胖。
+
+```zig
+var stats = Stats{};
+var caller = zgrpc.caller.Caller.init(allocator, io, &.{
+    .{ .host = "10.0.0.1", .port = 50051 },
+    .{ .host = "10.0.0.2", .port = 50051 },
+}, .{
+    .timeout_ms = 2000,
+    .retry = .{ .max_attempts = 3, .initial_backoff_ms = 100, .retry_on = &.{ 14, 8 } },
+    .interceptors = &.{.{ .ctx = &stats, .on_request = onRequest, .on_response = onResponse }},
+});
+defer caller.deinit();
+const r = try caller.unary("/echo.Echo/Say", payload, arena);
+```
+
+重试判据（这里最容易做错）：
+- **连接级错误**（建连失败 / 断开 / 超时）→ 重试，并按 round-robin 换下一个地址；
+- **`retry_on` 里的 status**（默认 `UNAVAILABLE(14)` / `RESOURCE_EXHAUSTED(8)`）→ 重试；
+- **其它 status**（如 `INVALID_ARGUMENT(3)`）→ 直接返回，重试只会放大故障。
+
+重试前必定丢弃旧连接（h2 连接出错后流状态不可信）。拦截器是**只观察不改写**的回调
+（`on_request` / `on_response` 带 attempt 与耗时）；要改内容请直接构造 `Request`。
+
+目前只覆盖 `unary`：`callMany` / `clientStream` 的重试（部分成功、流已发一半）需要单独设计。
+
 ### 对照官方规范的符合性
 
 以 `doc/PROTOCOL-HTTP2.md` 与 `doc/PROTOCOL-WEB.md` 逐条比对（2026-11-12）：

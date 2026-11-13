@@ -6,6 +6,14 @@
 ## 未发布
 
 ### 新增
+- **客户端调用策略（`zgrpc.caller`）**：拦截器 + 重试 + 负载均衡，**不污染 `client.Client`**。
+  - `Interceptor{ on_request(path, attempt), on_response(path, status, elapsed_ns, attempt) }`：只观察不改内容。
+  - `RetryPolicy{ max_attempts, initial_backoff_ms, max_backoff_ms, retry_on }`：指数退避封顶；
+    **连接级错误与 `retry_on` 里的 status 重试，其它 status 直接返回**（重试 `INVALID_ARGUMENT` 只会放大故障）。
+    重试前必定 `dropConn()`（h2 连接出错后流状态不可信）。
+  - `endpoints` 多地址 + round-robin（**建连时**轮转）。
+  - 实测：正常调用 attempts=1/retries=0；可重试 status 尝试 3 次；拦截器 req/rsp 与尝试次数一致；rr 建连前进。
+  - 边界：只做 `unary`；`callMany`/`clientStream` 的重试语义（部分成功、流已发一半）单独设计。
 - **keepalive（服务端主动 PING）**：长连接穿过 NAT / 四层 LB 时避免被当成「空闲」掐掉。
   - `h2.Connection.write_mutex`（自旋锁）+ `sendPing()` + PING ACK 计数；`writeFrame` 的头+体+flush 全程持锁。
   - `grpc.Server.keepalive_interval_ms` + `spawnKeepalive()` / `pingAll()` / `connCount()`；

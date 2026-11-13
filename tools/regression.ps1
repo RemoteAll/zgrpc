@@ -16,7 +16,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # 测试数下限：只能抬高，不能降低（降低必须在 docs/决策记录.md 写明依据）
-$minTests = 74
+$minTests = 78
 
 # 随机空闲端口：Windows 上 `Stop-Process -Force`（= TerminateProcess）会让监听 socket
 # 变成 zombie LISTEN（netstat 里 OwningProcess=0），持续数十秒且无法 kill。
@@ -306,6 +306,20 @@ if ($SkipSmoke) {
     Add-Content -Path $report -Value "[回归] keepalive-probe：$kaOut" -Encoding UTF8
     if ($kaCode -eq 0) { Write-Report "[回归] PASS：keepalive（服务端主动 PING）" }
     else { Write-Report "[回归] FAIL：keepalive exit=$kaCode（详见 $report）"; $failed += 'keepalive' }
+}
+
+# ---------- 3.8 Caller：拦截器 / 重试 / 负载均衡 ----------
+$callerExe = Join-Path $root 'zig-out\bin\caller-probe.exe'
+if ($SkipSmoke) {
+    Write-Report "[回归] SKIP：caller（-SkipSmoke）"
+} elseif (-not (Test-Path $callerExe)) {
+    Write-Report "[回归] SKIP：caller（缺少 caller-probe 产物）"
+} else {
+    $co = Invoke-Probe -Exe $callerExe -Tag 'caller-probe'
+    $cc = $LASTEXITCODE
+    Add-Content -Path $report -Value "[回归] caller-probe：$co" -Encoding UTF8
+    if ($cc -eq 0) { Write-Report "[回归] PASS：caller（拦截器 / 重试 / 负载均衡）" }
+    else { Write-Report "[回归] FAIL：caller exit=$cc（详见 $report）"; $failed += 'caller' }
 }
 
 # ---------- 4. 互操作对拍（Rust hyper 当裁判，双向）----------

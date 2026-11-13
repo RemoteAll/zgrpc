@@ -84,6 +84,7 @@ pub fn build(b: *std.Build) void {
     addExample(b, zgrpc, target, optimize, "timeout-probe", "client_timeout_probe.zig", "验证客户端本地读超时（服务端不响应时按时退出）");
     addExample(b, zgrpc, target, optimize, "afd-probe", "afd_timeout_probe.zig", "验证 Windows AFD 原生 SO_RCVTIMEO 读超时（无线程）");
     addExample(b, zgrpc, target, optimize, "keepalive-probe", "keepalive_probe.zig", "验证服务端 keepalive 会主动发 PING");
+    addExample(b, zgrpc, target, optimize, "caller-probe", "caller_probe.zig", "验证拦截器 / 重试 / 负载均衡");
 }
 
 fn addExample(

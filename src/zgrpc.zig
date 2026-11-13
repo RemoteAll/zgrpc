@@ -23,6 +23,7 @@ pub const hpack = @import("hpack.zig");
 pub const h2 = @import("h2.zig");
 pub const grpc = @import("grpc.zig");
 pub const client = @import("client.zig");
+pub const caller = @import("caller.zig");
 pub const gzip = @import("gzip.zig");
 pub const health = @import("health.zig");
 pub const clock = @import("clock.zig");
