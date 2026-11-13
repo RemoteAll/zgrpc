@@ -781,8 +781,8 @@ pub const Connection = struct {
         } else |_| {}
         self.write_mutex.unlock();
 
-        // 响应已完整：尽力刷出（拿不到锁就交给持有者，见 `flushBestEffort`）
-        if (end_stream or s.pending_out.items.len == 0) self.flushBestEffort();
+        // 刷出交给“最后一个完成的 handler”（`markStreamFinished`）：
+        // 这里绝不能自己刷新，否则 N 路并发就是 N 次系统调用。
         return r;
     }
 
@@ -843,41 +843,8 @@ pub const Connection = struct {
         } else |_| {}
         self.write_mutex.unlock();
 
-        // 尽力刷出：32 路并发完成会合并成极少次系统调用（见 `flushBestEffort`）
-        self.flushBestEffort();
+        // 同样交给“最后一个完成的 handler”合并刷出（见 `markStreamFinished`）
         return r;
-    }
-
-    /// 尽力把发送缓冲刷出去：**抢到写锁的人负责把当前积压一次刷出**。
-    ///
-    /// 为什么需要它：flush 必须与写帧同在写锁内（否则会撕裂 `std.Io.Writer`），
-    /// 而 N 路并发完成各刷一次就是 N 次系统调用 —— 实测这就是稳态吞吐下降
-    /// 2.4 倍的全部原因。
-    ///
-    /// 为什么不会把响应永久留在缓冲里（存活证明）：
-    /// 1. `unflushed` 只在写锁内增减，所以“抢到锁且 `unflushed > 0`”的人一定能把
-    ///    此前所有已完成的写入一起刷出；同一批里其余人再抢到锁时 `unflushed` 已是 0，
-    ///    不会产生系统调用（空刷本身就是空转）；
-    /// 2. `tryLock` 可能虚假失败（`cmpxchgWeak`），所以自旋重试；
-    /// 3. 仍然抢不到就用**阻塞锁**兜底：宁可退化成一次系统调用，也绝不丢响应；
-    /// 4. 连接任务在阻塞读之前必经 `flushForRead`，形成最后一道屎底。
-    fn flushBestEffort(self: *Connection) void {
-        var tries: usize = 0;
-        while (tries < 8) : (tries += 1) {
-            if (self.write_mutex.tryLock()) {
-                defer self.write_mutex.unlock();
-                if (self.unflushed == 0) return;
-                self.writer.flush() catch {};
-                self.unflushed = 0;
-                return;
-            }
-            std.atomic.spinLoopHint();
-        }
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
-        if (self.unflushed == 0) return;
-        self.writer.flush() catch {};
-        self.unflushed = 0;
     }
 
     /// 把某条流挂起的正文/trailers 尽量发出去（**只由连接任务调用**）。
@@ -1532,6 +1499,14 @@ pub const Connection = struct {
         defer self.write_mutex.unlock();
         s.finished = true;
         self.active_jobs -= 1;
+        // **合并刷出的精确判据**：只有“最后一个完成的 handler”（把 active_jobs
+        // 减到 0 的那个）负责刷出。此时其他任务的写帧早已在缓冲里（它们先写后减），
+        // 所以 N 路并发完成只会产生 **一次** write() 系统调用。
+        // 不用时间窗、不用试探锁，也不会出现“没人刷”的窗口。
+        if (self.active_jobs == 0 and self.unflushed > 0) {
+            self.writer.flush() catch {};
+            self.unflushed = 0;
+        }
     }
 
     /// 等所有每流任务结束（**连接收尾前必须调**，否则 `deinit` 会撕掉仍在用的 arena）。
@@ -2282,4 +2257,42 @@ test "h2 concurrent write: trailers deferred behind pending body" {
     try testing.expect(first_data);
     try testing.expect(headers_after);
     try testing.expect(s.pending_trailers == null);
+}
+
+test "h2 concurrent write: unflushed 由最后一个完成的 handler 清零" {
+    var r = std.Io.Reader.fixed("");
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var conn = Connection.init(testing.allocator, &r, &aw.writer, .{});
+    defer conn.deinit();
+    conn.concurrent_write = true;
+
+    const s = try conn.createStream(1);
+    conn.send_window = 1024;
+    s.send_window = 1024;
+
+    // 模拟「一个任务正在跑」：租约 + 活跃计数
+    s.leased = true;
+    s.finished = false;
+    conn.active_jobs = 1;
+
+    try conn.sendStreamData(s, "hi", true);
+    // 并发写路径自己不刷：否则 N 路并发就是 N 次系统调用
+    try testing.expect(conn.unflushed > 0);
+
+    // 最后一个完成的 handler 负责刷出，并把计数清零
+    conn.markStreamFinished(s);
+    try testing.expectEqual(@as(usize, 0), conn.unflushed);
+    try testing.expect(s.finished);
+
+    var pos: usize = 0;
+    var saw = false;
+    while (nextFrame(aw.written(), &pos)) |f| {
+        if (f.ftype != .data) continue;
+        try testing.expectEqualStrings("hi", f.payload);
+        try testing.expect(f.flags & Flags.end_stream != 0);
+        saw = true;
+    }
+    try testing.expect(saw);
 }
