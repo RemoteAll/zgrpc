@@ -118,7 +118,8 @@ fn runBatch(
     );
 }
 
-fn acceptLoop(    allocator: std.mem.Allocator,
+fn acceptLoop(
+    allocator: std.mem.Allocator,
     io: std.Io,
     listener: *std.Io.net.Server,
     server: *zgrpc.grpc.Server,
