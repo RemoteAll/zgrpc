@@ -57,8 +57,68 @@ fn sayHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator)
     try call.sendMessage(msg.payload);
 }
 
-fn acceptLoop(
-    allocator: std.mem.Allocator,
+/// 批量多流模式：**同一条连接**上并开 `cfg.batch` 条流，测每轮的墙钟耗时。
+///
+/// 判读方法（配合 `--handler-delay-us`）：
+/// - handler 串行（每连接一个任务）：一轮 ≈ batch × delay；
+/// - handler 每流并发：一轮 ≈ delay。
+fn runBatch(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    client: *zgrpc.client.Client,
+    call_method: []const u8,
+    cfg: Args,
+) !void {
+    _ = io;
+    const payload = try gpa.alloc(u8, cfg.payload);
+    defer gpa.free(payload);
+    @memset(payload, 'x');
+
+    const reqs = try gpa.alloc(zgrpc.client.Request, cfg.batch);
+    defer gpa.free(reqs);
+    for (reqs) |*r| r.* = .{ .method = call_method, .payload = payload };
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    for (0..3) |_| {
+        _ = arena_state.reset(.retain_capacity);
+        _ = try client.callMany(reqs, arena_state.allocator());
+    }
+
+    var total_ns: u128 = 0;
+    var min_ns: u128 = std.math.maxInt(u128);
+    var max_ns: u128 = 0;
+    var round: usize = 0;
+    while (round < cfg.iterations) : (round += 1) {
+        _ = arena_state.reset(.retain_capacity);
+        const t0 = zgrpc.clock.monotonicNs();
+        const rs = try client.callMany(reqs, arena_state.allocator());
+        const dt: u128 = @intCast(zgrpc.clock.monotonicNs() - t0);
+        for (rs) |r| {
+            if (r.messages.len != 1) return error.Unexpected;
+        }
+        total_ns += dt;
+        min_ns = @min(min_ns, dt);
+        max_ns = @max(max_ns, dt);
+    }
+
+    const rounds_f: f64 = @floatFromInt(round);
+    const avg_ms = @as(f64, @floatFromInt(total_ns)) / rounds_f / 1_000_000.0;
+    std.debug.print(
+        "[batch-result] streams={d} rounds={d} avg_ms={d:.3} min_ms={d:.3} max_ms={d:.3} per_stream_us={d:.1}\n",
+        .{
+            cfg.batch,
+            round,
+            avg_ms,
+            @as(f64, @floatFromInt(min_ns)) / 1_000_000.0,
+            @as(f64, @floatFromInt(max_ns)) / 1_000_000.0,
+            avg_ms * 1000.0 / @as(f64, @floatFromInt(cfg.batch)),
+        },
+    );
+}
+
+fn acceptLoop(    allocator: std.mem.Allocator,
     io: std.Io,
     listener: *std.Io.net.Server,
     server: *zgrpc.grpc.Server,
@@ -87,6 +147,8 @@ const Args = struct {
     pool_max: usize = 256,
     /// >0：事件循环连接 + 每流任务池（消除同连接队头阻塞），值为池上限
     streams: usize = 0,
+    /// >1：同一连接上并开 N 条流的批量模式（真多路复用，才测得出每流并发）
+    batch: usize = 1,
     /// 强制开启服务端连接登记（默认已关闭；用于量化登记开销）
     track_conns: bool = false,
     /// 客户端走连接池（共享 `zgrpc.Pool`，用于验证连接复用/上限）
@@ -122,6 +184,8 @@ fn parseArgs(init: std.process.Init) Args {
             a.pool = true;
         } else if (std.mem.eql(u8, arg, "--streams")) {
             if (it.next()) |v| a.streams = std.fmt.parseInt(usize, v, 10) catch a.streams;
+        } else if (std.mem.eql(u8, arg, "--batch")) {
+            if (it.next()) |v| a.batch = std.fmt.parseInt(usize, v, 10) catch a.batch;
         } else if (std.mem.eql(u8, arg, "--pool-max")) {
             if (it.next()) |v| a.pool_max = std.fmt.parseInt(usize, v, 10) catch a.pool_max;
         } else if (std.mem.eql(u8, arg, "--track-conns")) {
@@ -282,6 +346,14 @@ pub fn main(init: std.process.Init) !void {
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
+
+    // ---------- 批量多流模式：同一连接上并开 N 条流 ----------
+    // 只有这个模式能真正测出「同连接每流并发」：ghz 在 `--connections 1` 下
+    // 并不会同时开多条流，用它判断队头阻塞会得出错误结论。
+    if (cfg.batch > 1) {
+        try runBatch(io, gpa, &client, method, cfg);
+        return;
+    }
 
     // ---------- 预热 ----------
     for (0..warmup) |_| {
