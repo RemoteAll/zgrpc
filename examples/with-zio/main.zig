@@ -20,9 +20,20 @@ pub const std_options_debug_io = zio.debug_io;
 const default_port: u16 = 18055;
 const method = "/bench.Bench/Echo";
 
+/// handler 里人为忙等多少微秒（第 7 个位置参数）。
+///
+/// 用途与 `tools/bench.zig --handler-delay-us` 一致：量化「同连接多流是否串行」。
+/// 串行模型下 N 路并发流的总延迟 ≈ N × delay；每流一个任务则接近 delay。
+var handler_delay_us: u64 = 0;
+
 fn sayHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator) anyerror!void {
     _ = ctx;
     _ = arena;
+    if (handler_delay_us > 0) {
+        // 忙等而不是 sleep：要测的就是「handler 占住执行体」这件事本身
+        const until = zgrpc.clock.monotonicNs() + @as(i128, handler_delay_us) * 1000;
+        while (zgrpc.clock.monotonicNs() < until) std.atomic.spinLoopHint();
+    }
     const msg = call.firstMessage() orelse {
         call.setStatus(.invalid_argument, "缺少请求消息");
         return;
@@ -81,6 +92,8 @@ pub fn main(init: std.process.Init) !void {
                 stack_kb = std.fmt.parseInt(usize, a, 10) catch stack_kb;
             } else if (idx == 5) {
                 stack_max_kb = std.fmt.parseInt(usize, a, 10) catch stack_max_kb;
+            } else if (idx == 6) {
+                handler_delay_us = std.fmt.parseInt(u64, a, 10) catch handler_delay_us;
             }
         }
     }

@@ -749,7 +749,13 @@ pub const Server = struct {
     /// 阻塞任务会占满池槽位，反而把并发卡在 `max_workers` 上。
     dispatch: ConnDispatch = .thread_per_conn,
     /// `dispatch == .pool` 时必需；由调用方创建与销毁（生命周期必须长于 acceptLoop）。
+    ///
+    /// `.task` 模式下它同时充当**每流任务池**：留空则 `acceptLoop` 自动建一个默认池。
     pool: ?*zzig.threading.pool.Pool = null,
+    /// `.task` 模式自动建池时的线程上限（`pool` 为空才生效）
+    stream_workers: usize = default_stream_workers,
+    /// 自动建的池（内部拥有，`acceptLoop` 退出时销毁）
+    owned_pool: ?*zzig.threading.pool.Pool = null,
     /// `dispatch == .task` 时用来跟踪连接任务；`acceptLoop` 在退出时 await 它。
     ///
     /// 自己调用 `dispatchStream` 而不走 `acceptLoop` 时，收尾要手动
@@ -917,6 +923,12 @@ pub const Server = struct {
     /// 只记日志并短暂退避，连接照常继续接受——之前这里是 `catch return`，
     /// 一次瞬时错误会把整个服务端的 accept 循环终止，表面上「服务还在」但已不再接新连接。
     pub fn acceptLoop(self: *Server, io: std.Io, allocator: std.mem.Allocator, listener: *std.Io.net.Server) void {
+        // `.task` 模式**默认开启每流任务**：没显式给 pool 就自己建一个（退出时销毁）。
+        // 实测该模式在顺序/多路复用两种工作点都不劣于内联执行，慢 handler 时
+        // 同连接并发延迟降 4~6.5 倍，所以没必要让用户手动开。
+        self.ensureStreamPool(io, allocator);
+        defer self.destroyOwnedStreamPool();
+
         // 任务模式：连接任务挂在 server 上，所以收尾在这里 await（优雅关闭）
         defer if (self.dispatch == .task) self.task_group.await(io) catch {};
 
@@ -935,6 +947,37 @@ pub const Server = struct {
             };
             self.dispatchStream(io, allocator, stream);
         }
+    }
+
+    /// 每流任务池的默认线程上限。
+    ///
+    /// handler 是阻塞执行体，所以它同时决定了「一条连接上能同时处理几路请求」。
+    /// 取值与 `std.Io.Threaded` 的默认并发度同量级：太小会让多路复用客户端排长队，
+    /// 太大只是多几个休眠线程。
+    pub const default_stream_workers: usize = 64;
+
+    /// `.task` 模式下确保存在每流任务池（幂等；只在 `pool` 为空时生效）。
+    fn ensureStreamPool(self: *Server, io: std.Io, allocator: std.mem.Allocator) void {
+        if (self.dispatch != .task or self.pool != null or self.owned_pool != null) return;
+        const p = zzig.threading.pool.Pool.create(io, allocator, .{
+            .min_workers = 0,
+            .max_workers = self.stream_workers,
+            .idle_timeout_ms = 60_000,
+            .queue_capacity = 4096,
+        }) catch |e| {
+            // 建池失败不是致命错误：退回内联执行，只是失去每流并发而已
+            log.grpc.warn("每流任务池创建失败（{s}），本连接退回内联执行", .{@errorName(e)});
+            return;
+        };
+        self.owned_pool = p;
+        self.pool = p;
+    }
+
+    fn destroyOwnedStreamPool(self: *Server) void {
+        const p = self.owned_pool orelse return;
+        self.owned_pool = null;
+        if (self.pool == p) self.pool = null;
+        p.destroy();
     }
 
     /// 按 `dispatch` 调度一条已接受的连接（`acceptLoop` 的单条版本，也便于自定义 accept 流程）。

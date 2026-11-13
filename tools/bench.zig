@@ -148,6 +148,8 @@ const Args = struct {
     pool_max: usize = 256,
     /// >0：事件循环连接 + 每流任务池（消除同连接队头阻塞），值为池上限
     streams: usize = 0,
+    /// 只用 `.task` 调度、不给池（验证默认自动建池）
+    task: bool = false,
     /// >1：同一连接上并开 N 条流的批量模式（真多路复用，才测得出每流并发）
     batch: usize = 1,
     /// 用户显式给了 `--batch`（`--batch 1` 也要走批量路径，顺序单流照样用它测）
@@ -187,6 +189,8 @@ fn parseArgs(init: std.process.Init) Args {
             a.pool = true;
         } else if (std.mem.eql(u8, arg, "--streams")) {
             if (it.next()) |v| a.streams = std.fmt.parseInt(usize, v, 10) catch a.streams;
+        } else if (std.mem.eql(u8, arg, "--task")) {
+            a.task = true;
         } else if (std.mem.eql(u8, arg, "--batch")) {
             if (it.next()) |v| a.batch = std.fmt.parseInt(usize, v, 10) catch a.batch;
             a.batch_set = true;
@@ -247,6 +251,10 @@ pub fn main(init: std.process.Init) !void {
         server.dispatch = .task;
         server.pool = hpool;
         say("[bench] 服务端调度：事件循环 + 每流任务池（max={d}）\n", .{cfg.streams});
+    } else if (cfg.task) {
+        // 不给池：验证「.task 默认自动建池 + 默认开启每流任务」
+        server.dispatch = .task;
+        say("[bench] 服务端调度：事件循环 + 自动每流任务池\n", .{});
     } else if (cfg.pool) {
         const pool = try zzig.threading.pool.Pool.create(io, gpa, .{
             .min_workers = 0,
@@ -786,6 +794,7 @@ fn runConcurrent(io: std.Io, gpa: std.mem.Allocator, addr: std.Io.net.IpAddress,
             merged += 1;
         }
     }
+    const total_qps = @as(f64, @floatFromInt(total_req)) * 1e9 / @as(f64, @floatFromInt(@max(wall_ns, 1)));
     say(
         \\
         \\=== zgrpc unary 基准（并发 {d} 连接 × {d} 次）===
@@ -799,7 +808,18 @@ fn runConcurrent(io: std.Io, gpa: std.mem.Allocator, addr: std.Io.net.IpAddress,
         cfg.iterations,
         total_req,
         @as(f64, @floatFromInt(wall_ns)) / 1e6,
-        @as(f64, @floatFromInt(total_req)) * 1e9 / @as(f64, @floatFromInt(@max(wall_ns, 1))),
+        total_qps,
         @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(@max(merged, 1))) / 1000.0,
     });
+    // 控制台输出走 WriteConsoleW，重定向抓不到；脚本对拍需要这一行 stderr
+    std.debug.print(
+        "[bench-concurrent] conns={d} iterations={d} ok={d} qps={d:.1} elapsed_ms={d:.2}\n",
+        .{
+            n,
+            cfg.iterations,
+            total_req,
+            total_qps,
+            @as(f64, @floatFromInt(wall_ns)) / 1e6,
+        },
+    );
 }
