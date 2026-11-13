@@ -23,6 +23,8 @@
 handler 并行执行（业务仍同步串行，串行只是执行顺序，**不会因此拒绝并发流**）、
 客户端流/bidi 背压（gRPC-Web 规范本身也不支持 bidi）、`grpc-timeout` 的**强制中断**（本层只判超时并回 `DEADLINE_EXCEEDED`，
 不会打断已阻塞在业务里的调用）、
+发送侧流控限速（客户端 DATA 已按对端 `MAX_FRAME_SIZE` 分片，但不按 `SETTINGS_INITIAL_WINDOW_SIZE` 限速，
+大消息 + 小窗口的对端仍可能回 `FLOW_CONTROL_ERROR`）、
 well-known types / `Any`（`.proto` 子集代码生成与**服务反射**已支持，见下）。
 
 ### keepalive（服务端主动 PING）
