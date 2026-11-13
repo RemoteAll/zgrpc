@@ -673,6 +673,18 @@ pub const ConnDispatch = enum {
     /// 提交到弹性线程池。**短连接 / 短 RPC / 探活高频建连的正确选择**。
     /// 需要 `Server.pool`；提交失败会自动回退到独立线程。
     pool,
+    /// **每连接一个「运行时任务」**（事件循环 / 异步后端的正确选择）。
+    ///
+    /// 与 `thread_per_conn` 的区别只有一个：连接跑在 `std.Io.Group` 的任务里，
+    /// 而不是 `std.Thread.spawn` 出来的 OS 线程里。**语义完全由传入的 `std.Io` 决定**：
+    /// - 传 `std.Io.Threaded`：任务落到线程池（行为近似 `thread_per_conn`，但有并发上限）；
+    /// - 传异步后端（如 zio：Windows 走 IOCP、Linux 走 io_uring）：任务是**协程**，
+    ///   连接数不再等于线程数。实测 5000 条长连接只需 ~21 个线程，
+    ///   而 `thread_per_conn` 在 5000 连接时会因建线程太慢而开始拒连。
+    ///
+    /// 上千到上万长连接**必须**用这个模式；几百连接以内用 `thread_per_conn` 吞吐更好。
+    /// 需要 `Server.task_group` 存活到连接结束（`acceptLoop` 会负责 await）。
+    task,
 };
 
 /// gRPC 路由表；把它作为 `h2.Connection.serve` 的 handler 使用：
@@ -738,6 +750,11 @@ pub const Server = struct {
     dispatch: ConnDispatch = .thread_per_conn,
     /// `dispatch == .pool` 时必需；由调用方创建与销毁（生命周期必须长于 acceptLoop）。
     pool: ?*zzig.threading.pool.Pool = null,
+    /// `dispatch == .task` 时用来跟踪连接任务；`acceptLoop` 在退出时 await 它。
+    ///
+    /// 自己调用 `dispatchStream` 而不走 `acceptLoop` 时，收尾要手动
+    /// `server.task_group.await(io)`，否则任务可能还在用着已释放的 server。
+    task_group: std.Io.Group = .init,
 
     pub fn context(self: *Server) *anyopaque {
         return @ptrCast(self);
@@ -874,11 +891,6 @@ pub const Server = struct {
     /// ```
     pub const conn_stack_size: usize = 128 * 1024;
 
-    /// 接受连接并按 `dispatch` 调度（阻塞直到 listener 不再返回连接）。
-    ///
-    /// - `.thread_per_conn`：每连接起一独立线程（默认；长连接/流式场景正确选择）
-    /// - `.pool`：提交到弹性线程池（短连接高频建连场景）；提交失败会**回退**到独立线程，
-    ///   绝不因为队列满而丢掉连接
     /// 推荐的监听队列长度。
     ///
     /// `std.Io.net` 的默认值只有 **128**。连接突发时（如 2000 个客户端同时建连）
@@ -895,14 +907,19 @@ pub const Server = struct {
 
     /// 接受连接并按 `dispatch` 调度（阻塞直到 listener 不再返回连接）。
     ///
-    /// - `.thread_per_conn`：每连接起一独立线程（默认；长连接/流式场景正确选择）
-    /// - `.pool`：提交到弹性线程池（短连接高频建连场景）；提交失败会**回退**到独立线程，
-    ///   绝不因为队列满而丢掉连接
+    /// - `.thread_per_conn`：每连接起一独立线程（默认）
+    /// - `.pool`：提交到弹性线程池（短连接高频建连场景）；提交失败会**回退**到独立线程
+    /// - `.task`：每连接一个运行时任务（事件循环 / 异步后端）。**上千到上万长连接必须用它**，
+    ///   因为线程数不再随连接数增长。实现方式：连接跑在 `Server.task_group` 里，
+    ///   退出循环时会 `await` 这个 group（优雅收尾，不会带着未完成的连接改内存）。
     ///
     /// **不会因为单次 accept 失败就退出整个循环**：瞬时的资源紧张（如 fd/句柄耗尽）
     /// 只记日志并短暂退避，连接照常继续接受——之前这里是 `catch return`，
     /// 一次瞬时错误会把整个服务端的 accept 循环终止，表面上「服务还在」但已不再接新连接。
     pub fn acceptLoop(self: *Server, io: std.Io, allocator: std.mem.Allocator, listener: *std.Io.net.Server) void {
+        // 任务模式：连接任务挂在 server 上，所以收尾在这里 await（优雅关闭）
+        defer if (self.dispatch == .task) self.task_group.await(io) catch {};
+
         while (true) {
             const stream = listener.accept(io) catch |e| switch (e) {
                 // listener 已被关闭：这才是真正的收尾信号
@@ -922,6 +939,16 @@ pub const Server = struct {
 
     /// 按 `dispatch` 调度一条已接受的连接（`acceptLoop` 的单条版本，也便于自定义 accept 流程）。
     pub fn dispatchStream(self: *Server, io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream) void {
+        if (self.dispatch == .task) {
+            // 事件循环 / 异步后端：连接作为**运行时任务**跑，不是 OS 线程。
+            // `concurrent` 在带并发上限的后端（如 std.Io.Threaded 的线程池）也会报
+            // `ConcurrencyUnavailable`，那时回退到独立线程，绝不丢连接。
+            self.task_group.concurrent(io, connTaskEntry, .{ self, allocator, io, stream }) catch |e| {
+                log.grpc.warn("连接任务创建失败（{s}），回退为独立线程", .{@errorName(e)});
+                self.spawnConnThread(io, allocator, stream);
+            };
+            return;
+        }
         if (self.dispatch == .pool) {
             if (self.pool) |pool| {
                 // 盒子由 allocator 分配：池任务只有一个 `*anyopaque` 上下文
@@ -948,6 +975,17 @@ pub const Server = struct {
             }
         }
         self.spawnConnThread(io, allocator, stream);
+    }
+
+    /// `.task` 模式的任务入口：`std.Io.Group` 要求函数返回值可强转成 `Cancelable!void`，
+    /// 而 `serveConn` 返回 `void`，所以这里包一层。
+    fn connTaskEntry(
+        self: *Server,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        stream: std.Io.net.Stream,
+    ) std.Io.Cancelable!void {
+        self.serveConn(allocator, io, stream);
     }
 
     /// 独立线程模型（默认）：起线程后立即 detach，连接结束由线程自己退出。
@@ -2060,4 +2098,63 @@ test "base64：流式宽松解码（容忍 in-stream padding，对应 grpc-web-t
     // 空白与换行也忽略
     try testing.expectEqualStrings("hello", try decodeBase64Stream(a, "aGVs\r\nbG8="));
     try testing.expectError(error.InvalidBase64, decodeBase64Stream(a, "aGVsbG8!"));
+}
+
+// ---------------------------------------------------------------------------
+// 连接调度模式（事件循环 / 任务模式）的回归测试
+// ---------------------------------------------------------------------------
+
+// 事件循环 / 任务模式的最小回归：验证 `dispatch = .task` 真的把连接交给了运行时任务组。
+//
+// 为什么不在这里做完整的请求/响应往返：那样客户端读会阻塞，一旦调度有问题就会**挂住整个测试进程**。
+// 这里只验证调度契约（连接被 accept → 作为任务跑起来 → 客户端断开后任务能结束），
+// 协议正确性由上面 100+ 个用例覆盖。
+test "grpc：dispatch=task 把连接交给运行时任务组，并能优雅收尾" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var dummy: u8 = 0;
+    var routes = [_]Route{.{ .path = "/t/Echo", .handler = echoHandler2 }};
+    var server = Server{
+        .routes = &routes,
+        .outer_ctx = &dummy,
+        .dispatch = .task,
+        // 需要 connCount 观测连接登记，所以打开
+        .track_conns = true,
+    };
+
+    // 端口：`std.Io.net` 未暴露 getsockname，只能试几个高位端口
+    var listener: std.Io.net.Server = undefined;
+    var port: u16 = 0;
+    var probe: u16 = 18921;
+    while (probe < 18926) : (probe += 1) {
+        const a = std.Io.net.IpAddress.parse("127.0.0.1", probe) catch continue;
+        listener = a.listen(io, .{ .reuse_address = true }) catch continue;
+        port = probe;
+        break;
+    }
+    defer listener.deinit(io);
+    try testing.expect(port != 0);
+
+    // 客户端先连（内核先排队），再把服务端一侧 accept 出来
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var client_stream = try addr.connect(io, .{ .mode = .stream });
+    // 关键：`.task` 分支把连接交给 `server.task_group`
+    const srv_stream = try listener.accept(io);
+    server.dispatchStream(io, testing.allocator, srv_stream);
+
+    // 任务确实跑起来了（服务端已登记这条连接）；最多等 1 秒，避免测试挂死
+    var waited: usize = 0;
+    while (server.connCount() == 0 and waited < 200) : (waited += 1) {
+        std.Io.sleep(io, .{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    try testing.expectEqual(@as(usize, 1), server.connCount());
+
+    // 客户端断开 → 服务端读到 EOF → 连接任务结束
+    client_stream.close(io);
+
+    // 等任务组清空：既验证任务被跟踪，也验证能优雅收尾（不带着未完成任务释放 server）
+    server.task_group.await(io) catch {};
+    try testing.expectEqual(@as(usize, 0), server.connCount());
 }

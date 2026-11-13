@@ -1,0 +1,45 @@
+feat(server): 事件循环成为一等调度模式（dispatch=.task）+ 万连接实测
+
+用户要求：性能最优、资源最省、单机支持非常多连接与非常高的并发。
+
+一、`.task` 成为一等调度模式（不再只存在于示例里）
+- `ConnDispatch` 新增 `.task`：连接作为**运行时任务**（`std.Io.Group`）跑，
+  而不是 `std.Thread.spawn` 出来的 OS 线程。语义完全由传入的 `std.Io` 决定：
+  Threaded → 线程池；zio → 协程（Windows IOCP / Linux io_uring / macOS kqueue）。
+- `Server.task_group` + `acceptLoop` 退出时 `await`（优雅收尾，不带着未完成任务释放 server）。
+- `connTaskEntry` 包装函数（`Group` 要求返回值可强转 `Cancelable!void`）。
+- 任务创建失败（如后端有并发上限）自动回退独立线程，**绝不丢连接**。
+
+二、回归测试（真实 socket）
+- 新增「dispatch=task 把连接交给运行时任务组，并能优雅收尾」：验证连接被 accept 后
+  确实作为任务跑起来（connCount==1）、客户端断开后任务组能清空（connCount==0）。
+  轮询上限 1 秒，**不会挂死测试进程**；协议正确性由已有 100+ 用例覆盖。
+
+三、示例改为用一等入口
+- `examples/with-zio/main.zig` 重写：`dispatch = .task` + `Server.acceptLoop`，
+  删掉示例自带的 serveLoop/handleClient 副本；新增缓冲与栈参数：
+  `serve <port> [recv_kb] [send_kb]`。
+
+四、万连接实测（16 逻辑核，同机，ghz 保持长连接 15s）
+- **10000 条长连接**：24 线程 / 10157 句柄 / **零拒连** / **55213 QPS**；
+  同条件 grpc-go **33750 QPS** → zgrpc **+64%**。
+- 线程模型在 5000 连接时就会因建线程太慢丢 22654 次连接（见决策记录增补十）。
+
+五、内存优化（关键发现）
+- zio 默认 `stack_pool.committed_size = 256 KiB`（**每个协程初始提交的物理内存**），
+  一万协程就是 2.5 GB。连接协程栈用量很小（收发缓冲都在堆上），
+  改为 `committed_size = 16 KiB` / `maximum_size = 1 MiB`：
+  10000 连接 RSS 从 **1215 MB 降到 ~750-850 MB**（仍在压测负载下）。
+- 配合 `Server.conn_recv_buf_size` / `conn_send_buf_size` 调到 4 KiB/4 KiB，
+  每连接自身缓冲只占 8 KiB。
+- 剩余按连接成本约 75 KB，主要是 zio 任务/栈 + 内核 socket 缓冲；
+  下一步要更低需要按 idle/active 分离测量后再定。
+
+影响范围
+- [x] 公共 API：`ConnDispatch.task`、`Server.task_group`
+- [x] 性能影响：新增调度模式；无默认行为变更（默认仍是 thread_per_conn）
+- [ ] 兼容性变更
+
+测试情况
+- [x] zig build test --summary all -> 8/8 steps；104/104 tests passed
+- [x] 10000 连接实测零拒连，55213 QPS

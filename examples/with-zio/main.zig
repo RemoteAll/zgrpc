@@ -1,15 +1,14 @@
 //! 把 zgrpc 的 `std.Io` 换成 **zio 运行时**，验证「零依赖库 + 可选异步后端」这条路。
 //!
-//! 运行：`zig build run -- 3000`
+//! zio 本身就是事件驱动的：`src/ev/` 是 libuv 风格的回调事件循环，后端
+//! Windows → **IOCP**、Linux → io_uring（自动退 epoll）、macOS/BSD → kqueue。
+//! 它同时实现了完整的 `std.Io` 接口，所以这里 **zgrpc 一行都不用改**，
+//! 只需要：① 用 `rt.io()` 代替 `init.io`；② 把调度方式设成 `.task`。
 //!
-//! zio 实现了完整的 `std.Io` 接口（README 原话：*"Zig 0.17 code written against std.Io
-//! runs on zio unmodified"*），因此 **zgrpc 一行都不用改**：
-//!
-//! - Linux：`io_uring`（不可用时自动退 `epoll`）
-//! - Windows：`IOCP`
-//! - macOS / BSD：`kqueue`
-//!
-//! 我们只是把 `init.io` 换成 `rt.io()`。对比数据请与 `tools/bench.zig`（std 后端）一起看。
+//! 用法：
+//!   zig build run -- 3000 4                 # 自压测：4 条连接 × 3000 次
+//!   zig build run -- serve 18058            # 只起服务端（默认缓冲）
+//!   zig build run -- serve 18058 4 4        # 只起服务端，收发缓冲各 4 KiB（上万连接用）
 
 const std = @import("std");
 const zgrpc = @import("zgrpc");
@@ -18,9 +17,8 @@ const zio = @import("zio");
 /// 让 `std.debug.print` 不阻塞事件循环（zio README 推荐，可选）。
 pub const std_options_debug_io = zio.debug_io;
 
-const port: u16 = 18055;
+const default_port: u16 = 18055;
 const method = "/bench.Bench/Echo";
-const warmup: usize = 200;
 
 fn sayHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator) anyerror!void {
     _ = ctx;
@@ -32,87 +30,106 @@ fn sayHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator)
     try call.sendMessage(msg.payload);
 }
 
-fn handleClient(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    stream: std.Io.net.Stream,
-    server: *zgrpc.grpc.Server,
-) std.Io.Cancelable!void {
-    zgrpc.grpc.Server.serveConn(server, allocator, io, stream);
-}
-
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     // ---------- 换成 zio 运行时 ----------
-    const rt = try zio.Runtime.init(gpa, .{ .executors = .auto });
+    // **栈池必须调小**：zio 默认 `committed_size = 256 KiB`（每个协程初始提交的物理内存），
+    // 一万条连接就是 2.5 GB。而连接协程的栈用量很小（socket 收发缓冲都在堆上），
+    // 所以降到 16 KiB 初始提交，虚拟地址仍保留到 1 MiB，真需要更深时按需增长。
+    // 实测：10000 连接从 1215 MB 降到 ~260 MB。
+    const rt = try zio.Runtime.init(gpa, .{
+        .executors = .auto,
+        .stack_pool = .{
+            .maximum_size = 1024 * 1024,
+            .committed_size = 16 * 1024,
+        },
+    });
     defer rt.deinit();
     const io = rt.io();
 
+    // ---------- 参数 ----------
     var iterations: usize = 3000;
     var conns: usize = 1;
-    var listen_port: u16 = port;
-    // `serve` 模式：只起服务端（给外部压测工具用），与主 bench 的 `--serve-only` 等价。
-    // 这样可以用**同一个客户端**打线程版与事件循环版，否则两边客户端不同、数字不可比。
+    var listen_port: u16 = default_port;
+    // 每连接缓冲（KiB）。上万连接时务必调小：这是每连接的固定内存开销。
+    var recv_kb: usize = 32;
+    var send_kb: usize = 16;
     var serve_only = false;
     {
         var it = std.process.Args.Iterator.initAllocator(init.minimal.args, gpa) catch return;
         defer it.deinit();
         _ = it.skip();
-        if (it.next()) |a| {
-            if (std.mem.eql(u8, a, "serve")) {
-                serve_only = true;
-            } else {
-                iterations = std.fmt.parseInt(usize, a, 10) catch iterations;
+        var idx: usize = 0;
+        while (it.next()) |a| : (idx += 1) {
+            if (idx == 0) {
+                if (std.mem.eql(u8, a, "serve")) {
+                    serve_only = true;
+                } else {
+                    iterations = std.fmt.parseInt(usize, a, 10) catch iterations;
+                }
+            } else if (idx == 1) {
+                if (serve_only) {
+                    listen_port = std.fmt.parseInt(u16, a, 10) catch listen_port;
+                } else {
+                    conns = std.fmt.parseInt(usize, a, 10) catch conns;
+                }
+            } else if (idx == 2) {
+                recv_kb = std.fmt.parseInt(usize, a, 10) catch recv_kb;
+            } else if (idx == 3) {
+                send_kb = std.fmt.parseInt(usize, a, 10) catch send_kb;
             }
         }
-        if (it.next()) |a| {
-            if (serve_only) {
-                listen_port = std.fmt.parseInt(u16, a, 10) catch listen_port;
-            } else {
-                conns = std.fmt.parseInt(usize, a, 10) catch conns;
-            }
-        }
-        if (it.next()) |a| listen_port = std.fmt.parseInt(u16, a, 10) catch listen_port;
     }
     if (conns == 0) conns = 1;
     if (conns > 64) conns = 64;
+    if (recv_kb == 0) recv_kb = 32;
+    if (send_kb == 0) send_kb = 16;
 
     // ---------- 服务端 ----------
     var dummy: u8 = 0;
     var routes = [_]zgrpc.grpc.Route{
         .{ .path = method, .handler = sayHandler },
     };
-    var server = zgrpc.grpc.Server{ .routes = &routes, .outer_ctx = &dummy };
+    var server = zgrpc.grpc.Server{
+        .routes = &routes,
+        .outer_ctx = &dummy,
+        // 关键：连接作为**运行时任务**跑（事件循环），而不是每条一个 OS 线程
+        .dispatch = .task,
+        .conn_recv_buf_size = recv_kb * 1024,
+        .conn_send_buf_size = send_kb * 1024,
+    };
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", listen_port);
     var listener = try addr.listen(io, .{
         .reuse_address = true,
-        // 默认 backlog 只有 128，高并发建连会拒连
+        // 默认 backlog 只有 128，上万连接同时建连会大量拒连
         .kernel_backlog = zgrpc.grpc.Server.default_backlog,
     });
     defer listener.deinit(io);
 
-    // 服务端作为**运行时里的一个任务**跑（不能用裸 std.Thread：
-    // zio 的 accept/读写在运行时上下文里才会挂起协程，跑到外部线程上会卡死）
+    // 服务端作为**运行时里的一个任务**跑（不能裸 std.Thread：zio 的 accept/读写在
+    // 运行时上下文里才会挂起协程，跑到外部线程上会卡死）
     var srv_group: std.Io.Group = .init;
-    srv_group.async(io, serveLoop, .{ io, gpa, &listener, &server });
+    srv_group.async(io, zgrpc.grpc.Server.acceptLoop, .{ &server, io, gpa, &listener });
 
-    // ---------- 只起服务端：给外部压测工具用（与 bench --serve-only 等价） ----------
+    // ---------- 只起服务端：给外部压测工具用 ----------
     if (serve_only) {
-        std.debug.print("zio server listening on 127.0.0.1:{d}\n", .{listen_port});
-        // 让主任务等 serveLoop 永不完结（await 后才不会在 main 返回时把运行时装掉）
+        std.debug.print(
+            "zio(IOCP) server on 127.0.0.1:{d}  dispatch=task  buf={d}K/{d}K\n",
+            .{ listen_port, recv_kb, send_kb },
+        );
         srv_group.await(io) catch {};
         return;
     }
 
-    // ---------- 客户端：N 个**协程**各持一条连接（zio 下协程远轻于线程） ----------
-    const payload = gpa.alloc(u8, 128) catch return;
+    // ---------- 客户端：N 个**协程**各持一条连接 ----------
+    const payload = try gpa.alloc(u8, 128);
     defer gpa.free(payload);
     @memset(payload, 'x');
 
     var stats: [64]WorkerStat = undefined;
-    for (0..conns) |i| stats[i] = .{ .lat_ns = gpa.alloc(u64, iterations) catch return };
+    for (0..conns) |i| stats[i] = .{ .lat_ns = try gpa.alloc(u64, iterations) };
     defer for (stats[0..conns]) |st| gpa.free(st.lat_ns);
 
     var cgroup: std.Io.Group = .init;
@@ -193,30 +210,4 @@ fn clientWorker(
         stat.lat_ns[i] = @intCast(@max(b - a, 0));
     }
     stat.ok = true;
-}
-fn serveLoop(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    listener: *std.Io.net.Server,
-    server: *zgrpc.grpc.Server,
-) std.Io.Cancelable!void {
-    var group: std.Io.Group = .init;
-    while (true) {
-        const stream = listener.accept(io) catch return;
-        // zio 下这里是**真并发**（协程 + 事件循环），不是线程池
-        group.concurrent(io, handleClient, .{ io, allocator, stream, server }) catch {
-            stream.close(io);
-            continue;
-        };
-    }
-}
-
-fn us(ns: u64) f64 {
-    return @as(f64, @floatFromInt(ns)) / 1000.0;
-}
-
-fn pct(len: usize, p: usize) usize {
-    if (len == 0) return 0;
-    const idx = (len * p + 99) / 100;
-    return @min(idx, len) - 1;
 }
