@@ -16,7 +16,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # 测试数下限：只能抬高，不能降低（降低必须在 docs/决策记录.md 写明依据）
-$minTests = 78
+$minTests = 83
 
 # 随机空闲端口：Windows 上 `Stop-Process -Force`（= TerminateProcess）会让监听 socket
 # 变成 zombie LISTEN（netstat 里 OwningProcess=0），持续数十秒且无法 kill。
@@ -342,7 +342,7 @@ if ($SkipInterop) {
             $rs = Start-Process -FilePath $interopExe -ArgumentList @('server', '--port', $rustPort.ToString()) -RedirectStandardError "$reportDir\rust-server.log" -RedirectStandardOutput "$reportDir\rust-server.out" -PassThru -WindowStyle Hidden
             Start-Sleep -Milliseconds 900
             try {
-                $zo = & $clientExe2 $rustPort 2>&1 | Out-String
+                $zo = & $clientExe2 $rustPort --big 100000 2>&1 | Out-String
                 $zc = $LASTEXITCODE
                 Add-Content -Path $report -Value "[回归] zgrpc client -> Rust server：$zo" -Encoding UTF8
                 if ($zc -eq 0) {

@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("[keepalive-probe] 服务端监听 127.0.0.1:{d}，keepalive={d}ms\n", .{ port, interval_ms });
 
     // keepalive 线程
-    const ka = try server.spawnKeepalive(allocator);
+    const ka = try server.spawnKeepalive();
     defer {
         server.stopKeepalive();
         ka.join();

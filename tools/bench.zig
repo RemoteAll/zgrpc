@@ -53,7 +53,6 @@ fn acceptLoop(
     }
 }
 
-
 const Args = struct {
     iterations: usize = default_iterations,
     payload: usize = default_payload,
@@ -65,6 +64,9 @@ const Args = struct {
     conns: usize = 1,
     /// 只起服务端不压测（供 ghz / wrk 等外部工具打）
     serve_only: bool = false,
+    /// >0 时开启服务端 keepalive（每 N 毫秒向所有连接发 PING），用于验证
+    /// 「保活不会拖垮高并发」（之前 pingAll 会在锁内阻塞，慢连接会把新连接堵在登记前）
+    keepalive_ms: u32 = 0,
 };
 
 fn parseArgs(init: std.process.Init) Args {
@@ -85,6 +87,8 @@ fn parseArgs(init: std.process.Init) Args {
             if (it.next()) |v| a.conns = std.fmt.parseInt(usize, v, 10) catch a.conns;
         } else if (std.mem.eql(u8, arg, "--serve-only")) {
             a.serve_only = true;
+        } else if (std.mem.eql(u8, arg, "--keepalive-ms")) {
+            if (it.next()) |v| a.keepalive_ms = std.fmt.parseInt(u32, v, 10) catch a.keepalive_ms;
         }
     }
     if (a.iterations == 0) a.iterations = 1;
@@ -104,6 +108,12 @@ pub fn main(init: std.process.Init) !void {
         .{ .path = "/echo.Echo/Say", .handler = sayHandler },
     };
     var server = zgrpc.grpc.Server{ .routes = &routes, .outer_ctx = &dummy };
+    if (cfg.keepalive_ms > 0) {
+        server.keepalive_interval_ms = cfg.keepalive_ms;
+        const ka = try server.spawnKeepalive();
+        ka.detach();
+        std.debug.print("[bench] keepalive 已开启：每 {d}ms PING 所有连接\n", .{cfg.keepalive_ms});
+    }
 
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
     var listener = addr.listen(io, .{ .reuse_address = true }) catch |e| {

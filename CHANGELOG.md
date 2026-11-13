@@ -5,6 +5,30 @@
 
 ## 未发布
 
+### 修复
+- **客户端大消息会发出超限帧**（真实互通缺陷）：`client` 发 DATA 时**从不分片**，一条 > 16 KiB 的消息
+  就是一个超大帧。自己的服务端容忍所以自测发现不了，但 tonic / nghttp2 会直接 `FRAME_SIZE_ERROR` 断连。
+  现在 `writeData()` 按对端 `MAX_FRAME_SIZE` 切分（只有末片带 `END_STREAM`），并新增 `applySettings()`
+  解析对端 `SETTINGS_MAX_FRAME_SIZE`（之前只回 ACK、完全不读）。实测：100 000 字节经 Rust hyper
+  服务端完整往返（服务端日志 `收到 1 条消息（100005 字节）`），该用例已进回归对拍段。
+- **服务端 HEADERS 不分片**：header block 超过帧长时同样会发超限帧，且违反 RFC 9113 §6.10
+  （HEADERS 与后续 CONTINUATION 之间不允许插入任何帧）。新增 `Connection.writeHeaderBlock()`：
+  整段序列在同一把写锁内完成，`END_HEADERS` 只出现在末帧 —— 这也是 keepalive 能并发发 PING 的前提。
+- **keepalive 会被一条慢连接拖死（高并发隐患）**：`pingAll()` 原先在 `conns_lock` 内**阻塞**调 `sendPing()`，
+  一条卡的连接（TCP 背压）不只拖住整轮心跳，还让所有 `serveConn` 卡在登记/注销上，新连接接不进来。
+  现在新增 `SpinLock.tryLock()` + `Connection.trySendPing()`：对正忙连接**直接跳过**（有业务流量本身就保活），
+  `pingAll()` 永不阻塞。
+- **keepalive 日志刷屏**：跳过/写失败原先逐次 `print`，10ms 心跳下 20 秒就 586 行。改为聚合计数
+  `pings_skipped` / `pings_failed`（可查询），日志不再随心跳频率增长。
+- **`caller.Conn.create` 资源泄漏**：建连成功后若后续 `alloc` 失败，socket 不会被关闭 —— 每次失败漏一个连接。
+  补 `errdefer stream.close(io)`。
+- **`grpc.Server` 缺 `deinit()`**：`conns` 登记表分配后永不释放。新增 `deinit()`（停 keepalive + 释放表，可重入）。
+- **`conns` 分配器用错风险**：原先用调用方传入的 allocator（`spawnKeepalive(allocator)`），而该表会被
+  连接线程与 keepalive 线程并发 append —— 调用方传 arena 时会以极难定位的方式崩。现固定用 `page_allocator`，
+  `spawnKeepalive()` 不再需要 allocator 参数。
+- **客户端超时设置失败被静默吞掉**：POSIX 分支 `setRecvTimeout(...) catch {}` 会让调用方以为有时限保护，
+  实际可能永远阻塞。改为带原因与毫秒数的告警日志。
+
 ### 新增
 - **客户端调用策略（`zgrpc.caller`）**：拦截器 + 重试 + 负载均衡，**不污染 `client.Client`**。
   - `Interceptor{ on_request(path, attempt), on_response(path, status, elapsed_ns, attempt) }`：只观察不改内容。

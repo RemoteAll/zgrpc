@@ -64,6 +64,8 @@ const Conn = struct {
     fn create(alloc: std.mem.Allocator, io: std.Io, ep: Endpoint, opts: Options) !*Conn {
         const addr = try std.Io.net.IpAddress.parse(ep.host, ep.port);
         const stream = try addr.connect(io, .{ .mode = .stream });
+        // 后续任一步失败都要关掉 socket，否则每失败一次漏一个连接
+        errdefer stream.close(io);
 
         const c = try alloc.create(Conn);
         errdefer alloc.destroy(c);

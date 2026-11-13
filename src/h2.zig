@@ -126,7 +126,7 @@ pub const Responder = struct {
         var block: std.ArrayListUnmanaged(u8) = .empty;
         try hpack.encode(list.items, &block, a);
 
-        try self.conn.writeFrame(.headers, Flags.end_headers, self.stream.id, block.items);
+        try self.conn.writeHeaderBlock(self.stream.id, block.items, 0);
         self.begun = true;
     }
 
@@ -160,12 +160,7 @@ pub const Responder = struct {
         const a = self.stream.allocator();
         var block: std.ArrayListUnmanaged(u8) = .empty;
         try hpack.encode(trailers, &block, a);
-        try self.conn.writeFrame(
-            .headers,
-            Flags.end_headers | Flags.end_stream,
-            self.stream.id,
-            block.items,
-        );
+        try self.conn.writeHeaderBlock(self.stream.id, block.items, Flags.end_stream);
         self.ended = true;
     }
 
@@ -261,6 +256,12 @@ pub const SpinLock = struct {
         while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
         }
+    }
+
+    /// 尝试拿锁；拿不到立刻返回 false。
+    /// keepalive 用它跳过「正忙」的连 —— 有业务流量时本来就不需要 PING。
+    pub fn tryLock(self: *SpinLock) bool {
+        return self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) == null;
     }
 
     pub fn unlock(self: *SpinLock) void {
@@ -463,6 +464,44 @@ pub const Connection = struct {
         };
     }
 
+    /// 发送 header block，并按需分片为 `HEADERS + CONTINUATION…`。
+    ///
+    /// RFC 9113 §6.10：一个 header block 的 HEADERS 与它后面的 CONTINUATION 之间
+    /// **不允许插入任何帧**（PING 也不行），否则对端会当协议错误。因此整段序列
+    /// 必须在同一把写锁内完成 —— 这也正是 keepalive 能安全并发发 PING 的前提。
+    ///
+    /// `extra_flags` 只允许 `END_STREAM`（HEADERS 专属）；`END_HEADERS` 由这里控制，
+    /// 而且只能出现在末帧上。未超帧长时直接一帧发出（常见路径不变）。
+    fn writeHeaderBlock(
+        self: *Connection,
+        stream_id: u32,
+        block: []const u8,
+        extra_flags: u8,
+    ) !void {
+        const max = self.peer_max_frame_size;
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+
+        if (block.len <= max) {
+            try self.writeFrameBody(.headers, extra_flags | Flags.end_headers, stream_id, block);
+            return;
+        }
+        // 首片带 END_STREAM（若有），不带 END_HEADERS；其余走 CONTINUATION，末片才带 END_HEADERS
+        try self.writeFrameBody(.headers, extra_flags & Flags.end_stream, stream_id, block[0..max]);
+        var off: usize = max;
+        while (off < block.len) {
+            const n = @min(max, block.len - off);
+            const last = off + n == block.len;
+            try self.writeFrameBody(
+                .continuation,
+                if (last) Flags.end_headers else 0,
+                stream_id,
+                block[off .. off + n],
+            );
+            off += n;
+        }
+    }
+
     fn writeFrame(
         self: *Connection,
         ftype: FrameType,
@@ -470,10 +509,34 @@ pub const Connection = struct {
         stream_id: u32,
         payload: []const u8,
     ) !void {
-        if (payload.len > 0x00ff_ffff) return error.FrameTooLarge;
         // 头 + 体 + flush 必须原子（keepalive 线程可能并发发 PING）
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
+        return self.writeFrameBody(ftype, flags, stream_id, payload);
+    }
+
+    /// 非阻塞写帧：拿不到写锁（连接正忙）就返回 false，不排队。
+    fn writeFrameTry(
+        self: *Connection,
+        ftype: FrameType,
+        flags: u8,
+        stream_id: u32,
+        payload: []const u8,
+    ) !bool {
+        if (!self.write_mutex.tryLock()) return false;
+        defer self.write_mutex.unlock();
+        try self.writeFrameBody(ftype, flags, stream_id, payload);
+        return true;
+    }
+
+    fn writeFrameBody(
+        self: *Connection,
+        ftype: FrameType,
+        flags: u8,
+        stream_id: u32,
+        payload: []const u8,
+    ) !void {
+        if (payload.len > 0x00ff_ffff) return error.FrameTooLarge;
 
         var hdr: [9]u8 = undefined;
         hdr[0] = @intCast((payload.len >> 16) & 0xff);
@@ -515,6 +578,8 @@ pub const Connection = struct {
         var payload: [8]u8 = undefined;
         std.mem.writeInt(u32, payload[0..4], 0, .big); // last_stream_id
         std.mem.writeInt(u32, payload[4..8], @backingInt(code), .big);
+        // 刻意吞掉：GOAWAY 是「尽力告知」，能走到这里通常已经是对端断了/写不出去，
+        // 没有后续动作可做，上层已拿到原始错误，这里再报错只会掩盖真正原因。
         self.writeFrame(.goaway, 0, 0, &payload) catch {};
     }
 
@@ -568,13 +633,26 @@ pub const Connection = struct {
     ///
     /// 发送与业务帧共用写锁，因此可以从 keepalive 线程调用。
     pub fn sendPing(self: *Connection, payload: ?[8]u8) !void {
-        var buf: [8]u8 = payload orelse blk: {
+        const buf = pingPayload(payload);
+        self.pings_sent +|= 1;
+        try self.writeFrame(.ping, 0, 0, &buf);
+    }
+
+    /// 非阻塞版：连接正忙（有业务帧在写）时返回 false ——
+    /// 「正在传数据」本身就达到了保活目的，没必要排队等写锁。
+    pub fn trySendPing(self: *Connection, payload: ?[8]u8) !bool {
+        const buf = pingPayload(payload);
+        const wrote = try self.writeFrameTry(.ping, 0, 0, &buf);
+        if (wrote) self.pings_sent +|= 1;
+        return wrote;
+    }
+
+    fn pingPayload(payload: ?[8]u8) [8]u8 {
+        return payload orelse blk: {
             var b: [8]u8 = undefined;
             std.mem.writeInt(u64, &b, @bitCast(@as(i64, @truncate(@import("clock.zig").monotonicNs()))), .big);
             break :blk b;
         };
-        self.pings_sent +|= 1;
-        try self.writeFrame(.ping, 0, 0, &buf);
     }
 
     /// 收到过多少个 PING ACK（调用方可据此判活；0 表示对端从未回应）。
@@ -1357,4 +1435,35 @@ test "h2健壮性：RST_STREAM 载荷不是 4 字节 → FRAME_SIZE_ERROR" {
     try appendFrame(&input, a, .rst_stream, 0, 1, &.{ 0x00, 0x01 }); // 只给 2 字节
 
     try testing.expectError(error.FrameSizeError, driveConn(a, input.items, .{}));
+}
+
+test "SpinLock：tryLock 拿不到立刻返回 false（不自旋阻塞）" {
+    var l: SpinLock = .{};
+    try testing.expect(l.tryLock());
+    // 已被占住 → 不能再拿到
+    try testing.expect(!l.tryLock());
+    l.unlock();
+    try testing.expect(l.tryLock());
+    l.unlock();
+}
+
+test "keepalive：连接正忙时 trySendPing 立刻放弃（不阻塞、不计数）" {
+    var r = std.Io.Reader.fixed("");
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var conn = Connection.init(testing.allocator, &r, &aw.writer, .{});
+    defer conn.deinit();
+
+    // 空闲连接：PING 正常发出并计数
+    try testing.expect(try conn.trySendPing(null));
+    try testing.expectEqual(@as(u64, 1), conn.pings_sent);
+
+    // 模拟「另一线程正在写业务帧」：写锁被占
+    conn.write_mutex.lock();
+    defer conn.write_mutex.unlock();
+    // 必须立刻返回 false（而不是排队等锁）——这是高并发下 pingAll 不拖死别人的前提
+    try testing.expect(!(try conn.trySendPing(null)));
+    // 跳过的那次不计数
+    try testing.expectEqual(@as(u64, 1), conn.pings_sent);
 }

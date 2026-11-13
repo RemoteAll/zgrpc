@@ -36,12 +36,21 @@ var server = zgrpc.grpc.Server{
     .outer_ctx = &dummy,
     .keepalive_interval_ms = 30_000,   // 30s 一次
 };
-const ka = try server.spawnKeepalive(allocator);   // 一个线程服务所有连接
+defer server.deinit();                 // 释放连接登记表（可重复调用）
+const ka = try server.spawnKeepalive();  // 一个线程服务所有连接；不需传 allocator
 defer { server.stopKeepalive(); ka.join(); }
 ```
 
 只配 `keepalive_interval_ms` **不会自动发** —— 还需要 `spawnKeepalive()`，或由调用方周期调 `pingAll()`
 （适合已有事件循环的场景）。不主动断开无响应的连接：`h2.Connection.pingAcks()` 暴露计数，策略留给调用方。
+
+**高并发下的行为（已实测，非推测）**：`pingAll()` 对**正忙**的连接（写锁被占）直接跳过 —— 正在传数据
+本身已经保活，排队等写锁只会被一条慢连接（TCP 背压）拖死整轮，而且一直握着 `conns_lock` 会让新连接
+登记不进来。跳过与写失败都只做**聚合计数**（`pings_skipped` / `pings_failed`），不逐次打日志。
+512 连接 × 3000 次调用实测：关闭 keepalive 32687 QPS，10ms 间隔（比默认激进 3000 倍）33779 QPS —— 无退化。
+
+`conns` 登记表固定用 `page_allocator`（不接调用方 allocator）：它会被连接线程与 keepalive 线程并发 append，
+调用方传进来的 arena 无锁并发写会以极难定位的方式崩掉。
 
 ## 客户端调用策略（拦截器 / 重试 / 负载均衡）
 

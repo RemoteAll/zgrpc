@@ -616,12 +616,21 @@ pub const Server = struct {
     keepalive_interval_ms: ?u32 = null,
 
     /// 活跃连接（keepalive 线程遍历用）；由 `serveConn` 自动登记/注销。
+    ///
+    /// **固定用 `page_allocator`**：这个表会被连接线程（并发 append）和 keepalive 线程
+    /// 同时访问，而调用方传进来的 allocator 可能是 arena（无锁、不可并发）—— 那时候
+    /// 会以极难定位的方式崩掉。keepalive 是服务端基础设施，用系统分配器最稳。
     conns: std.ArrayListUnmanaged(*h2.Connection) = .empty,
     conns_lock: h2.SpinLock = .{},
     /// keepalive 线程的停止标志（`spawnKeepalive` 用）
     keepalive_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
-    /// 登记连接/线程用的分配器（`spawnKeepalive` 设置；未设置时退回 page_allocator）
-    outer_ctx_alloc: ?std.mem.Allocator = null,
+    /// 因「连接正忙」而跳过的 PING 次数（聚合计数）。
+    ///
+    /// 有意**不逐次打日志**：10ms 一轮心跳时每轮都可能跳过上百个连接，
+    /// 逐次输出会把日志自身变成性能瓶颈（也把真正有价值的错误冲掉）。
+    pings_skipped: u64 = 0,
+    /// PING 写失败的次数（通常是连接刚关闭、`unregisterConn` 还没跑）。同样只计数不报日志。
+    pings_failed: u64 = 0,
 
     pub fn context(self: *Server) *anyopaque {
         return @ptrCast(self);
@@ -637,7 +646,7 @@ pub const Server = struct {
     fn registerConn(self: *Server, c: *h2.Connection) void {
         self.conns_lock.lock();
         defer self.conns_lock.unlock();
-        self.conns.append(self.outer_ctx_alloc orelse std.heap.page_allocator, c) catch |e| {
+        self.conns.append(std.heap.page_allocator, c) catch |e| {
             std.debug.print("[zgrpc.server] 登记连接失败（keepalive 对该连接不可用）：{s}\n", .{@errorName(e)});
         };
     }
@@ -653,29 +662,40 @@ pub const Server = struct {
         }
     }
 
-    /// 向所有活跃连接发一次 PING（keepalive 的核心动作）。
+    /// 向所有活跃连接发一次 PING（keepalive 的核心动作）。返回**实际发出**的条数。
+    ///
+    /// 关键点：对正忙（写锁被占）的连接**跳过**而不是排队等 ——
+    /// 1. 正在传数据本身已经保活了，不需要 PING；
+    /// 2. 若在这里阻塞，一个慢连接（TCP 背压）就会拖住整轮，
+    ///    而且一直持有 `conns_lock` 会让新连接登记不进来（高并发下是致命的）。
     ///
     /// 不主动断开无响应的连接 —— 那属于传输层/上层策略，这里只保证「链路上有流量」。
     pub fn pingAll(self: *Server) usize {
         self.conns_lock.lock();
         defer self.conns_lock.unlock();
         var sent: usize = 0;
+        var skipped: usize = 0;
+        var failed: usize = 0;
         for (self.conns.items) |c| {
-            c.sendPing(null) catch |e| {
-                std.debug.print("[zgrpc.server] keepalive PING 发送失败（连接可能刚关闭）：{s}\n", .{@errorName(e)});
+            // 写失败通常是「连接刚关闭、还没 unregister」，属于正常竞态：
+            // 这里只计数（见 `pings_failed`），不逐次打印 —— 10ms 心跳下会刷屏。
+            const wrote = c.trySendPing(null) catch {
+                failed += 1;
                 continue;
             };
-            sent += 1;
+            if (wrote) sent += 1 else skipped += 1;
         }
+        self.pings_failed +|= failed;
+        if (skipped > 0) self.pings_skipped +|= skipped;
         return sent;
     }
 
     /// 起一个后台线程，每 `keepalive_interval_ms` 调一次 `pingAll()`。
     ///
-    /// **生命周期要求**：`Server` 必须比该线程活得久（`deinitKeepalive()` 会置停止标志并 join）。
-    pub fn spawnKeepalive(self: *Server, allocator: std.mem.Allocator) !std.Thread {
+    /// **生命周期要求**：`Server` 必须比该线程活得久 —— 退出前先 `stopKeepalive()`
+    /// 再 join，最后才 `deinit()`。
+    pub fn spawnKeepalive(self: *Server) !std.Thread {
         const interval_ms = self.keepalive_interval_ms orelse return error.KeepaliveDisabled;
-        self.outer_ctx_alloc = allocator;
         self.keepalive_stop.store(false, .release);
         return std.Thread.spawn(.{ .stack_size = conn_stack_size }, keepaliveLoop, .{ self, interval_ms });
     }
@@ -683,6 +703,18 @@ pub const Server = struct {
     /// 让 keepalive 线程退出并等待它结束（join 由调用方用返回的句柄完成）。
     pub fn stopKeepalive(self: *Server) void {
         self.keepalive_stop.store(true, .release);
+    }
+
+    /// 释放服务端内部状态（`conns` 表）。
+    ///
+    /// 调用时机：**keepalive 已停止、所有连接线程已结束**。
+    /// 重复调用是安全的（表会被清空）。
+    pub fn deinit(self: *Server) void {
+        self.stopKeepalive();
+        self.conns_lock.lock();
+        defer self.conns_lock.unlock();
+        self.conns.deinit(std.heap.page_allocator);
+        self.conns = .empty;
     }
 
     fn keepaliveLoop(self: *Server, interval_ms: u32) void {
@@ -1358,6 +1390,34 @@ fn echoHandler2(ctx: *anyopaque, call: *Call, arena: std.mem.Allocator) anyerror
         return;
     };
     try call.sendMessage(msg.payload);
+}
+
+test "grpc：Server.deinit 可重入，pingAll 无连接时返 0（不依赖用户 allocator）" {
+    var dummy: u8 = 0;
+    var server = Server{ .routes = &.{}, .outer_ctx = &dummy };
+
+    // 无连接时 pingAll 不应该报错或阻塞
+    try testing.expectEqual(@as(usize, 0), server.pingAll());
+    try testing.expectEqual(@as(usize, 0), server.connCount());
+
+    // 登记后卸载：conns 由 page_allocator 管理，不依赖调用方传的 allocator
+    var r = std.Io.Reader.fixed("");
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+    var conn = h2.Connection.init(testing.allocator, &r, &aw.writer, .{});
+    defer conn.deinit();
+
+    server.registerConn(&conn);
+    try testing.expectEqual(@as(usize, 1), server.connCount());
+    // 空闲连接应能收到 PING
+    try testing.expectEqual(@as(usize, 1), server.pingAll());
+    server.unregisterConn(&conn);
+    try testing.expectEqual(@as(usize, 0), server.connCount());
+
+    // 重复 deinit 安全（表已空）
+    server.deinit();
+    server.deinit();
+    try testing.expectEqual(@as(usize, 0), server.connCount());
 }
 
 test "grpc：压缩请求自动解压 + 大响应按 grpc-accept-encoding 压缩" {

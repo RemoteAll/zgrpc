@@ -111,6 +111,8 @@ pub const Client = struct {
     /// 下一个可用流 id（客户端发起的流必须是奇数）
     next_stream_id: u32 = 1,
     started: bool = false,
+    /// 对端 `SETTINGS_MAX_FRAME_SIZE`（收到 SETTINGS 后更新；发送侧分片按它切）
+    peer_max_frame_size: usize = h2.default_max_frame_size,
     /// 本地超时所需的 socket（`enableTimeout` 提供）
     timeout_stream: ?std.Io.net.Stream = null,
     timeout_io: ?std.Io = null,
@@ -224,7 +226,10 @@ pub const Client = struct {
                     else => |other| return other,
                 };
             } else {
-                if (remain) |ms| socket_timeout.setRecvTimeout(io, stream, ms) catch {};
+                if (remain) |ms| socket_timeout.setRecvTimeout(io, stream, ms) catch |e| {
+                    // 不能静默吞：设不上超时会让本次调用失去时限保护（可能永远阻塞）
+                    std.debug.print("[zgrpc.client] 设置接收超时失败（{d}ms）：{s} —— 本次调用可能无法按时中断\n", .{ ms, @errorName(e) });
+                };
                 var datas = [1][]u8{slice};
                 got = stream.read(io, &datas) catch |e| {
                     if (socket_timeout.isReadTimeout(e)) return error.Timeout;
@@ -377,7 +382,7 @@ pub const Client = struct {
                 try grpc.encodeBase64Padded(arena, body.items)
             else
                 body.items;
-            try writeFrame(self.writer, .data, h2.Flags.end_stream, r.stream_id, data);
+            try self.writeData(r.stream_id, data, true);
         }
         try self.writer.flush();
 
@@ -398,6 +403,7 @@ pub const Client = struct {
             switch (hdr.ftype) {
                 .settings => {
                     if (hdr.flags & h2.Flags.ack == 0) {
+                        self.applySettings(payload);
                         try writeFrame(self.writer, .settings, h2.Flags.ack, 0, &.{});
                         try self.writer.flush();
                     }
@@ -506,17 +512,16 @@ pub const Client = struct {
 
         try self.writeHeaders(sid, method, self.opts.timeout_ms, &.{}, arena);
         if (messages.len == 0) {
-            try writeFrame(self.writer, .data, h2.Flags.end_stream, sid, &.{});
+            try self.writeData(sid, &.{}, true);
         } else {
             for (messages, 0..) |m, i| {
                 var body: std.ArrayListUnmanaged(u8) = .empty;
                 try grpc.encodeMessage(&body, arena, m);
-                const flags: u8 = if (i + 1 == messages.len) h2.Flags.end_stream else 0;
                 const data = if (self.opts.content_type == .grpc_web_text)
                     try grpc.encodeBase64Padded(arena, body.items)
                 else
                     body.items;
-                try writeFrame(self.writer, .data, flags, sid, data);
+                try self.writeData(sid, data, i + 1 == messages.len);
             }
         }
         try self.writer.flush();
@@ -541,6 +546,7 @@ pub const Client = struct {
             switch (hdr.ftype) {
                 .settings => {
                     if (hdr.flags & h2.Flags.ack == 0) {
+                        self.applySettings(payload);
                         try writeFrame(self.writer, .settings, h2.Flags.ack, 0, &.{});
                         try self.writer.flush();
                     }
@@ -626,7 +632,70 @@ pub const Client = struct {
         // 自定义请求 metadata 放在 Call-Definition 之后（规范：Call-Definition 在前）
         try hs.appendSlice(arena, metadata);
         try hpack.encode(hs.items, &block, arena);
-        try writeFrame(self.writer, .headers, h2.Flags.end_headers, stream_id, block.items);
+        try self.writeHeaderBlock(stream_id, block.items, 0);
+    }
+
+    /// 发送 header block，超帧长时拆为 `HEADERS + CONTINUATION…`（RFC 9113 §6.10）。
+    ///
+    /// 客户端是单线程顺序发送，中间不会插其它帧，所以不需要额外加锁；
+    /// 关键是 `END_HEADERS` 只能出现在末帧，`END_STREAM` 只能出现在首帧。
+    fn writeHeaderBlock(self: *Client, stream_id: u32, block: []const u8, extra_flags: u8) !void {
+        const max = self.peer_max_frame_size;
+        if (block.len <= max) {
+            try writeFrame(self.writer, .headers, extra_flags | h2.Flags.end_headers, stream_id, block);
+            return;
+        }
+        try writeFrame(self.writer, .headers, extra_flags & h2.Flags.end_stream, stream_id, block[0..max]);
+        var off: usize = max;
+        while (off < block.len) {
+            const n = @min(max, block.len - off);
+            const last = off + n == block.len;
+            try writeFrame(
+                self.writer,
+                .continuation,
+                if (last) h2.Flags.end_headers else 0,
+                stream_id,
+                block[off .. off + n],
+            );
+            off += n;
+        }
+    }
+
+    /// 发 DATA（按对端 `MAX_FRAME_SIZE` 分片，只有末片带 `END_STREAM`）。
+    ///
+    /// 不分片会让超过 16 KiB 的消息变成超限帧，真实 gRPC 服务端（tonic / nghttp2）
+    /// 会直接报 FRAME_SIZE_ERROR 并断连 —— 我们自己的服务端容忍，所以自测发现不了。
+    fn writeData(self: *Client, stream_id: u32, payload: []const u8, end_stream: bool) !void {
+        const max = self.peer_max_frame_size;
+        if (payload.len == 0) {
+            if (end_stream) try writeFrame(self.writer, .data, h2.Flags.end_stream, stream_id, &.{});
+            return;
+        }
+        var off: usize = 0;
+        while (off < payload.len) {
+            const n = @min(max, payload.len - off);
+            const last = off + n == payload.len;
+            try writeFrame(
+                self.writer,
+                .data,
+                if (last and end_stream) h2.Flags.end_stream else 0,
+                stream_id,
+                payload[off .. off + n],
+            );
+            off += n;
+        }
+    }
+
+    /// 解析对端 SETTINGS（目前只关心 `MAX_FRAME_SIZE`）：不解析就会一直用默认 16384。
+    fn applySettings(self: *Client, payload: []const u8) void {
+        var i: usize = 0;
+        while (i + 6 <= payload.len) : (i += 6) {
+            const id = std.mem.readInt(u16, payload[i..][0..2], .big);
+            const val = std.mem.readInt(u32, payload[i + 2 ..][0..4], .big);
+            if (id == 0x0005 and val >= h2.default_max_frame_size and val <= 16_777_215) {
+                self.peer_max_frame_size = val;
+            }
+        }
     }
 
     fn refundWindow(self: *Client, stream_id: u32, amount: usize) !void {
@@ -927,4 +996,78 @@ test "client：grpc-web-text 往返（请求 base64 发出、状态取自 body �
         try testing.expectEqualStrings("ping", raw[5..]);
     }
     try testing.expect(found);
+}
+
+
+test "client：大消息按 MAX_FRAME_SIZE 分片（不分片会让真实 gRPC 服务端 FRAME_SIZE_ERROR）" {
+    var r = std.Io.Reader.fixed("");
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var c = Client.init(testing.allocator, &r, &aw.writer, .{});
+
+    const big = try testing.allocator.alloc(u8, 40000);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @intCast(i % 251);
+
+    try c.writeData(1, big, true);
+
+    const data = aw.written();
+    var off: usize = 0;
+    var frames: usize = 0;
+    var end_stream_frames: usize = 0;
+    var reassembled: std.ArrayListUnmanaged(u8) = .empty;
+    defer reassembled.deinit(testing.allocator);
+
+    while (off + 9 <= data.len) {
+        const len = (@as(usize, data[off]) << 16) | (@as(usize, data[off + 1]) << 8) | @as(usize, data[off + 2]);
+        const ftype: u8 = data[off + 3];
+        const flags: u8 = data[off + 4];
+        // 关键：任何一帧都不得超过对端 MAX_FRAME_SIZE（默认 16384）
+        try testing.expect(len <= 16384);
+        try testing.expectEqual(@as(u8, 0x0), ftype); // DATA
+        if (flags & h2.Flags.end_stream != 0) end_stream_frames += 1;
+        try reassembled.appendSlice(testing.allocator, data[off + 9 .. off + 9 + len]);
+        off += 9 + len;
+        frames += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), frames); // 16384 + 16384 + 7232
+    try testing.expectEqual(@as(usize, 1), end_stream_frames); // END_STREAM 只能出现一次（末帧）
+    try testing.expectEqualStrings(big, reassembled.items);
+}
+
+test "client：header block 超过帧长拆成 HEADERS + CONTINUATION，END_HEADERS 只在末帧" {
+    var r = std.Io.Reader.fixed("");
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var c = Client.init(testing.allocator, &r, &aw.writer, .{});
+
+    const block = try testing.allocator.alloc(u8, 40000);
+    defer testing.allocator.free(block);
+    @memset(block, 'x');
+
+    try c.writeHeaderBlock(1, block, 0);
+
+    const data = aw.written();
+    var off: usize = 0;
+    var types: [8]u8 = undefined;
+    var flags: [8]u8 = undefined;
+    var n: usize = 0;
+    while (off + 9 <= data.len and n < types.len) {
+        const len = (@as(usize, data[off]) << 16) | (@as(usize, data[off + 1]) << 8) | @as(usize, data[off + 2]);
+        types[n] = data[off + 3];
+        flags[n] = data[off + 4];
+        try testing.expect(len <= 16384);
+        off += 9 + len;
+        n += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqual(@as(u8, 0x1), types[0]); // HEADERS
+    try testing.expectEqual(@as(u8, 0x9), types[1]); // CONTINUATION
+    try testing.expectEqual(@as(u8, 0x9), types[2]);
+    // 首帧不能带 END_HEADERS（后面还有 CONTINUATION）
+    try testing.expectEqual(@as(u8, 0), flags[0] & h2.Flags.end_headers);
+    // 末帧必须带 END_HEADERS
+    try testing.expect(flags[2] & h2.Flags.end_headers != 0);
 }
