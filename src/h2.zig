@@ -153,6 +153,10 @@ pub const Responder = struct {
     pub fn sendData(self: *Responder, bytes: []const u8) !void {
         if (!self.begun) try self.begin("200", &.{});
         if (self.ended) return error.AlreadyEnded;
+        // 并发写路径：不阻塞读，窗口不足挂 pending（详见 `sendStreamData`）
+        if (self.conn.concurrent_write) {
+            return self.conn.sendStreamData(self.stream, bytes, false);
+        }
 
         var off: usize = 0;
         while (off < bytes.len) {
@@ -179,6 +183,11 @@ pub const Responder = struct {
         const a = self.stream.allocator();
         var block: std.ArrayListUnmanaged(u8) = .empty;
         try hpack.encode(trailers, &block, a);
+        if (self.conn.concurrent_write) {
+            try self.conn.finishStream(self.stream, block.items);
+            self.ended = true;
+            return;
+        }
         try self.conn.writeHeaderBlock(self.stream.id, block.items, Flags.end_stream);
         self.ended = true;
     }
@@ -187,6 +196,11 @@ pub const Responder = struct {
     pub fn endData(self: *Responder, bytes: []const u8) !void {
         if (self.ended) return error.AlreadyEnded;
         if (!self.begun) try self.begin("200", &.{});
+        if (self.conn.concurrent_write) {
+            try self.conn.sendStreamData(self.stream, bytes, true);
+            self.ended = true;
+            return;
+        }
         if (bytes.len == 0) {
             try self.conn.writeFrame(.data, Flags.end_stream, self.stream.id, &.{});
             self.ended = true;
@@ -256,6 +270,15 @@ pub const StreamState = struct {
     rsp: ?*Responder = null,
     /// 业务挂载点（流式模式：gRPC 的 Call）
     user_data: ?*anyopaque = null,
+
+    // --- 并发写模式（`Connection.concurrent_write`）专用 ---
+    /// 窗口不足时暂存的待发正文。**只有该流自己的任务会 append**，
+    /// 由连接任务在收到 `WINDOW_UPDATE` 时 drain —— 两侧都在写锁内操作。
+    pending_out: std.ArrayListUnmanaged(u8) = .empty,
+    /// `pending_out` 排空后是否要带 `END_STREAM`
+    pending_end: bool = false,
+    /// 编码好的 trailers header block（arena 持有），等 `pending_out` 排空后再发
+    pending_trailers: ?[]const u8 = null,
 
     pub fn allocator(self: *StreamState) std.mem.Allocator {
         return self.arena.allocator();
@@ -331,6 +354,13 @@ pub const Connection = struct {
     ///
     /// 原先每帧 `alloc`+`free`，一个 unary 请求 2 帧就是 4 次分配器调用。
     frame_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// 允许从**非连接任务**并发写响应（每流一个 handler 任务时必需）。
+    ///
+    /// 开启后 `Responder.sendData` / `end` / `endData` 走
+    /// 「写锁内写帧 + 窗口不足挂到 per-stream pending」这条路径，
+    /// **不再调用会阻塞读的 `pumpForWindow`**（只有连接任务能读 socket）。
+    /// 关闭时行为与之前完全一致（阻塞式，吞吐更好）。
+    concurrent_write: bool = false,
 
     serve_ctx: ?*anyopaque = null,
     serve_handler: ?HandlerFn = null,
@@ -422,6 +452,9 @@ pub const Connection = struct {
         s.pending_stream_refund = 0;
         s.rsp = null;
         s.user_data = null;
+        s.pending_out = .empty;
+        s.pending_end = false;
+        s.pending_trailers = null;
     }
 
     fn createStream(self: *Connection, id: u32) !*StreamState {
@@ -574,9 +607,23 @@ pub const Connection = struct {
         block: []const u8,
         extra_flags: u8,
     ) !void {
-        const max = self.peer_max_frame_size;
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
+        try self.writeHeaderBlockLocked(stream_id, block, extra_flags, false);
+    }
+
+    /// 同 `writeHeaderBlock`，但**调用者必须已持写锁**。
+    ///
+    /// `ignore_extra = true` 时忽略 `extra_flags`（并发写路径用：END_STREAM 由调用点决定）。
+    fn writeHeaderBlockLocked(
+        self: *Connection,
+        stream_id: u32,
+        block: []const u8,
+        extra_flags: u8,
+        ignore_extra: bool,
+    ) !void {
+        _ = ignore_extra;
+        const max = self.peer_max_frame_size;
 
         if (block.len <= max) {
             try self.writeFrameBody(.headers, extra_flags | Flags.end_headers, stream_id, block);
@@ -650,6 +697,119 @@ pub const Connection = struct {
         }
         self.frame_buf.items.len = need;
         return self.frame_buf.items[0..need];
+    }
+
+    // -----------------------------------------------------------------------
+    // 并发写路径（`concurrent_write`）：可被任意任务调用
+    // -----------------------------------------------------------------------
+
+    /// 写一个流的响应正文，可被**任意任务**并发调用。
+    ///
+    /// 与旧的阻塞路径的区别：
+    /// - 窗口检查、扣减、写帧**全在同一把写锁内**完成（否则多任务会算错窗口）；
+    /// - 窗口不足时**不阻塞读**，把剩余字节挂到 `s.pending_out`，
+    ///   等连接任务收到 `WINDOW_UPDATE` 时 `drainStreamPending` 续发。
+    pub fn sendStreamData(
+        self: *Connection,
+        s: *StreamState,
+        bytes: []const u8,
+        end_stream: bool,
+    ) !void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        try self.writeStreamDataLocked(s, bytes, end_stream);
+    }
+
+    /// 调用者**必须已持有** `write_mutex`。
+    fn writeStreamDataLocked(
+        self: *Connection,
+        s: *StreamState,
+        bytes: []const u8,
+        end_stream: bool,
+    ) !void {
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const room = @min(self.send_window, s.send_window);
+            if (room <= 0) break;
+            const want: usize = @intCast(@min(
+                @as(i64, @intCast(@min(bytes.len - off, self.peer_max_frame_size))),
+                room,
+            ));
+            const last = off + want == bytes.len;
+            try self.writeFrameBody(
+                .data,
+                if (last and end_stream) Flags.end_stream else 0,
+                s.id,
+                bytes[off .. off + want],
+            );
+            self.send_window -= @as(i64, @intCast(want));
+            s.send_window -= @as(i64, @intCast(want));
+            off += want;
+        }
+        if (off < bytes.len) {
+            // 窗口不足：挂起剩余部分（这块内存属于该流自己的 arena，不跨流共享）
+            if (s.pending_out.items.len + (bytes.len - off) > self.opts.max_body) {
+                return error.ResponseTooLarge;
+            }
+            try s.pending_out.appendSlice(s.allocator(), bytes[off..]);
+            if (end_stream) s.pending_end = true;
+        }
+    }
+
+    /// 结束一个流的响应：写 trailers header block，可被任意任务并发调用。
+    ///
+    /// 若该流还有挂起的正文（`pending_out` 非空），把 trailers 也挂起来，
+    /// 等正文排空后再由连接任务发（顺序不能乱）。
+    pub fn finishStream(self: *Connection, s: *StreamState, trailers_block: []const u8) !void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        if (s.pending_out.items.len > 0) {
+            s.pending_trailers = trailers_block;
+            return;
+        }
+        try self.writeHeaderBlockLocked(s.id, trailers_block, Flags.end_stream, true);
+    }
+
+    /// 把某条流挂起的正文/trailers 尽量发出去（**只由连接任务调用**）。
+    pub fn drainStreamPending(self: *Connection, s: *StreamState) !void {
+        if (s.pending_out.items.len == 0 and s.pending_trailers == null) return;
+
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+
+        if (s.pending_out.items.len > 0) {
+            const buf = s.pending_out.items;
+            var off: usize = 0;
+            while (off < buf.len) {
+                const room = @min(self.send_window, s.send_window);
+                if (room <= 0) break;
+                const want: usize = @intCast(@min(
+                    @as(i64, @intCast(@min(buf.len - off, self.peer_max_frame_size))),
+                    room,
+                ));
+                const last = off + want == buf.len;
+                try self.writeFrameBody(
+                    .data,
+                    if (last and s.pending_end) Flags.end_stream else 0,
+                    s.id,
+                    buf[off .. off + want],
+                );
+                self.send_window -= @as(i64, @intCast(want));
+                s.send_window -= @as(i64, @intCast(want));
+                off += want;
+            }
+            if (off > 0) {
+                const rest = buf.len - off;
+                std.mem.copyForwards(u8, s.pending_out.items[0..rest], s.pending_out.items[off..]);
+                s.pending_out.shrinkRetainingCapacity(rest);
+            }
+            if (s.pending_out.items.len > 0) return; // 窗口还是不够，等下一次 WINDOW_UPDATE
+        }
+
+        if (s.pending_trailers) |block| {
+            s.pending_trailers = null;
+            try self.writeHeaderBlockLocked(s.id, block, Flags.end_stream, true);
+        }
     }
 
     /// 若下一次读**必须真正走 socket**，则先把挂起的输出刷出去。
@@ -821,8 +981,19 @@ pub const Connection = struct {
         const inc: i64 = @intCast(std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff);
         if (hdr.stream_id == 0) {
             self.send_window += inc;
+            // 连接级窗口回补了：把所有还有积压的流都推一把
+            for (self.streams.items) |s| {
+                if (s.pending_out.items.len > 0 or s.pending_trailers != null) {
+                    self.drainStreamPending(s) catch |e| {
+                        log.h2.warn("续发挂起数据失败（流 {d}）：{s}", .{ s.id, @errorName(e) });
+                    };
+                }
+            }
         } else if (self.findStream(hdr.stream_id)) |s| {
             s.send_window += inc;
+            self.drainStreamPending(s) catch |e| {
+                log.h2.warn("续发挂起数据失败（流 {d}）：{s}", .{ s.id, @errorName(e) });
+            };
         }
     }
 
@@ -1773,4 +1944,90 @@ test "h2：流对象复用 —— 串行 N 个请求不会攒下 N 个流对象"
     try testing.expectEqual(@as(usize, 0), conn.activeStreams());
     // 3 个请求串行完成：池里最多 1 个对象（反复复用），绝不是 3 个
     try testing.expect(conn.spare.items.len <= 1);
+}
+
+// 并发写路径（为「每流一个 handler 任务」准备的地基）。
+//
+// 关键契约：窗口不足时**不阻塞读**（只有连接任务能读 socket），
+// 而是把剩余字节挂到该流的 pending_out，等 WINDOW_UPDATE 由连接任务续发。
+test "h2 concurrent write: pending data drains after window update" {
+    var r = std.Io.Reader.fixed("");
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var conn = Connection.init(testing.allocator, &r, &aw.writer, .{});
+    defer conn.deinit();
+    conn.concurrent_write = true;
+
+    const s = try conn.createStream(1);
+    // 模拟「对端还没回补窗口」
+    conn.send_window = 0;
+    s.send_window = 0;
+
+    try conn.sendStreamData(s, "hello", true);
+    try testing.expectEqual(@as(usize, 0), aw.written().len); // 一个字节都没发
+    try testing.expectEqual(@as(usize, 5), s.pending_out.items.len);
+
+    // 窗口回补 → 续发，且最后一帧带 END_STREAM
+    conn.send_window = 1024;
+    s.send_window = 1024;
+    try conn.drainStreamPending(s);
+
+    try testing.expectEqual(@as(usize, 0), s.pending_out.items.len);
+    var pos: usize = 0;
+    var saw_data = false;
+    while (nextFrame(aw.written(), &pos)) |f| {
+        if (f.ftype != .data) continue;
+        try testing.expectEqualStrings("hello", f.payload);
+        try testing.expect(f.flags & Flags.end_stream != 0);
+        saw_data = true;
+    }
+    try testing.expect(saw_data);
+}
+
+test "h2 concurrent write: trailers deferred behind pending body" {
+    var r = std.Io.Reader.fixed("");
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    var conn = Connection.init(testing.allocator, &r, &aw.writer, .{});
+    defer conn.deinit();
+    conn.concurrent_write = true;
+
+    const s = try conn.createStream(1);
+    conn.send_window = 0;
+    s.send_window = 0;
+
+    try conn.sendStreamData(s, "abc", false);
+    // 还有正文挂起时收尾：trailers 不能抢先发（顺序会乱）
+    const trailers_block = [_]u8{ 0x00, 0x00 };
+    try conn.finishStream(s, &trailers_block);
+    try testing.expect(s.pending_trailers != null);
+    try testing.expectEqual(@as(usize, 0), aw.written().len);
+
+    conn.send_window = 1024;
+    s.send_window = 1024;
+    try conn.drainStreamPending(s);
+
+    // 期望顺序：DATA(abc) 然后 HEADERS(END_STREAM)
+    var pos: usize = 0;
+    var first_data = false;
+    var headers_after = false;
+    while (nextFrame(aw.written(), &pos)) |f| {
+        switch (f.ftype) {
+            .data => {
+                try testing.expectEqualStrings("abc", f.payload);
+                first_data = true;
+            },
+            .headers => {
+                try testing.expect(first_data); // 必须在 DATA 之后
+                try testing.expect(f.flags & Flags.end_stream != 0);
+                headers_after = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(first_data);
+    try testing.expect(headers_after);
+    try testing.expect(s.pending_trailers == null);
 }
