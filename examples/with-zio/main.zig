@@ -1,4 +1,4 @@
-//! 把 zgrpc 的 `std.Io` 换成 **zio 运行时**，验证「零依赖库 + 可选异步后端」这条路。
+﻿//! 把 zgrpc 的 `std.Io` 换成 **zio 运行时**，验证「零依赖库 + 可选异步后端」这条路。
 //!
 //! zio 本身就是事件驱动的：`src/ev/` 是 libuv 风格的回调事件循环，后端
 //! Windows → **IOCP**、Linux → io_uring（自动退 epoll）、macOS/BSD → kqueue。
@@ -8,7 +8,7 @@
 //! 用法：
 //!   zig build run -- 3000 4                 # 自压测：4 条连接 × 3000 次
 //!   zig build run -- serve 18058            # 只起服务端（默认缓冲）
-//!   zig build run -- serve 18058 4 4        # 只起服务端，收发缓冲各 4 KiB（上万连接用）
+//!   zig build run -- serve 18058 4 4 16     # 缓冲 4K/4K，协程栈初始提交 16 KiB
 
 const std = @import("std");
 const zgrpc = @import("zgrpc");
@@ -33,28 +33,27 @@ fn sayHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator)
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
-    // ---------- 换成 zio 运行时 ----------
-    // **栈池必须调小**：zio 默认 `committed_size = 256 KiB`（每个协程初始提交的物理内存），
-    // 一万条连接就是 2.5 GB。而连接协程的栈用量很小（socket 收发缓冲都在堆上），
-    // 所以降到 16 KiB 初始提交，虚拟地址仍保留到 1 MiB，真需要更深时按需增长。
-    // 实测：10000 连接从 1215 MB 降到 ~260 MB。
-    const rt = try zio.Runtime.init(gpa, .{
-        .executors = .auto,
-        .stack_pool = .{
-            .maximum_size = 1024 * 1024,
-            .committed_size = 16 * 1024,
-        },
-    });
-    defer rt.deinit();
-    const io = rt.io();
-
     // ---------- 参数 ----------
     var iterations: usize = 3000;
     var conns: usize = 1;
     var listen_port: u16 = default_port;
-    // 每连接缓冲（KiB）。上万连接时务必调小：这是每连接的固定内存开销。
-    var recv_kb: usize = 32;
-    var send_kb: usize = 16;
+    // 每连接缓冲（KiB）。**每连接的固定内存开销**，也是「一次 read 能拿回多少请求帧」的上限。
+    //   - 上万连接：4 KiB / 4 KiB（实测 10000 连接整进程仅 132 MB）
+    //   - 追求单连接吞吐：32 KiB / 16 KiB（一次能读完整批 64 路并发请求，批量写更划算）
+    var recv_kb: usize = 4;
+    var send_kb: usize = 4;
+    // 协程栈的**初始提交**大小（KiB）。zio 默认 256 KiB —— 一万协程就是 2.5 GB。
+    var stack_kb: usize = 4;
+    // 协程栈的**保留上限**（KiB）。
+    //
+    // 这才是 Windows 上真正决定"每连接吃多少内存"的参数（实测 5000 连接，4 KiB 初始提交）：
+    //   maximum_size = 1 MiB   → 614 MB（≈122 KB/连接）
+    //   maximum_size = 256 KiB → 612 MB（≈122 KB/连接）
+    //   maximum_size = 128 KiB → 612 MB（≈122 KB/连接）
+    //   maximum_size = 64 KiB  → **92 MB（≈18 KB/连接）**
+    // 也就是说 ≥128 KiB 时 Windows 侧的栈映射会按大粒度提交，翻到 64 KiB 才真正省下来。
+    // 库自身在服务端的调用栈很浅（几 KB），64 KiB 足够；handler 里不要开大栈数组。
+    var stack_max_kb: usize = 64;
     var serve_only = false;
     {
         var it = std.process.Args.Iterator.initAllocator(init.minimal.args, gpa) catch return;
@@ -78,13 +77,34 @@ pub fn main(init: std.process.Init) !void {
                 recv_kb = std.fmt.parseInt(usize, a, 10) catch recv_kb;
             } else if (idx == 3) {
                 send_kb = std.fmt.parseInt(usize, a, 10) catch send_kb;
+            } else if (idx == 4) {
+                stack_kb = std.fmt.parseInt(usize, a, 10) catch stack_kb;
+            } else if (idx == 5) {
+                stack_max_kb = std.fmt.parseInt(usize, a, 10) catch stack_max_kb;
             }
         }
     }
     if (conns == 0) conns = 1;
     if (conns > 64) conns = 64;
-    if (recv_kb == 0) recv_kb = 32;
-    if (send_kb == 0) send_kb = 16;
+    if (recv_kb == 0) recv_kb = 4;
+    if (send_kb == 0) send_kb = 4;
+    if (stack_kb == 0) stack_kb = 4;
+    if (stack_max_kb == 0) stack_max_kb = 256;
+
+    // ---------- 换成 zio 运行时 ----------
+    // **栈池必须调小**：zio 默认 `committed_size = 256 KiB`（每个协程初始提交的物理内存），
+    // 一万条连接就是 2.5 GB。而连接协程的栈用量很小（socket 收发缓冲都在堆上），
+    // 所以降到 16 KiB 初始提交，虚拟地址仍保留到 1 MiB，真需要更深时按需增长。
+    // 实测：10000 连接从 1215 MB 降到 ~750 MB（Windows 走 RtlCreateUserStack，提交粒度偏大）。
+    const rt = try zio.Runtime.init(gpa, .{
+        .executors = .auto,
+        .stack_pool = .{
+            .maximum_size = stack_max_kb * 1024,
+            .committed_size = stack_kb * 1024,
+        },
+    });
+    defer rt.deinit();
+    const io = rt.io();
 
     // ---------- 服务端 ----------
     var dummy: u8 = 0;
@@ -116,8 +136,8 @@ pub fn main(init: std.process.Init) !void {
     // ---------- 只起服务端：给外部压测工具用 ----------
     if (serve_only) {
         std.debug.print(
-            "zio(IOCP) server on 127.0.0.1:{d}  dispatch=task  buf={d}K/{d}K\n",
-            .{ listen_port, recv_kb, send_kb },
+            "zio(IOCP) server on 127.0.0.1:{d}  dispatch=task  buf={d}K/{d}K stack={d}K/{d}K\n",
+            .{ listen_port, recv_kb, send_kb, stack_kb, stack_max_kb },
         );
         srv_group.await(io) catch {};
         return;
