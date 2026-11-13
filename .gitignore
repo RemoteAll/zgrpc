@@ -29,3 +29,4 @@ bench_pair/*.log.commitmsg
 *.txt
 .cm2
 .cm3
+.cm4
