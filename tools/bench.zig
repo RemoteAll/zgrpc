@@ -62,6 +62,8 @@ const Args = struct {
     pool: bool = false,
     /// 线程池 worker 上限
     pool_max: usize = 256,
+    /// 强制开启服务端连接登记（默认已关闭；用于量化登记开销）
+    track_conns: bool = false,
 };
 
 fn parseArgs(init: std.process.Init) Args {
@@ -88,6 +90,8 @@ fn parseArgs(init: std.process.Init) Args {
             a.pool = true;
         } else if (std.mem.eql(u8, arg, "--pool-max")) {
             if (it.next()) |v| a.pool_max = std.fmt.parseInt(usize, v, 10) catch a.pool_max;
+        } else if (std.mem.eql(u8, arg, "--track-conns")) {
+            a.track_conns = true;
         }
     }
     if (a.iterations == 0) a.iterations = 1;
@@ -109,6 +113,12 @@ pub fn main(init: std.process.Init) !void {
         .{ .path = "/echo.Echo/Say", .handler = sayHandler },
     };
     var server = zgrpc.grpc.Server{ .routes = &routes, .outer_ctx = &dummy };
+
+    // 连接登记默认关闭（每连接一次自旋锁 + append + 线性扫描）；`--track-conns` 强制打开用于对比
+    if (cfg.track_conns) {
+        server.track_conns = true;
+        std.debug.print("[bench] 服务端连接登记：开启\n", .{});
+    }
 
     // 服务端连接调度：默认每连接一线程；`--pool` 改为弹性线程池（短任务场景）
     if (cfg.pool) {
