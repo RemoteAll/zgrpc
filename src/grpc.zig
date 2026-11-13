@@ -2158,3 +2158,57 @@ test "grpc：dispatch=task 把连接交给运行时任务组，并能优雅收�
     server.task_group.await(io) catch {};
     try testing.expectEqual(@as(usize, 0), server.connCount());
 }
+
+// 多连接并发回归：64 条连接同时在线，每个都作为独立运行时任务跑，断开后能全部收尾。
+//
+// 这条用例锁住「连接数增长不会退化成串行」以及「任务组不会泄漏」，
+// 是万连接能力的最小可回归代理（CI 里不可能真的开一万条）。
+test "grpc：dispatch=task 支持多连接并发且全部优雅收尾" {
+    const n_conns = 64;
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var dummy: u8 = 0;
+    var routes = [_]Route{.{ .path = "/t/Echo", .handler = echoHandler2 }};
+    var server = Server{
+        .routes = &routes,
+        .outer_ctx = &dummy,
+        .dispatch = .task,
+        .track_conns = true,
+    };
+
+    var listener: std.Io.net.Server = undefined;
+    var port: u16 = 0;
+    var probe: u16 = 18931;
+    while (probe < 18936) : (probe += 1) {
+        const a = std.Io.net.IpAddress.parse("127.0.0.1", probe) catch continue;
+        listener = a.listen(io, .{ .reuse_address = true }) catch continue;
+        port = probe;
+        break;
+    }
+    defer listener.deinit(io);
+    try testing.expect(port != 0);
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+
+    // 先把 64 条连接都建好（内核排队），再逐个 accept + 派发
+    var clients: [n_conns]std.Io.net.Stream = undefined;
+    for (&clients) |*c| c.* = try addr.connect(io, .{ .mode = .stream });
+    var servers: [n_conns]std.Io.net.Stream = undefined;
+    for (&servers) |*s| s.* = try listener.accept(io);
+    for (servers) |s| server.dispatchStream(io, testing.allocator, s);
+
+    // 64 个任务都跑起来（最多等 2 秒）
+    var waited: usize = 0;
+    while (server.connCount() < n_conns and waited < 400) : (waited += 1) {
+        std.Io.sleep(io, .{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    try testing.expectEqual(@as(usize, n_conns), server.connCount());
+
+    // 全部断开 → 所有连接任务结束
+    for (clients) |c| c.close(io);
+    server.task_group.await(io) catch {};
+    try testing.expectEqual(@as(usize, 0), server.connCount());
+}

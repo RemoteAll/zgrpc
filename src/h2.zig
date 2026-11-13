@@ -327,6 +327,10 @@ pub const Connection = struct {
     /// 取 4 KiB：远小于默认 16 KiB 发送缓冲，正常一批响应（~210 字节/条）约 20 条刷一次，
     /// 既拿到批量写，又不会让响应在缓冲里久留。
     flush_high_water: usize = 4 * 1024,
+    /// 帧载荷复用缓冲（只增不减，`deinit` 释放）。
+    ///
+    /// 原先每帧 `alloc`+`free`，一个 unary 请求 2 帧就是 4 次分配器调用。
+    frame_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     serve_ctx: ?*anyopaque = null,
     serve_handler: ?HandlerFn = null,
@@ -369,6 +373,7 @@ pub const Connection = struct {
         self.spare.deinit(self.alloc);
         for (self.pending.items) |pf| self.alloc.free(pf.payload);
         self.pending.deinit(self.alloc);
+        self.frame_buf.deinit(self.alloc);
         self.decoder.deinit();
     }
 
@@ -509,15 +514,15 @@ pub const Connection = struct {
             // 帧体也可能不在缓冲里：读它之前同样要刷
             try self.flushForRead(hdr.length);
 
-            const payload = try self.alloc.alloc(u8, hdr.length);
+            // 复用帧载荷缓冲：原先每帧一次 `alloc`+`free`，一个 unary 请求就是 2 帧
+            // （HEADERS + DATA）＝ 4 次分配器调用；压成每连接一块只增不减的缓冲。
+            const payload = try self.framePayload(hdr.length);
             self.reader.readSliceAll(payload) catch |e| {
-                self.alloc.free(payload);
                 log.h2.warn("读帧体失败（流 {d}，{d} 字节）：{s}", .{
                     hdr.stream_id, hdr.length, @errorName(e),
                 });
                 return error.ConnectionClosed;
             };
-            defer self.alloc.free(payload);
 
             try self.handleFrame(hdr, payload);
             try self.flushIfFull();
@@ -628,6 +633,23 @@ pub const Connection = struct {
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
         try self.writer.flush();
+    }
+
+    /// 取一块能装下 `need` 字节的帧载荷缓冲（**每连接复用**，只增不减）。
+    ///
+    /// 原先 `runLoop` 每帧 `alloc`+`free`：一个 unary 请求 2 帧就是 4 次分配器调用。
+    /// 改成复用后这些分配在连接生命周期内只发生 O(log) 次。
+    ///
+    /// 生命周期约定与之前一致：返回的切片只在本次 `handleFrame` 期间有效
+    /// （需要留存的路径 `pumpForWindow` 会自己复制一份）。
+    fn framePayload(self: *Connection, need: usize) ![]u8 {
+        if (need > self.frame_buf.capacity) {
+            // 按需扩张：至少翻倍，避免大帧之后每次小帧都重新分配
+            const want = @max(need, @max(self.frame_buf.capacity * 2, 1024));
+            try self.frame_buf.ensureTotalCapacity(self.alloc, want);
+        }
+        self.frame_buf.items.len = need;
+        return self.frame_buf.items[0..need];
     }
 
     /// 若下一次读**必须真正走 socket**，则先把挂起的输出刷出去。
