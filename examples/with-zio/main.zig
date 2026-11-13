@@ -27,6 +27,8 @@ const method = "/bench.Bench/Echo";
 var handler_delay_us: u64 = 0;
 /// handler 用 `Call.sleepNs`（可挂起等待）多少微秒（第 8 个位置参数）
 var handler_sleep_us: u64 = 0;
+/// 0 = io_task（协程派发），1 = thread_pool（第 9 个位置参数）
+var job_mode: u32 = 0;
 
 fn sayHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator) anyerror!void {
     _ = ctx;
@@ -101,6 +103,9 @@ pub fn main(init: std.process.Init) !void {
                 handler_delay_us = std.fmt.parseInt(u64, a, 10) catch handler_delay_us;
             } else if (idx == 7) {
                 handler_sleep_us = std.fmt.parseInt(u64, a, 10) catch handler_sleep_us;
+            } else if (idx == 8) {
+                // 0 = 协程派发(ch io_task)，1 = 线程池(thread_pool)；用于同逻辑对拍
+                job_mode = std.fmt.parseInt(u32, a, 10) catch 0;
             }
         }
     }
@@ -136,8 +141,8 @@ pub fn main(init: std.process.Init) !void {
         .outer_ctx = &dummy,
         // 关键：连接作为**运行时任务**跑（事件循环），而不是每条一个 OS 线程
         .dispatch = .task,
-        // 每流任务派发到运行时任务（协程）：不占 OS 线程
-        .job_mode = .io_task,
+        // 每流任务派发：默认运行时任务（协程），arg9 可改成线程池做对拍
+        .job_mode = if (job_mode == 1) .thread_pool else .io_task,
         // 协程下并发流的成本极低，把 SETTINGS 上限抬上去才能真的用起来
         .max_concurrent_streams = 1024,
         .conn_recv_buf_size = recv_kb * 1024,
