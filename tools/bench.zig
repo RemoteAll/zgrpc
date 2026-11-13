@@ -40,12 +40,17 @@ const warmup: usize = 200;
 /// 给 handler 加一个固定延迟后，串行模型下 N 路并发流的总延迟会变成 N × delay，
 /// 而真并发（每流一个任务）则接近 delay。
 var handler_delay_us: u64 = 0;
+/// handler 用 `Call.sleepNs`（可挂起等待）多少微秒；0 = 用忙等
+var handler_sleep_us: u64 = 0;
 
 /// 回显 handler：把请求消息原样发回（衡量协议层开销，不含业务逻辑）。
 fn sayHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator) anyerror!void {
     _ = ctx;
     _ = arena;
-    if (handler_delay_us > 0) {
+    if (handler_sleep_us > 0) {
+        // 可挂起等待：在 io_task（协程）模式下不占线程
+        call.sleepNs(handler_sleep_us * 1000);
+    } else if (handler_delay_us > 0) {
         // 忙等而不是 sleep：要测的就是「handler 占用执行线程」这件事本身
         const until = zgrpc.clock.monotonicNs() + @as(i128, handler_delay_us) * 1000;
         while (zgrpc.clock.monotonicNs() < until) std.atomic.spinLoopHint();
@@ -150,6 +155,10 @@ const Args = struct {
     streams: usize = 0,
     /// 只用 `.task` 调度、不给池（验证默认自动建池）
     task: bool = false,
+    /// 每流任务派发到**运行时任务**（协程）而不是线程池
+    io_task: bool = false,
+    /// 我方声明的 SETTINGS_MAX_CONCURRENT_STREAMS
+    max_streams: usize = 100,
     /// >1：同一连接上并开 N 条流的批量模式（真多路复用，才测得出每流并发）
     batch: usize = 1,
     /// 用户显式给了 `--batch`（`--batch 1` 也要走批量路径，顺序单流照样用它测）
@@ -191,6 +200,12 @@ fn parseArgs(init: std.process.Init) Args {
             if (it.next()) |v| a.streams = std.fmt.parseInt(usize, v, 10) catch a.streams;
         } else if (std.mem.eql(u8, arg, "--task")) {
             a.task = true;
+        } else if (std.mem.eql(u8, arg, "--io-task")) {
+            a.io_task = true;
+        } else if (std.mem.eql(u8, arg, "--max-streams")) {
+            if (it.next()) |v| a.max_streams = std.fmt.parseInt(usize, v, 10) catch a.max_streams;
+        } else if (std.mem.eql(u8, arg, "--handler-sleep-us")) {
+            if (it.next()) |v| handler_sleep_us = std.fmt.parseInt(u64, v, 10) catch handler_sleep_us;
         } else if (std.mem.eql(u8, arg, "--batch")) {
             if (it.next()) |v| a.batch = std.fmt.parseInt(usize, v, 10) catch a.batch;
             a.batch_set = true;
@@ -267,6 +282,15 @@ pub fn main(init: std.process.Init) !void {
         say("[bench] 服务端调度：弹性线程池（max={d}）\n", .{cfg.pool_max});
     } else {
         say("[bench] 服务端调度：每连接一线程\n", .{});
+    }
+    // 每流任务派发方式：`--io-task` 走运行时任务（协程），否则线程池
+    server.max_concurrent_streams = cfg.max_streams;
+    if (cfg.io_task) {
+        server.job_mode = .io_task;
+        say("[bench] 每流任务派发：运行时任务（io_task）\n", .{});
+    }
+    if (handler_sleep_us > 0) {
+        say("[bench] handler 使用可挂起等待：{d}us\n", .{handler_sleep_us});
     }
     if (cfg.keepalive_ms > 0) {
         server.keepalive_interval_ms = cfg.keepalive_ms;

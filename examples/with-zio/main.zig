@@ -25,11 +25,16 @@ const method = "/bench.Bench/Echo";
 /// 用途与 `tools/bench.zig --handler-delay-us` 一致：量化「同连接多流是否串行」。
 /// 串行模型下 N 路并发流的总延迟 ≈ N × delay；每流一个任务则接近 delay。
 var handler_delay_us: u64 = 0;
+/// handler 用 `Call.sleepNs`（可挂起等待）多少微秒（第 8 个位置参数）
+var handler_sleep_us: u64 = 0;
 
 fn sayHandler(ctx: *anyopaque, call: *zgrpc.grpc.Call, arena: std.mem.Allocator) anyerror!void {
     _ = ctx;
     _ = arena;
-    if (handler_delay_us > 0) {
+    if (handler_sleep_us > 0) {
+        // 可挂起等待：io_task（协程）下不占线程
+        call.sleepNs(handler_sleep_us * 1000);
+    } else if (handler_delay_us > 0) {
         // 忙等而不是 sleep：要测的就是「handler 占住执行体」这件事本身
         const until = zgrpc.clock.monotonicNs() + @as(i128, handler_delay_us) * 1000;
         while (zgrpc.clock.monotonicNs() < until) std.atomic.spinLoopHint();
@@ -94,6 +99,8 @@ pub fn main(init: std.process.Init) !void {
                 stack_max_kb = std.fmt.parseInt(usize, a, 10) catch stack_max_kb;
             } else if (idx == 6) {
                 handler_delay_us = std.fmt.parseInt(u64, a, 10) catch handler_delay_us;
+            } else if (idx == 7) {
+                handler_sleep_us = std.fmt.parseInt(u64, a, 10) catch handler_sleep_us;
             }
         }
     }
@@ -129,6 +136,10 @@ pub fn main(init: std.process.Init) !void {
         .outer_ctx = &dummy,
         // 关键：连接作为**运行时任务**跑（事件循环），而不是每条一个 OS 线程
         .dispatch = .task,
+        // 每流任务派发到运行时任务（协程）：不占 OS 线程
+        .job_mode = .io_task,
+        // 协程下并发流的成本极低，把 SETTINGS 上限抬上去才能真的用起来
+        .max_concurrent_streams = 1024,
         .conn_recv_buf_size = recv_kb * 1024,
         .conn_send_buf_size = send_kb * 1024,
     };

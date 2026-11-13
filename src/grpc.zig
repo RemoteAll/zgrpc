@@ -333,6 +333,9 @@ pub const Call = struct {
     req: h2.Request,
     rsp: *h2.Responder,
     alloc: std.mem.Allocator,
+    /// 该调用所在的 `std.Io`：`.io_task` 模式下 handler 用它做**可挂起**的等待/IO，
+    /// 而不是硬阻塞一个线程。为空表示拿到不 io（降级），此时 `sleepNs` 会忙等。
+    io: ?std.Io = null,
     status: Status = .ok,
     /// 失败时回给客户端的文本（放在 trailers 的 `grpc-message`）
     error_message: []const u8 = "",
@@ -374,6 +377,19 @@ pub const Call = struct {
     resp_trailers: std.ArrayListUnmanaged(hpack.Header) = .empty,
 
     /// unary 调用取第一条消息。
+    /// 等一段时间。
+    ///
+    /// 有 `io` 时走**可挂起**的 `std.Io.sleep`（协程后端不占线程，上千路并发也只
+    /// 需要几条线程）；没有 `io`（降级/旧路径）时忙等，保证行为不变。
+    pub fn sleepNs(self: *Call, ns: u64) void {
+        if (self.io) |io| {
+            std.Io.sleep(io, .{ .nanoseconds = ns }, .awake) catch {};
+            return;
+        }
+        const until = clock.monotonicNs() + @as(i128, @intCast(ns));
+        while (clock.monotonicNs() < until) std.atomic.spinLoopHint();
+    }
+
     pub fn firstMessage(self: *Call) ?Message {
         var it = MessageIterator{ .data = self.req.body, .alloc = self.alloc };
         return it.next();
@@ -754,6 +770,15 @@ pub const Server = struct {
     pool: ?*zzig.threading.pool.Pool = null,
     /// `.task` 模式自动建池时的线程上限（`pool` 为空才生效）
     stream_workers: usize = default_stream_workers,
+    /// 每流任务的派发方式（仅 `.task` 模式生效）
+    job_mode: JobMode = .thread_pool,
+    /// 我方声明的 `SETTINGS_MAX_CONCURRENT_STREAMS`（一条连接上允许并存的流数）。
+    ///
+    /// 默认 100 偏保守：想真正吃到「每流任务」的并发（尤其是协程 handler），
+    /// 需要把它调到与实际并发相当的量级。
+    max_concurrent_streams: usize = 100,
+    /// `acceptLoop` 记下的 `std.Io`，供 handler 做**可挂起**的等待/IO（见 `Call.sleepNs`）
+    io_ctx: ?std.Io = null,
     /// 自动建的池（内部拥有，`acceptLoop` 退出时销毁）
     owned_pool: ?*zzig.threading.pool.Pool = null,
     /// `dispatch == .task` 时用来跟踪连接任务；`acceptLoop` 在退出时 await 它。
@@ -928,6 +953,8 @@ pub const Server = struct {
         // 同连接并发延迟降 4~6.5 倍，所以没必要让用户手动开。
         self.ensureStreamPool(io, allocator);
         defer self.destroyOwnedStreamPool();
+        // handler 里 `Call.sleepNs` / 业务 IO 需要运行时上下文
+        self.io_ctx = io;
 
         // 任务模式：连接任务挂在 server 上，所以收尾在这里 await（优雅关闭）
         defer if (self.dispatch == .task) self.task_group.await(io) catch {};
@@ -1111,21 +1138,27 @@ pub const Server = struct {
         var sr = stream.reader(io, recv_buf);
         var sw = stream.writer(io, send_buf);
 
-        var conn = h2.Connection.init(allocator, &sr.interface, &sw.interface, .{});
+        var conn = h2.Connection.init(allocator, &sr.interface, &sw.interface, .{
+            .max_concurrent_streams = self.max_concurrent_streams,
+        });
         defer conn.deinit();
 
-        // 每流任务模式：`dispatch == .task` 且提供了池时启用。
-        // 目的：消除同连接上的队头阻塞（实测 1ms handler、单连接 64 路并发
-        // p50 从 65ms 降到接近 4ms 的水平）。`job_ctx` 指向栈上结构，
-        // 生命周期由 `conn.waitJobs` + 本函数返回顺序保证。
-        var job_ctx = StreamJobCtx{ .pool = undefined, .allocator = allocator };
+        // 每流任务模式：`dispatch == .task` 时默认启用。
+        // 目的：消除同连接上的队头阻塞（实测 1ms handler、单连接 32 路并发
+        // 34.1ms → 4.8ms）。`job_ctx` 指向栈上结构，生命周期由
+        // `conn.waitJobs` + 本函数返回顺序保证。
+        var job_group: std.Io.Group = .init;
+        var job_ctx = StreamJobCtx{
+            .io = io,
+            .group = &job_group,
+            .pool = self.pool,
+            .allocator = allocator,
+            .mode = self.job_mode,
+        };
         if (self.dispatch == .task) {
-            if (self.pool) |pool| {
-                job_ctx.pool = pool;
-                conn.concurrent_write = true;
-                conn.job_submit = streamJobSubmit;
-                conn.job_ctx = @ptrCast(&job_ctx);
-            }
+            conn.concurrent_write = true;
+            conn.job_submit = streamJobSubmit;
+            conn.job_ctx = @ptrCast(&job_ctx);
         }
         // 兜底：连接异常收尾时，把还留在发送缓冲里的字节尽力刷出去。
         // 延迟 flush 的正常刷出点在读循环，异常路径（协议错/对端半关）走不到那里。
@@ -1144,12 +1177,26 @@ pub const Server = struct {
         };
         // 每流任务可能还在跑：必须先等它们退出，`conn.deinit()` 才能释放 arena
         conn.waitJobs(io);
+        // 组内任务资源释放（任务已在 `waitJobs` 里全部结束）
+        job_group.await(io) catch {};
     }
+
+    /// 每流任务的派发方式。
+    pub const JobMode = enum {
+        /// 提交成**运行时的任务**（协程）：在事件循环后端（zio/IOCP）上不占 OS 线程。
+        /// handler 内部应使用 `Call.io()` 做可挂起的等待/IO，不要硬阻塞。
+        io_task,
+        /// 提交到 `pool`（阻塞执行体，默认）：适合 CPU 密集或会阻塞的 handler。
+        thread_pool,
+    };
 
     /// 每流任务的上下文（栈上，生命周期 = 本条连接）。
     const StreamJobCtx = struct {
-        pool: *zzig.threading.pool.Pool,
+        io: std.Io,
+        group: *std.Io.Group,
+        pool: ?*zzig.threading.pool.Pool,
         allocator: std.mem.Allocator,
+        mode: JobMode,
     };
 
     /// 一次性任务盒：从**该流自己的 arena** 分配，随流一起释放。
@@ -1159,10 +1206,10 @@ pub const Server = struct {
         arena: std.mem.Allocator,
     };
 
-    /// `h2.Connection.job_submit` 的实现：把 unary handler 挪到线程池执行。
+    /// `h2.Connection.job_submit` 的实现：把 handler 挪出连接任务。
     ///
-    /// 关键点：**提交失败绝不能丢请求**——退化成在当前任务同步执行，
-    /// 正确性优先（只在这条连接上短暂阻塞）。
+    /// 关键点：**提交失败绝不能丢请求**——按 `io_task → thread_pool → 同步执行`
+    /// 逐级降级，正确性优先。
     fn streamJobSubmit(ctx: *anyopaque, conn: *h2.Connection, s: *h2.StreamState) void {
         const jc: *StreamJobCtx = @ptrCast(@alignCast(ctx));
         const arena = s.allocator();
@@ -1171,11 +1218,28 @@ pub const Server = struct {
             return;
         };
         box.* = .{ .conn = conn, .stream = s, .arena = arena };
-        jc.pool.submit(streamJobRun, box) catch {
-            box.arena.destroy(box);
-            conn.runJob(s);
+
+        // ① 运行时任务（协程）：事件循环后端上不占 OS 线程。
+        //    用 `Group.concurrent` 而不是 `async`——`async` 的语义是「await 之前
+        //    不保证执行」，那是批处理用的，放到连接任务里会直接把请求晾住。
+        if (jc.mode == .io_task) {
+            if (jc.group.concurrent(jc.io, streamJobRun, .{box})) |_| {
+                return;
+            } else |e| {
+                // 后端不支持并发派发（如受限的 Io 实现）→ 降到线程池
+                log.grpc.debug("每流任务派发到运行时失败（{s}），降级到线程池", .{@errorName(e)});
+            }
+        }
+
+        // ② 线程池
+        if (jc.pool) |pool| {
+            pool.submit(streamJobRun, box) catch {};
             return;
-        };
+        }
+
+        // ③ 同步执行（绝不丢请求）
+        box.arena.destroy(box);
+        conn.runJob(s);
     }
 
     fn streamJobRun(ctx: *anyopaque) void {
@@ -1208,6 +1272,7 @@ pub const Server = struct {
             .rsp = rsp,
             .alloc = arena,
             .start_ns = clock.monotonicNs(),
+            .io = self.io_ctx,
         };
 
         if (!std.mem.eql(u8, req.method, "POST")) {
@@ -1267,6 +1332,7 @@ pub const Server = struct {
             .rsp = rsp,
             .alloc = a,
             .start_ns = clock.monotonicNs(),
+            .io = self.io_ctx,
         };
         rsp.stream.user_data = call;
 
