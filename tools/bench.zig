@@ -157,6 +157,8 @@ const Args = struct {
     task: bool = false,
     /// 每流任务派发到**运行时任务**（协程）而不是线程池
     io_task: bool = false,
+    /// 打开 h2 相位计时（连接结束时把「读帧/处理/刷出」耗时打到 stderr）
+    profile_phases: bool = false,
     /// 我方声明的 SETTINGS_MAX_CONCURRENT_STREAMS
     max_streams: usize = 100,
     /// >1：同一连接上并开 N 条流的批量模式（真多路复用，才测得出每流并发）
@@ -202,6 +204,8 @@ fn parseArgs(init: std.process.Init) Args {
             a.task = true;
         } else if (std.mem.eql(u8, arg, "--io-task")) {
             a.io_task = true;
+        } else if (std.mem.eql(u8, arg, "--profile-phases")) {
+            a.profile_phases = true;
         } else if (std.mem.eql(u8, arg, "--max-streams")) {
             if (it.next()) |v| a.max_streams = std.fmt.parseInt(usize, v, 10) catch a.max_streams;
         } else if (std.mem.eql(u8, arg, "--handler-sleep-us")) {
@@ -245,6 +249,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .path = "/echo.Echo/Say", .handler = sayHandler },
     };
     var server = zgrpc.grpc.Server{ .routes = &routes, .outer_ctx = &dummy };
+    if (cfg.profile_phases) server.profile_phases = true;
 
     // 连接登记默认关闭（每连接一次自旋锁 + append + 线性扫描）；`--track-conns` 强制打开用于对比
     if (cfg.track_conns) {

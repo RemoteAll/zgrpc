@@ -777,6 +777,8 @@ pub const Server = struct {
     /// 默认 100 偏保守：想真正吃到「每流任务」的并发（尤其是协程 handler），
     /// 需要把它调到与实际并发相当的量级。
     max_concurrent_streams: usize = 100,
+    /// 相位计时的开关（透传到 h2.Options.profile_phases；**仅供性能分析**）
+    profile_phases: bool = false,
     /// `acceptLoop` 记下的 `std.Io`，供 handler 做**可挂起**的等待/IO（见 `Call.sleepNs`）
     io_ctx: ?std.Io = null,
     /// 自动建的池（内部拥有，`acceptLoop` 退出时销毁）
@@ -1140,6 +1142,7 @@ pub const Server = struct {
 
         var conn = h2.Connection.init(allocator, &sr.interface, &sw.interface, .{
             .max_concurrent_streams = self.max_concurrent_streams,
+            .profile_phases = self.profile_phases,
         });
         defer conn.deinit();
 

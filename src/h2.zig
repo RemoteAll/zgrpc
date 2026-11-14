@@ -94,6 +94,9 @@ pub const FrameHeader = struct {
 pub const Options = struct {
     /// 单个 header block（含 CONTINUATION 拼接）上限，防 HPACK 炸弹
     max_header_block: usize = 64 * 1024,
+    /// 相位计时开关（**默认关**）：打开后按「读帧 / 协议处理 / 刷出」累计耗时，
+    /// 连接结束时打到 stderr。用于回答「每请求那 20 多微秒花在哪」，不要在生产开。
+    profile_phases: bool = false,
     /// 单请求体上限
     max_body: usize = 4 * 1024 * 1024,
     /// 我们自己声明的 `SETTINGS_INITIAL_WINDOW_SIZE`
@@ -435,6 +438,13 @@ pub const Connection = struct {
     /// 并发写路径用它把「一批同时完成的响应」合并成一次 flush：
     /// 抢到写锁且看到它 > 0 的人一次刷完，其余人看到 0 就直接返回。
     unflushed: usize = 0,
+    /// 相位耗时累计（纳秒），仅在 `opts.profile_phases` 打开时累加。
+    /// 开销：每帧 6 次读时钟（约 0.2µs/请求），但能直接回答「时间花在哪」。
+    prof_io_ns: u64 = 0,
+    prof_handle_ns: u64 = 0,
+    prof_flush_ns: u64 = 0,
+    prof_frames: u64 = 0,
+    prof_requests: u64 = 0,
     /// 允许从**非连接任务**并发写响应（每流一个 handler 任务时必需）。
     ///
     /// 开启后 `Responder.sendData` / `end` / `endData` 走
@@ -603,6 +613,7 @@ pub const Connection = struct {
     }
 
     fn runLoop(self: *Connection) !void {
+        defer self.reportProfile();
         var pf: [client_preface.len]u8 = undefined;
         self.reader.readSliceAll(&pf) catch |e| {
             log.h2.warn("读连接前言失败：{s}", .{@errorName(e)});
@@ -630,12 +641,20 @@ pub const Connection = struct {
             // 缓冲里没有完整的 9 字节头，接下来这次读很可能真阻塞在 socket 上。
             try self.flushForRead(9);
 
+            // 相位计时：t0 之前 = 刷出；t0..t1 = 读帧；t1..t2 = 协议处理+handler；t2..t3 = 刷出
+            const prof = self.opts.profile_phases;
+            const now = struct {
+                fn ns() i128 {
+                    return @import("clock.zig").monotonicNs();
+                }
+            };
+            const t0: i128 = if (prof) now.ns() else 0;
+
             const hdr = self.readFrameHeader() catch |e| {
                 // 对端关闭/半包 → 正常收尾；其它读错误也在这里定位
                 log.h2.debug("读帧结束（{s}），连接收尾", .{@errorName(e)});
                 return error.ConnectionClosed;
             };
-
             // 帧体也可能不在缓冲里：读它之前同样要刷
             try self.flushForRead(hdr.length);
 
@@ -649,9 +668,33 @@ pub const Connection = struct {
                 return error.ConnectionClosed;
             };
 
+            const t1: i128 = if (prof) now.ns() else 0;
             try self.handleFrame(hdr, payload);
+            const t2: i128 = if (prof) now.ns() else 0;
             try self.flushIfFull();
+            if (prof) {
+                const t3 = now.ns();
+                self.prof_io_ns += @intCast(@max(t1 - t0, 0));
+                self.prof_handle_ns += @intCast(@max(t2 - t1, 0));
+                self.prof_flush_ns += @intCast(@max(t3 - t2, 0));
+                self.prof_frames += 1;
+            }
         }
+    }
+
+    /// 连接结束时输出相位报告（仅 `profile_phases` 打开）。
+    ///
+    /// 一个 unary 请求入方向是 2 帧（HEADERS + DATA），所以「每帧」×2 ≈ 「每请求」。
+    fn reportProfile(self: *Connection) void {
+        if (!self.opts.profile_phases or self.prof_frames == 0) return;
+        const f: f64 = @floatFromInt(self.prof_frames);
+        const io_us = @as(f64, @floatFromInt(self.prof_io_ns)) / f / 1000.0;
+        const hd_us = @as(f64, @floatFromInt(self.prof_handle_ns)) / f / 1000.0;
+        const fl_us = @as(f64, @floatFromInt(self.prof_flush_ns)) / f / 1000.0;
+        std.debug.print(
+            "[h2-prof] frames={d} io_us/frame={d:.2} handle_us/frame={d:.2} flush_us/frame={d:.2} total_us/frame={d:.2}\n",
+            .{ self.prof_frames, io_us, hd_us, fl_us, io_us + hd_us + fl_us },
+        );
     }
 
     fn handleFrame(self: *Connection, hdr: FrameHeader, payload: []const u8) !void {
