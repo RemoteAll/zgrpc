@@ -958,6 +958,15 @@ pub const Server = struct {
         // handler 里 `Call.sleepNs` / 业务 IO 需要运行时上下文
         self.io_ctx = io;
 
+        // 启动诊断：每连接一线程只适合短连接/低连接数；上千长连接会因线程成本崩掉。
+        // 放在启动时提示一次，比运行到中途 spawn 失败才发现要好。
+        if (self.dispatch == .thread_per_conn) {
+            log.grpc.info(
+                "连接调度=每连接一线程：适合短连接/低并发；预计上千长连接请改用 dispatch=.task（见 Server.production）",
+                .{},
+            );
+        }
+
         // 任务模式：连接任务挂在 server 上，所以收尾在这里 await（优雅关闭）
         defer if (self.dispatch == .task) self.task_group.await(io) catch {};
 
@@ -984,6 +993,38 @@ pub const Server = struct {
     /// 取值与 `std.Io.Threaded` 的默认并发度同量级：太小会让多路复用客户端排长队，
     /// 太大只是多几个休眠线程。
     pub const default_stream_workers: usize = 64;
+
+    /// **生产推荐配置**：`.task` 调度 + 每流任务 + 一组实测调优过的参数。
+    ///
+    /// 为什么要有它：最优路径需要同时设好几项（dispatch / 缓冲 / backlog / 并发流上限），
+    /// 分散在多个字段里很容易漏；这里把它们固化成一个入口，**不改变任何默认值**，
+    /// 老代码行为完全不变。
+    ///
+    /// 用法（zio 为例，`rt` 是 `zio.Runtime`）：
+    /// ```zig
+    /// var server = zgrpc.grpc.Server.production(&routes, &dummy);
+    /// var group: std.Io.Group = .init;
+    /// group.async(rt.io(), zgrpc.grpc.Server.acceptLoop, .{ &server, rt.io(), gpa, &listener });
+    /// ```
+    ///
+    /// **前提**：`.task` 要求 `acceptLoop` 在该 `io` 的运行时上下文里调用。
+    /// zio 下**不能**放在裸 `std.Thread` 里跑（协程不会挂起，会卡死）；
+    /// `std.Io.Threaded` 下没有这个限制。
+    pub fn production(routes: []const Route, outer_ctx: *anyopaque) Server {
+        return .{
+            .routes = routes,
+            .outer_ctx = outer_ctx,
+            .dispatch = .task,
+            .stream_workers = default_stream_workers,
+            // 32K 接收缓冲：一次能读完整批 64 路并发请求，让延迟 flush 真正合成一次写
+            .conn_recv_buf_size = 32 * 1024,
+            .conn_send_buf_size = 16 * 1024,
+            // 上千长连接时监听队列必须够深（默认 128 会大量拒连）
+            .default_backlog = 1024,
+            // 多路复用客户端常见的并发量级
+            .max_concurrent_streams = 1024,
+        };
+    }
 
     /// `.task` 模式下确保存在每流任务池（幂等；只在 `pool` 为空时生效）。
     fn ensureStreamPool(self: *Server, io: std.Io, allocator: std.mem.Allocator) void {

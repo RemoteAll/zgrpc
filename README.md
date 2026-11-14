@@ -4,7 +4,31 @@
 
 面向「需要 gRPC 的项目」独立成库，**不放进 zzig**：h2 + HPACK + gRPC 是一整套协议栈，
 不该让所有用 zzig 的项目都背上这份编译与维护成本；本库也不依赖 zzig，两边互不绑死。
+## 生产推荐配置（**先看这个**）
 
+默认值为了「任何后端、任何调用方式都不会坏」，所以是 `.thread_per_conn`（每连接一线程）。
+预期要跑**上千长连接**时，请直接用 `Server.production(...)` —— 它把实测调优过的几项一次设好：
+
+```zig
+var server = zgrpc.grpc.Server.production(&routes, &dummy);   // .task + 推荐缓冲/backlog/流上限
+var group: std.Io.Group = .init;
+// 注意：`.task` 必须在**运行时上下文**里启动 accept 循环
+group.async(io, zgrpc.grpc.Server.acceptLoop, .{ &server, io, gpa, &listener });
+```
+
+| 项 | 默认 | `production()` | 为什么 |
+|---|---|---|---|
+| `dispatch` | `.thread_per_conn` | **`.task`** | 1000 连接：1000 线程 → ~24 线程 |
+| 接收缓冲 | 32 KiB | 32 KiB | 一次读完整批并发请求，让延迟 flush 合成一次写 |
+| `default_backlog` | 1024 | 1024 | 默认 128 在连接突发时会大量拒连 |
+| `max_concurrent_streams` | 100 | 1024 | 多路复用客户端常见的并发量级 |
+
+> zio 下 `.task` **不能**放在裸 `std.Thread` 里跑（协程不会挂起，会卡死），必须在 `rt.io()` 的运行时里起。
+> 想要 Linux 上的 io_uring、Windows 上的 IOCP，就把 `io` 换成 zio 的 `rt.io()` —— 库本身不绑定运行时。
+
+实测（Windows / 16 逻辑核 / ReleaseFast）：单请求 RTT 90~95µs（最快一轮 49µs），
+32 流流水线 26.7µs/请求，100 流 25.3µs/请求；协议层自身只占约 2.9µs/请求（其余是系统调用与等对端）。
+性能护栏见 `bench_pair/guard.ps1`。
 ## 现状
 
 | 模块 | 能力 | 说明 |
