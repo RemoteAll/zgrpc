@@ -101,6 +101,13 @@ pub const Options = struct {
     user_agent: []const u8 = "grpc-zgrpc/0.2.1",
     /// 用哪种 content-type 形态（web 系列会自动做尾帧与 base64 处理）
     content_type: ContentType = .grpc,
+    /// 本端声明的 `SETTINGS_INITIAL_WINDOW_SIZE`（每条流的接收窗口）。
+    ///
+    /// 默认 65535（h2 缺省）。**并发发起很多流时必须调大**：
+    /// 否则响应窗口一耗尽，服务端就写不动，而「先全发再全收」的客户端又
+    /// 还没开始读 → 双方互等（实测 500 流 × 128B 响应必挂）。
+    /// 调大时会同步把**连接级**窗口也抬上去（否则连接级仍是 65535，照样卡）。
+    initial_window_size: u32 = @intCast(h2.default_window_size),
 };
 
 pub const Client = struct {
@@ -325,7 +332,21 @@ pub const Client = struct {
     pub fn handshake(self: *Client) !void {
         if (self.started) return;
         try self.writer.writeAll(h2.client_preface);
-        try writeFrame(self.writer, .settings, 0, 0, &.{});
+
+        // SETTINGS 里带上本端窗口：不声明就一直是 65535，大并发会被窗口卡死
+        var settings: [6]u8 = undefined;
+        std.mem.writeInt(u16, settings[0..2], 0x4, .big); // SETTINGS_INITIAL_WINDOW_SIZE
+        std.mem.writeInt(u32, settings[2..6], self.opts.initial_window_size, .big);
+        try writeFrame(self.writer, .settings, 0, 0, &settings);
+
+        // 连接级窗口也必须抬：h2 的连接级初值固定 65535，只有 WINDOW_UPDATE 能加
+        const default_w: u32 = @intCast(h2.default_window_size);
+        if (self.opts.initial_window_size > default_w) {
+            var inc: [4]u8 = undefined;
+            std.mem.writeInt(u32, &inc, self.opts.initial_window_size - default_w, .big);
+            try writeFrame(self.writer, .window_update, 0, 0, &inc);
+        }
+
         try self.writer.flush();
         self.started = true;
     }

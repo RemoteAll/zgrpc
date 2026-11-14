@@ -375,6 +375,9 @@ pub fn main(init: std.process.Init) !void {
 
     var client = zgrpc.client.Client.init(gpa, &sr.interface, &sw.interface, .{
         .authority = "127.0.0.1",
+        // 批量多流时响应总量很容易超过 64 KiB 默认窗口；不抬窗口就会
+        // 「服务端写不动 + 客户端还没开始读」互等（实测 500 流必挂）。
+        .initial_window_size = 8 * 1024 * 1024,
     });
     defer client.deinit();
 
