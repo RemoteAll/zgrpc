@@ -96,6 +96,17 @@ pub fn build(b: *std.Build) void {
     const floor_exe = b.addExecutable(.{ .name = "tcp_floor", .root_module = floor_mod });
     b.installArtifact(floor_exe);
     b.step("tcp-floor", "编译裸 TCP ping-pong 地板基准（zig-out\\bin\\tcp_floor.exe）").dependOn(&b.addInstallArtifact(floor_exe, .{}).step);
+
+    // 共享内存往返基准：`zig build shm-ring -Doptimize=ReleaseFast`
+    // 量「完全不走内核」的地板（Aeron IPC / iceoryx / io_uring 环那一类架构）。
+    const shm_mod = b.createModule(.{
+        .root_source_file = b.path("tools/shm_ring.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const shm_exe = b.addExecutable(.{ .name = "shm_ring", .root_module = shm_mod });
+    b.installArtifact(shm_exe);
+    b.step("shm-ring", "编译共享内存往返基准（zig-out\\bin\\shm_ring.exe）").dependOn(&b.addInstallArtifact(shm_exe, .{}).step);
     // 带 import 的示例：一次生成 root + 它的依赖（各自一个 .pb.zig）
     const gen_run2 = b.addRunArtifact(gen_exe);
     gen_run2.addArgs(&.{ "examples/proto_import/shop.proto", "examples/proto_import/shop.pb.zig" });
