@@ -85,6 +85,17 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(bench_exe);
     // 透传命令行参数（Zig 0.17：用 b.args() 取）`n    if (comptime @hasDecl(std.Build, "args")) {}
     b.step("bench", "编译 unary 基准（跑 zig-out\\bin\\bench.exe，可加 --iterations N）").dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
+
+    // 裸 TCP 往返地板基准：`zig build tcp-floor -Doptimize=ReleaseFast`
+    // 不依赖 zgrpc，纯粹量「这台机器上任何 socket RPC 的下限」。
+    const floor_mod = b.createModule(.{
+        .root_source_file = b.path("tools/tcp_floor.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const floor_exe = b.addExecutable(.{ .name = "tcp_floor", .root_module = floor_mod });
+    b.installArtifact(floor_exe);
+    b.step("tcp-floor", "编译裸 TCP ping-pong 地板基准（zig-out\\bin\\tcp_floor.exe）").dependOn(&b.addInstallArtifact(floor_exe, .{}).step);
     // 带 import 的示例：一次生成 root + 它的依赖（各自一个 .pb.zig）
     const gen_run2 = b.addRunArtifact(gen_exe);
     gen_run2.addArgs(&.{ "examples/proto_import/shop.proto", "examples/proto_import/shop.pb.zig" });
