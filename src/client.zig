@@ -805,12 +805,12 @@ fn synthesizeStatus(r: *Result, arena: std.mem.Allocator) !void {
     if (r.aborted) return;
     const st: []const u8 = if (r.http_status.len == 0) "200" else r.http_status;
     if (!std.mem.eql(u8, st, "200")) {
-        r.status = @intFromEnum(grpc.Status.unavailable);
+        r.status = @backingInt(grpc.Status.unavailable);
         r.message = try std.fmt.allocPrint(arena, "对端返回 HTTP {s}（不是 gRPC 响应）", .{st});
         r.aborted = true;
         return;
     }
-    r.status = @intFromEnum(grpc.Status.unknown_error);
+    r.status = @backingInt(grpc.Status.unknown_error);
     r.message = "流已结束但没有 grpc-status（对端不是合规的 gRPC 实现）";
 }
 
@@ -825,7 +825,7 @@ fn writeFrame(
     hdr[0] = @intCast((payload.len >> 16) & 0xff);
     hdr[1] = @intCast((payload.len >> 8) & 0xff);
     hdr[2] = @intCast(payload.len & 0xff);
-    hdr[3] = @intFromEnum(ftype);
+    hdr[3] = @backingInt(ftype);
     hdr[4] = flags;
     std.mem.writeInt(u32, hdr[5..9], stream_id & 0x7fff_ffff, .big);
     try w.writeAll(&hdr);
@@ -844,7 +844,7 @@ fn readFrameHeader(c: *Client) !FrameHeader {
     try c.readExact(&b);
     return .{
         .length = (@as(usize, b[0]) << 16) | (@as(usize, b[1]) << 8) | @as(usize, b[2]),
-        .ftype = @enumFromInt(b[3]),
+        .ftype = @fromBackingInt(@intCast(b[3])),
         .flags = b[4],
         .stream_id = std.mem.readInt(u32, b[5..9], .big) & 0x7fff_ffff,
     };
@@ -1019,7 +1019,6 @@ test "client：grpc-web-text 往返（请求 base64 发出、状态取自 body �
     }
     try testing.expect(found);
 }
-
 
 test "client：大消息按 MAX_FRAME_SIZE 分片（不分片会让真实 gRPC 服务端 FRAME_SIZE_ERROR）" {
     var r = std.Io.Reader.fixed("");
