@@ -1,0 +1,9 @@
+﻿{
+    "created":  "2026-11-14 08:51:56",
+    "metrics":  {
+                    "rpc_serial_us":  49,
+                    "rpc_pipe32_us":  28.2,
+                    "rpc_pipe100_us":  25.3,
+                    "tcp_floor_avg_us":  63.75
+                }
+}
