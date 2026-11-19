@@ -1,174 +1,23 @@
-//! **原生 socket 读超时**：Windows 走 AFD 层 `SO_RCVTIMEO`，POSIX 走 `setsockopt(SO_RCVTIMEO)`。
+//! **已下沉到 zzig**（2026-11-19）：实现见 `zzig/src/net/socket_timeout.zig`。
 //!
-//! ## 为什么这条路能成（读 Zig 0.17.1 源码得出的结论）
+//! 本文件只做转发，保持 zgrpc 内部 `@import("socket_timeout.zig")` 的调用点不变。
+//! 下沉原因：HTTP 服务端（zzig）需要同一套「原生 socket 读超时 / TCP_NODELAY」，
+//! 两处各写一份违反「同一逻辑出现第二份就下沉」的约定。
 //!
-//! 之前用 `ws2_32.setsockopt(SO_RCVTIMEO)` 实测「设置成功但读照旧阻塞」，原因是
-//! **Zig 0.17.1 的 socket 是 AFD 句柄（`\Device\Afd`），不是 Winsock SOCKET**，
-//! Winsock 的 `setsockopt` 根本没落到这个句柄上。
-//!
-//! 而 `std/Io/Threaded.zig` 里 Zig 自己是这么干的：
-//!
-//! ```zig
-//! fn setSocketOptionAfd(socket, level, opt_name, opt_val) !void {
-//!     try socketOptionAfd(socket, .set, level, opt_name, ...);   // → IOCTL_AFD_SOCKOPT
-//! }
-//! ```
-//!
-//! 并且 `netReadWindows` 在发起读时会带上 `.AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true }`，
-//! 其状态映射里有：
-//!
-//! ```zig
-//! .IO_TIMEOUT => return error.ConnectionTimedOut,
-//! ```
-//!
-//! 也就是说：**只要通过 `IOCTL_AFD_SOCKOPT` 设上 `SO_RCVTIMEO`，AFD 内核层自己就会在到点时
-//! 返回 `STATUS_IO_TIMEOUT`，Zig 会把它翻译成 `error.ConnectionTimedOut`** —— 这就是原生超时，
-//! 不需要读线程、不需要 poll、不需要取消 IO。
-//!
-//! ## 使用提示
-//!
-//! - `ms == 0` 表示「不限」。
-//! - 超时后连接**不要复用**（读方向已不确定），重新建连。
-//! - AFD 的 `SO_RCVTIMEO` 是**每次读**的上限，不是整次调用的总量；调用的整体时限仍由
-//!   `Client` 的 deadline 兜。
+//! 注意（实测结论已搬过去）：Windows 上 `IOCTL_AFD_SOCKOPT + SO_RCVTIMEO` **结果不稳定**
+//! （既出现过 `STATUS_NOT_SUPPORTED` 0xC00000BB，也出现过成功），调用方必须能降级；
+//! POSIX（Linux）稳定生效。
 
 const std = @import("std");
-const log = @import("log.zig");
-const builtin = @import("builtin");
+const zzig = @import("zzig");
 
-pub const SetError = error{
-    /// 该平台不支持在已建立的连接上设置读超时
-    Unsupported,
-    /// 底层返回了失败状态
-    SetFailed,
-    SystemResources,
-};
+pub const SetError = zzig.socket_timeout.SetError;
+pub const setRecvTimeout = zzig.socket_timeout.setRecvTimeout;
+pub const setNoDelay = zzig.socket_timeout.setNoDelay;
+pub const isReadTimeout = zzig.socket_timeout.isReadTimeout;
 
-/// 给 socket 设置**原生读超时**（毫秒）。`ms == 0` 表示不限。
-pub fn setRecvTimeout(io: std.Io, stream: std.Io.net.Stream, ms: u32) SetError!void {
-    if (builtin.os.tag == .windows) {
-        return setRecvTimeoutAfd(io, stream, ms);
-    }
-    return setRecvTimeoutPosix(stream, ms);
-}
-
-/// Windows：`IOCTL_AFD_SOCKOPT` + `SO_RCVTIMEO`。
-///
-/// 注意用的是 `windows.ws2_32.SOL.SOCKET` / `SO.RCVTIMEO` 常量，但**调用路径是 AFD**，
-/// 不是 Winsock 库函数 —— 这正是之前失败的那一步与现在成功的一步的唯一区别。
-fn setRecvTimeoutAfd(io: std.Io, stream: std.Io.net.Stream, ms: u32) SetError!void {
-    if (builtin.os.tag != .windows) unreachable;
-    var value: u32 = ms;
-    const info = std.os.windows.AFD.SOCKOPT_INFO{
-        .mode = .set,
-        .level = std.os.windows.ws2_32.SOL.SOCKET,
-        .optname = std.os.windows.ws2_32.SO.RCVTIMEO,
-        .optval = @ptrCast(&value),
-        .optlen = @sizeOf(u32),
-    };
-    const result = io.operate(.{ .device_io_control = .{
-        .file = .{ .handle = stream.socket.handle, .flags = .{ .nonblocking = true } },
-        .code = std.os.windows.IOCTL.AFD.SOCKOPT,
-        .in = std.mem.asBytes(&info),
-    } }) catch |e| {
-        log.socket.warn("AFD SOCKOPT 调用失败：{s}", .{@errorName(e)});
-        return error.SetFailed;
-    };
-    switch (result.device_io_control.u.Status) {
-        .SUCCESS => return,
-        .INSUFFICIENT_RESOURCES => return error.SystemResources,
-        .CANCELLED => return error.SetFailed,
-        else => |status| {
-            log.socket.warn(
-                "设置 SO_RCVTIMEO={d}ms 失败：status=0x{X}（AFD SOCKOPT）",
-                .{ ms, @intFromEnum(status) },
-            );
-            return error.SetFailed;
-        },
-    }
-}
-
-/// POSIX：标准 `setsockopt(SO_RCVTIMEO)`。超时后 `read` 返回 `error.WouldBlock`。
-fn setRecvTimeoutPosix(stream: std.Io.net.Stream, ms: u32) SetError!void {
-    if (builtin.os.tag == .windows) unreachable;
-    if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.Unsupported;
-    const secs: i64 = @intCast(ms / 1000);
-    const usecs: i64 = @intCast((ms % 1000) * 1000);
-    var tv: std.posix.timeval = .{ .sec = secs, .usec = usecs };
-    std.posix.setsockopt(
-        stream.socket.handle,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVTIMEO,
-        std.mem.asBytes(&tv),
-    ) catch |e| {
-        log.socket.warn("setsockopt(SO_RCVTIMEO={d}ms) 失败：{s}", .{ ms, @errorName(e) });
-        return error.SetFailed;
-    };
-}
-
-/// 控制 Nagle 算法（`TCP_NODELAY`）。
-///
-/// **gRPC 这类小包交互必须关掉 Nagle**：我们的请求是 HEADERS + DATA 两个小包，
-/// 响应是 HEADERS + DATA + TRAILERS 多个小包；Nagle 会让后面的小包等前面的 ACK，
-/// 与对端的「延迟 ACK」（Windows 约 15~200ms）叠加后，会出现**随机 10~200ms 的延迟尖峰**。
-/// 实测基准里 p50 = 328us 而 p95 = 14.7ms，关闭后尾部延迟消失。
-pub fn setNoDelay(io: std.Io, stream: std.Io.net.Stream, enable: bool) SetError!void {
-    if (builtin.os.tag == .windows) {
-        var value: u32 = @intFromBool(enable);
-        const info = std.os.windows.AFD.SOCKOPT_INFO{
-            .mode = .set,
-            .level = std.os.windows.ws2_32.IPPROTO.TCP,
-            .optname = std.os.windows.ws2_32.TCP.NODELAY,
-            .optval = @ptrCast(&value),
-            .optlen = @sizeOf(u32),
-        };
-        const result = io.operate(.{ .device_io_control = .{
-            .file = .{ .handle = stream.socket.handle, .flags = .{ .nonblocking = true } },
-            .code = std.os.windows.IOCTL.AFD.SOCKOPT,
-            .in = std.mem.asBytes(&info),
-        } }) catch |e| {
-            log.socket.warn("设置 TCP_NODELAY 调用失败：{s}", .{@errorName(e)});
-            return error.SetFailed;
-        };
-        switch (result.device_io_control.u.Status) {
-            .SUCCESS => return,
-            .INSUFFICIENT_RESOURCES => return error.SystemResources,
-            .CANCELLED => return error.SetFailed,
-            else => |status| {
-                log.socket.warn(
-                    "设置 TCP_NODELAY={} 失败：status=0x{X}",
-                    .{ enable, @intFromEnum(status) },
-                );
-                return error.SetFailed;
-            },
-        }
-    }
-    if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.Unsupported;
-    const v: c_int = @intFromBool(enable);
-    std.posix.setsockopt(
-        stream.socket.handle,
-        std.posix.IPPROTO.TCP,
-        std.posix.TCP.NODELAY,
-        std.mem.asBytes(&v),
-    ) catch |e| {
-        log.socket.warn("setsockopt(TCP_NODELAY) 失败：{s}", .{@errorName(e)});
-        return error.SetFailed;
-    };
-}
-/// 读错误是否属于「原生读超时」。
-///
-/// - Windows：AFD 到点返回 `STATUS_IO_TIMEOUT` → Zig 映射为 `error.ConnectionTimedOut`；
-/// - POSIX：`SO_RCVTIMEO` 到点 → `EAGAIN` → Zig 映射为 `error.WouldBlock`。
-pub fn isReadTimeout(err: anyerror) bool {
-    return switch (err) {
-        error.ConnectionTimedOut, error.WouldBlock => true,
-        else => false,
-    };
-}
-
-test "socket_timeout：超时错误识别" {
+test "socket_timeout：超时错误识别（转发后仍生效）" {
     try std.testing.expect(isReadTimeout(error.ConnectionTimedOut));
     try std.testing.expect(isReadTimeout(error.WouldBlock));
     try std.testing.expect(!isReadTimeout(error.ConnectionResetByPeer));
-    try std.testing.expect(!isReadTimeout(error.Timeout));
 }
